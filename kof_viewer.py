@@ -49,6 +49,7 @@ from matplotlib.backends.backend_tkagg import (
     NavigationToolbar2Tk,
 )
 from matplotlib.figure import Figure
+from matplotlib.path import Path
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 from scipy.interpolate import LinearNDInterpolator
 from scipy.spatial import Delaunay
@@ -324,7 +325,10 @@ class VolumeResult:
 
 
 def compute_volume(
-    top: KOFFile, bottom: KOFFile, target_cells: int = 200
+    top: KOFFile,
+    bottom: KOFFile,
+    target_cells: int = 200,
+    mask_polygon: Optional[list[tuple[float, float]]] = None,
 ) -> Optional[VolumeResult]:
     """Grid-sample both surfaces and sum (top-bottom) * cell_area."""
     if not top.ensure_triangulation() or not bottom.ensure_triangulation():
@@ -352,10 +356,16 @@ def compute_volume(
     yy_f = yy.ravel()
     xx_f = xx.ravel()
 
+    if mask_polygon is not None and len(mask_polygon) >= 3:
+        poly = Path(np.asarray(mask_polygon, dtype=float))
+        in_poly = poly.contains_points(np.column_stack([yy_f, xx_f]))
+    else:
+        in_poly = np.ones_like(yy_f, dtype=bool)
+
     z_top = top.interpolate(yy_f, xx_f)
     z_bot = bottom.interpolate(yy_f, xx_f)
     diff = z_top - z_bot
-    mask = np.isfinite(diff)
+    mask = np.isfinite(diff) & in_poly
     valid = diff[mask]
     cell_area = (ys[1] - ys[0]) * (xs[1] - xs[0]) if len(ys) > 1 and len(xs) > 1 else cell * cell
 
@@ -413,6 +423,12 @@ class KOFViewer(tk.Tk):
         self._section_cid: Optional[int] = None
         self._section_preview = None  # transient Line2D while drawing
         self._sections: list[tuple[tuple[float, float], tuple[float, float]]] = []
+
+        # Polygon mask state for volume limitation in 2D.
+        self._mask_mode = False
+        self._mask_click_points: list[tuple[float, float]] = []
+        self._mask_polygon: list[tuple[float, float]] = []
+        self._mask_cid: Optional[int] = None
 
         self._build_toolbar()
         self._build_body()
@@ -481,6 +497,13 @@ class KOFViewer(tk.Tk):
         ttk.Button(bar2, text="Clear sections",
                    command=self._on_clear_sections).pack(side=tk.LEFT, padx=2)
 
+        ttk.Separator(bar2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        self.mask_btn = ttk.Button(bar2, text="Draw mask",
+                       command=self._on_toggle_mask)
+        self.mask_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar2, text="Clear mask",
+               command=self._on_clear_mask).pack(side=tk.LEFT, padx=2)
+
     def _build_body(self) -> None:
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True)
@@ -527,6 +550,10 @@ class KOFViewer(tk.Tk):
         self.last_volume = None
         self.volume_text.set("Volume: (not computed)")
         self._sections.clear()
+        self._mask_polygon.clear()
+        self._mask_click_points.clear()
+        if self._mask_mode:
+            self._end_mask_mode()
         self._refresh_file_selectors()
         self._redraw()
 
@@ -575,7 +602,8 @@ class KOFViewer(tk.Tk):
         if top is bot:
             messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
             return
-        result = compute_volume(top, bot)
+        mask_poly = self._mask_polygon if len(self._mask_polygon) >= 3 else None
+        result = compute_volume(top, bot, mask_polygon=mask_poly)
         if result is None:
             messagebox.showerror(
                 "KOF Viewer",
@@ -584,9 +612,10 @@ class KOFViewer(tk.Tk):
             )
             return
         self.last_volume = result
+        mask_suffix = " (masked)" if mask_poly is not None else ""
         self.volume_text.set(
             f"Net: {result.net:+,.2f} m³   (Cut {result.cut:,.2f} / "
-            f"Fill {result.fill:,.2f})   over {result.area:,.1f} m²"
+            f"Fill {result.fill:,.2f})   over {result.area:,.1f} m²{mask_suffix}"
         )
         if self.show_triangulation.get():
             self._redraw()
@@ -605,6 +634,8 @@ class KOFViewer(tk.Tk):
 
     # --------------------------------------------------------- Section tool
     def _on_toggle_section(self) -> None:
+        if self._mask_mode:
+            self._end_mask_mode()
         if self._section_mode:
             self._end_section_mode()
             return
@@ -670,6 +701,86 @@ class KOFViewer(tk.Tk):
         if top is not None and bot is not None:
             SectionWindow(self, top, bot, (y0, x0), (y1, x1),
                           label=self._section_label(len(self._sections) - 1))
+
+    # ----------------------------------------------------------- Polygon mask
+    def _on_toggle_mask(self) -> None:
+        if self._section_mode:
+            self._end_section_mode()
+        if self._mask_mode:
+            self._end_mask_mode()
+            self._redraw_2d()
+            return
+        self._mask_mode = True
+        self._mask_click_points = []
+        self.mask_btn.configure(text="Cancel mask")
+        self.notebook.select(0)  # switch to 2D tab
+        self.status.set(
+            "Mask mode: left-click to add polygon vertices. "
+            "Right-click (or double-click) to close. Esc to cancel."
+        )
+        self._mask_cid = self.canvas2d.mpl_connect(
+            "button_press_event", self._on_mask_click
+        )
+        self.bind("<Escape>", lambda _e: self._cancel_mask_mode())
+
+    def _cancel_mask_mode(self) -> None:
+        self._mask_click_points = []
+        self._end_mask_mode()
+        self._redraw_2d()
+
+    def _end_mask_mode(self) -> None:
+        self._mask_mode = False
+        if self._mask_cid is not None:
+            self.canvas2d.mpl_disconnect(self._mask_cid)
+            self._mask_cid = None
+        self.mask_btn.configure(text="Draw mask")
+        self.unbind("<Escape>")
+        self._update_status()
+
+    def _on_clear_mask(self) -> None:
+        had_mask = len(self._mask_polygon) >= 3
+        self._mask_polygon.clear()
+        self._mask_click_points.clear()
+        if self._mask_mode:
+            self._end_mask_mode()
+        if had_mask and self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._redraw()
+
+    def _on_mask_click(self, event) -> None:  # noqa: ANN001
+        if event.inaxes is not self.ax2d:
+            return
+        if event.button == 3:  # right-click finalizes, if possible
+            if len(self._mask_click_points) >= 3:
+                self._mask_polygon = list(self._mask_click_points)
+                self._mask_click_points = []
+                self._end_mask_mode()
+                if self.last_volume is not None:
+                    self.volume_text.set("Volume: (stale – recompute)")
+                self._redraw()
+            else:
+                self._cancel_mask_mode()
+            return
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        self._mask_click_points.append((event.xdata, event.ydata))
+        if event.dblclick and len(self._mask_click_points) >= 3:
+            self._mask_polygon = list(self._mask_click_points)
+            self._mask_click_points = []
+            self._end_mask_mode()
+            if self.last_volume is not None:
+                self.volume_text.set("Volume: (stale – recompute)")
+            self._redraw()
+            return
+
+        self.status.set(
+            f"Mask mode: {len(self._mask_click_points)} vertex/vertices. "
+            "Left-click to add more, right-click or double-click to close."
+        )
+        self._redraw_2d()
 
     @staticmethod
     def _section_label(index: int) -> str:
@@ -750,6 +861,28 @@ class KOFViewer(tk.Tk):
                 f"{label}'", (y1, x1), fontsize=9, fontweight="bold", color="black",
                 xytext=(6, 6), textcoords="offset points", zorder=7,
             )
+
+        # Active polygon mask.
+        if len(self._mask_polygon) >= 3:
+            arr = np.asarray(self._mask_polygon, dtype=float)
+            closed = np.vstack([arr, arr[0]])
+            self.ax2d.fill(closed[:, 0], closed[:, 1],
+                           color="#ffbf00", alpha=0.15, zorder=8)
+            self.ax2d.plot(closed[:, 0], closed[:, 1], "-", color="#cc8a00",
+                           linewidth=1.8, zorder=9)
+            self.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#cc8a00",
+                           markersize=4, zorder=10)
+
+        # In-progress polygon while mask mode is active.
+        if self._mask_mode and self._mask_click_points:
+            arr = np.asarray(self._mask_click_points, dtype=float)
+            self.ax2d.plot(arr[:, 0], arr[:, 1], "--", color="#cc8a00",
+                           linewidth=1.3, zorder=11)
+            self.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#cc8a00",
+                           markersize=4, zorder=12)
+            if len(arr) >= 2:
+                self.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]],
+                               ":", color="#cc8a00", linewidth=1.0, zorder=11)
 
         if self.files:
             self.ax2d.legend(loc="best", fontsize=8)
@@ -841,6 +974,8 @@ class KOFViewer(tk.Tk):
     def _update_status(self) -> None:
         if self._section_mode:
             return
+        if self._mask_mode:
+            return
         if not self.files:
             self.status.set("No file loaded.")
             return
@@ -853,10 +988,13 @@ class KOFViewer(tk.Tk):
             total_points += n_pts
             total_blocks += n_pl
             parts.append(f"{kof.name}: {n_pts} pts / {n_pl} polylines")
-        self.status.set(
+        base = (
             f"{len(self.files)} file(s), {total_points} points, "
             f"{total_blocks} polylines   |   " + "  ·  ".join(parts)
         )
+        if len(self._mask_polygon) >= 3:
+            base += f"   |   mask: {len(self._mask_polygon)} vertices"
+        self.status.set(base)
 
 
 # ---------------------------------------------------------------------------
