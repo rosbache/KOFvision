@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from kof_viewer import compute_volume, parse_kof  # noqa: E402
+from kofvision import compute_volume, parse_kof  # noqa: E402
 
 
 def _resolve_repo_root() -> Path:
@@ -23,8 +23,26 @@ def _resolve_repo_root() -> Path:
 
 
 def _load_surfaces(root: Path):
-    top = parse_kof(str(root / "12_A (1).kof"))
-    bottom = parse_kof(str(root / "12_A(1) (1).kof"))
+    candidates = [
+        (root / "12_A (1).kof", root / "12_A(1) (1).kof"),
+        (root / "test data" / "12_A (1).kof", root / "test data" / "12_A(1) (1).kof"),
+    ]
+
+    top_path = None
+    bottom_path = None
+    for candidate_top, candidate_bottom in candidates:
+        if candidate_top.exists() and candidate_bottom.exists():
+            top_path = candidate_top
+            bottom_path = candidate_bottom
+            break
+
+    if top_path is None or bottom_path is None:
+        raise FileNotFoundError(
+            "Could not find sample KOF files. Expected either repo root or test data/."
+        )
+
+    top = parse_kof(str(top_path))
+    bottom = parse_kof(str(bottom_path))
     top.ensure_triangulation()
     bottom.ensure_triangulation()
     return top, bottom
