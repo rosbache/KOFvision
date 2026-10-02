@@ -41,6 +41,11 @@ from typing import Iterable, Optional
 
 import matplotlib
 import numpy as np
+from matplotlib import image as mpimg
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover - Pillow is typically present via matplotlib
+    Image = None
 
 matplotlib.use("TkAgg")
 
@@ -324,7 +329,218 @@ class VolumeResult:
     x_max: float
 
 
-def compute_volume(
+_EPS = 1e-12
+
+
+def _poly_signed_area(poly: list[np.ndarray]) -> float:
+    if len(poly) < 3:
+        return 0.0
+    acc = 0.0
+    for i, p in enumerate(poly):
+        q = poly[(i + 1) % len(poly)]
+        acc += p[0] * q[1] - p[1] * q[0]
+    return 0.5 * acc
+
+
+def _line_intersection(p1: np.ndarray, p2: np.ndarray,
+                       a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    r = p2 - p1
+    s = b - a
+    denom = r[0] * s[1] - r[1] * s[0]
+    if abs(denom) < _EPS:
+        return p2.copy()
+    ap = a - p1
+    t = (ap[0] * s[1] - ap[1] * s[0]) / denom
+    return p1 + t * r
+
+
+def _clip_polygon_convex(subject: list[np.ndarray],
+                         clipper: list[np.ndarray]) -> list[np.ndarray]:
+    if len(subject) < 3 or len(clipper) < 3:
+        return []
+
+    output = [p.copy() for p in subject]
+    clip_sign = 1.0 if _poly_signed_area(clipper) >= 0.0 else -1.0
+    ccount = len(clipper)
+
+    for i in range(ccount):
+        if len(output) < 3:
+            return []
+        a = clipper[i]
+        b = clipper[(i + 1) % ccount]
+
+        def inside(pt: np.ndarray) -> bool:
+            edge = b - a
+            rel = pt - a
+            cross = edge[0] * rel[1] - edge[1] * rel[0]
+            return clip_sign * cross >= -_EPS
+
+        input_poly = output
+        output = []
+        prev = input_poly[-1]
+        prev_in = inside(prev)
+
+        for curr in input_poly:
+            curr_in = inside(curr)
+            if curr_in:
+                if not prev_in:
+                    output.append(_line_intersection(prev, curr, a, b))
+                output.append(curr.copy())
+            elif prev_in:
+                output.append(_line_intersection(prev, curr, a, b))
+            prev = curr
+            prev_in = curr_in
+    return output
+
+
+def _point_in_triangle(pt: np.ndarray, tri: list[np.ndarray]) -> bool:
+    a, b, c = tri
+    v0 = c - a
+    v1 = b - a
+    v2 = pt - a
+    den = v0[0] * v1[1] - v1[0] * v0[1]
+    if abs(den) < _EPS:
+        return False
+    u = (v2[0] * v1[1] - v1[0] * v2[1]) / den
+    v = (v0[0] * v2[1] - v2[0] * v0[1]) / den
+    return u >= -_EPS and v >= -_EPS and (u + v) <= 1.0 + _EPS
+
+
+def _triangulate_simple_polygon(poly: list[np.ndarray]) -> list[list[np.ndarray]]:
+    if len(poly) < 3:
+        return []
+    pts = [p.copy() for p in poly]
+    if np.linalg.norm(pts[0] - pts[-1]) < _EPS:
+        pts.pop()
+    if len(pts) < 3:
+        return []
+
+    sign = 1.0 if _poly_signed_area(pts) >= 0.0 else -1.0
+    indices = list(range(len(pts)))
+    triangles: list[list[np.ndarray]] = []
+    guard = 0
+
+    while len(indices) > 3 and guard < len(pts) * len(pts):
+        guard += 1
+        ear_found = False
+        n = len(indices)
+        for i in range(n):
+            i0 = indices[(i - 1) % n]
+            i1 = indices[i]
+            i2 = indices[(i + 1) % n]
+            a = pts[i0]
+            b = pts[i1]
+            c = pts[i2]
+
+            cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+            if sign * cross <= _EPS:
+                continue
+
+            tri = [a, b, c]
+            contains_other = False
+            for j in indices:
+                if j in (i0, i1, i2):
+                    continue
+                if _point_in_triangle(pts[j], tri):
+                    contains_other = True
+                    break
+            if contains_other:
+                continue
+
+            triangles.append([a.copy(), b.copy(), c.copy()])
+            indices.pop(i)
+            ear_found = True
+            break
+
+        if not ear_found:
+            return []
+
+    if len(indices) == 3:
+        triangles.append([pts[indices[0]].copy(), pts[indices[1]].copy(), pts[indices[2]].copy()])
+    return triangles
+
+
+def _plane_coeff(tri_xy: np.ndarray, tri_z: np.ndarray) -> np.ndarray:
+    m = np.column_stack([tri_xy[:, 0], tri_xy[:, 1], np.ones(3)])
+    return np.linalg.solve(m, tri_z)
+
+
+def _integrate_linear_over_polygon(poly: list[np.ndarray], coeff: np.ndarray) -> tuple[float, float]:
+    if len(poly) < 3:
+        return 0.0, 0.0
+    p0 = poly[0]
+
+    def f(pt: np.ndarray) -> float:
+        return float(coeff[0] * pt[0] + coeff[1] * pt[1] + coeff[2])
+
+    f0 = f(p0)
+    integral = 0.0
+    area = 0.0
+    for i in range(1, len(poly) - 1):
+        p1 = poly[i]
+        p2 = poly[i + 1]
+        tri_area = abs(0.5 * ((p1[0] - p0[0]) * (p2[1] - p0[1]) -
+                              (p1[1] - p0[1]) * (p2[0] - p0[0])))
+        if tri_area <= _EPS:
+            continue
+        f1 = f(p1)
+        f2 = f(p2)
+        integral += tri_area * (f0 + f1 + f2) / 3.0
+        area += tri_area
+    return integral, area
+
+
+def _clip_polygon_by_levelset(poly: list[np.ndarray], coeff: np.ndarray,
+                              keep_positive: bool) -> list[np.ndarray]:
+    if len(poly) < 3:
+        return []
+
+    def g(pt: np.ndarray) -> float:
+        return float(coeff[0] * pt[0] + coeff[1] * pt[1] + coeff[2])
+
+    def inside(val: float) -> bool:
+        return val >= -_EPS if keep_positive else val <= _EPS
+
+    out: list[np.ndarray] = []
+    prev = poly[-1]
+    g_prev = g(prev)
+    prev_in = inside(g_prev)
+
+    for curr in poly:
+        g_curr = g(curr)
+        curr_in = inside(g_curr)
+
+        if prev_in != curr_in:
+            denom = g_prev - g_curr
+            if abs(denom) > _EPS:
+                t = g_prev / denom
+                t = min(max(t, 0.0), 1.0)
+                out.append(prev + t * (curr - prev))
+        if curr_in:
+            out.append(curr.copy())
+        prev = curr
+        g_prev = g_curr
+        prev_in = curr_in
+    return out
+
+
+def _integrate_diff_over_polygon(poly: list[np.ndarray],
+                                 top_xy: np.ndarray, top_z: np.ndarray,
+                                 bot_xy: np.ndarray, bot_z: np.ndarray) -> tuple[float, float, float, float]:
+    coeff = _plane_coeff(top_xy, top_z) - _plane_coeff(bot_xy, bot_z)
+
+    net, area = _integrate_linear_over_polygon(poly, coeff)
+    pos_poly = _clip_polygon_by_levelset(poly, coeff, keep_positive=True)
+    neg_poly = _clip_polygon_by_levelset(poly, coeff, keep_positive=False)
+
+    cut_int, _ = _integrate_linear_over_polygon(pos_poly, coeff)
+    fill_int, _ = _integrate_linear_over_polygon(neg_poly, coeff)
+    cut = max(0.0, cut_int)
+    fill = max(0.0, -fill_int)
+    return net, cut, fill, area
+
+
+def _compute_volume_raster(
     top: KOFFile,
     bottom: KOFFile,
     target_cells: int = 200,
@@ -386,6 +602,139 @@ def compute_volume(
     )
 
 
+def _compute_volume_triangles(
+    top: KOFFile,
+    bottom: KOFFile,
+    mask_polygon: Optional[list[tuple[float, float]]] = None,
+) -> Optional[VolumeResult]:
+    """Integrate (top-bottom) directly over overlap polygons from both triangulations."""
+    if not top.ensure_triangulation() or not bottom.ensure_triangulation():
+        return None
+    if top._xy is None or top._z is None or bottom._xy is None or bottom._z is None:
+        return None
+
+    top_simp = top.kept_simplices
+    bot_simp = bottom.kept_simplices
+    if top_simp is None or bot_simp is None or len(top_simp) == 0 or len(bot_simp) == 0:
+        return None
+
+    tb = top.xy_bounds()
+    bb = bottom.xy_bounds()
+    if tb is None or bb is None:
+        return None
+    y_min = max(tb[0], bb[0])
+    x_min = max(tb[1], bb[1])
+    y_max = min(tb[2], bb[2])
+    x_max = min(tb[3], bb[3])
+    if y_min >= y_max or x_min >= x_max:
+        return None
+
+    top_xy = top._xy[top_simp]
+    top_z = top._z[top_simp]
+    bot_xy = bottom._xy[bot_simp]
+    bot_z = bottom._z[bot_simp]
+
+    top_ymin = np.min(top_xy[:, :, 0], axis=1)
+    top_ymax = np.max(top_xy[:, :, 0], axis=1)
+    top_xmin = np.min(top_xy[:, :, 1], axis=1)
+    top_xmax = np.max(top_xy[:, :, 1], axis=1)
+
+    bot_ymin = np.min(bot_xy[:, :, 0], axis=1)
+    bot_ymax = np.max(bot_xy[:, :, 0], axis=1)
+    bot_xmin = np.min(bot_xy[:, :, 1], axis=1)
+    bot_xmax = np.max(bot_xy[:, :, 1], axis=1)
+
+    mask_tris: Optional[list[list[np.ndarray]]] = None
+    if mask_polygon is not None and len(mask_polygon) >= 3:
+        mask_pts = [np.asarray(p, dtype=float) for p in mask_polygon]
+        mask_tris = _triangulate_simple_polygon(mask_pts)
+        if not mask_tris:
+            return None
+
+    net_total = 0.0
+    cut_total = 0.0
+    fill_total = 0.0
+    area_total = 0.0
+    n_valid = 0
+
+    for i in range(len(top_xy)):
+        overlaps = (
+            (bot_ymax >= top_ymin[i] - _EPS)
+            & (bot_ymin <= top_ymax[i] + _EPS)
+            & (bot_xmax >= top_xmin[i] - _EPS)
+            & (bot_xmin <= top_xmax[i] + _EPS)
+        )
+        cand_idx = np.flatnonzero(overlaps)
+        if len(cand_idx) == 0:
+            continue
+
+        top_poly = [top_xy[i, 0], top_xy[i, 1], top_xy[i, 2]]
+        for j in cand_idx:
+            bot_poly = [bot_xy[j, 0], bot_xy[j, 1], bot_xy[j, 2]]
+            overlap_poly = _clip_polygon_convex(top_poly, bot_poly)
+            if len(overlap_poly) < 3:
+                continue
+
+            pieces = [overlap_poly]
+            if mask_tris is not None:
+                masked_pieces: list[list[np.ndarray]] = []
+                for piece in pieces:
+                    for mtri in mask_tris:
+                        clipped = _clip_polygon_convex(piece, mtri)
+                        if len(clipped) >= 3:
+                            masked_pieces.append(clipped)
+                pieces = masked_pieces
+
+            for poly in pieces:
+                net, cut, fill, area = _integrate_diff_over_polygon(
+                    poly, top_xy[i], top_z[i], bot_xy[j], bot_z[j]
+                )
+                if area <= _EPS:
+                    continue
+                net_total += net
+                cut_total += cut
+                fill_total += fill
+                area_total += area
+                n_valid += 1
+
+    if n_valid == 0:
+        return None
+
+    return VolumeResult(
+        top_name=top.name,
+        bottom_name=bottom.name,
+        cell_size=0.0,
+        n_valid=n_valid,
+        net=float(net_total),
+        cut=float(cut_total),
+        fill=float(fill_total),
+        area=float(area_total),
+        y_min=y_min,
+        x_min=x_min,
+        y_max=y_max,
+        x_max=x_max,
+    )
+
+
+def compute_volume(
+    top: KOFFile,
+    bottom: KOFFile,
+    target_cells: int = 200,
+    mask_polygon: Optional[list[tuple[float, float]]] = None,
+    method: str = "raster",
+) -> Optional[VolumeResult]:
+    """Compute volume by raster sampling or direct triangle integration."""
+    mode = (method or "raster").strip().lower()
+    if mode == "triangles":
+        return _compute_volume_triangles(top, bottom, mask_polygon=mask_polygon)
+    return _compute_volume_raster(
+        top,
+        bottom,
+        target_cells=target_cells,
+        mask_polygon=mask_polygon,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Viewer
 # ---------------------------------------------------------------------------
@@ -397,6 +746,45 @@ FILE_COLORS = [
 ]
 
 
+class _HoverTooltip:
+    """Small tooltip that appears when hovering over a widget."""
+
+    def __init__(self, widget: tk.Widget, text: str) -> None:
+        self.widget = widget
+        self.text = text
+        self.tip_window: Optional[tk.Toplevel] = None
+        self.widget.bind("<Enter>", self._show)
+        self.widget.bind("<Leave>", self._hide)
+        self.widget.bind("<ButtonPress>", self._hide)
+
+    def _show(self, _event=None) -> None:  # noqa: ANN001
+        if self.tip_window is not None:
+            return
+        x = self.widget.winfo_rootx() + 18
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        tip.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            tip,
+            text=self.text,
+            justify=tk.LEFT,
+            background="#ffffe0",
+            relief=tk.SOLID,
+            borderwidth=1,
+            padx=6,
+            pady=4,
+        )
+        label.pack()
+        self.tip_window = tip
+
+    def _hide(self, _event=None) -> None:  # noqa: ANN001
+        if self.tip_window is None:
+            return
+        self.tip_window.destroy()
+        self.tip_window = None
+
+
 class KOFViewer(tk.Tk):
     def __init__(self, initial_files: Optional[list[str]] = None) -> None:
         super().__init__()
@@ -404,6 +792,7 @@ class KOFViewer(tk.Tk):
         self.geometry("1300x860")
 
         self.files: list[KOFFile] = []
+        self.layer_vars: list[tk.BooleanVar] = []
         self.last_volume: Optional[VolumeResult] = None
 
         self.show_labels = tk.BooleanVar(value=False)
@@ -411,11 +800,21 @@ class KOFViewer(tk.Tk):
         self.show_lines = tk.BooleanVar(value=True)
         self.show_triangulation = tk.BooleanVar(value=False)
         self.equal_aspect = tk.BooleanVar(value=True)
+        self.show_raster = tk.BooleanVar(value=False)
+        self.raster_alpha = tk.DoubleVar(value=0.7)
 
         self.top_var = tk.StringVar()
         self.bottom_var = tk.StringVar()
+        self.volume_method = tk.StringVar(value="raster")
         self.volume_text = tk.StringVar(value="Volume: (not computed)")
         self.boundary_factor = tk.DoubleVar(value=2.5)
+
+        # Raster background state (2D tab only)
+        self.raster_path: Optional[str] = None
+        self._raster_img: Optional[np.ndarray] = None
+        self._raster_extent: Optional[tuple[float, float, float, float]] = None
+        self._raster_origin: str = "upper"
+        self._view_extent_2d: Optional[tuple[float, float, float, float]] = None
 
         # Section-drawing state
         self._section_mode = False
@@ -437,6 +836,7 @@ class KOFViewer(tk.Tk):
         for path in initial_files or []:
             self._load_file(path, redraw=False)
         self._refresh_file_selectors()
+        self._refresh_layer_controls()
         self._redraw()
 
     # ------------------------------------------------------------------ UI
@@ -447,6 +847,25 @@ class KOFViewer(tk.Tk):
         ttk.Button(bar, text="Open...", command=self._on_open).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="Clear", command=self._on_clear).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(bar, text="Open raster...",
+                   command=self._on_open_raster).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="Clear raster",
+                   command=self._on_clear_raster).pack(side=tk.LEFT, padx=2)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        ttk.Checkbutton(bar, text="Raster", variable=self.show_raster,
+                        command=self._redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Label(bar, text="Raster alpha:").pack(side=tk.LEFT, padx=(8, 2))
+        self.raster_alpha_spin = ttk.Spinbox(
+            bar, from_=0.05, to=1.0, increment=0.05, width=5,
+            textvariable=self.raster_alpha,
+            command=self._on_raster_alpha_change,
+        )
+        self.raster_alpha_spin.pack(side=tk.LEFT)
+        self.raster_alpha_spin.bind("<Return>",
+                                   lambda _e: self._on_raster_alpha_change())
+        self.raster_alpha_spin.bind("<FocusOut>",
+                                   lambda _e: self._on_raster_alpha_change())
 
         ttk.Checkbutton(bar, text="Labels", variable=self.show_labels,
                         command=self._redraw).pack(side=tk.LEFT, padx=2)
@@ -460,7 +879,10 @@ class KOFViewer(tk.Tk):
                         command=self._redraw).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Button(bar, text="Reset view", command=self._redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="Zoom to selected layers",
+               command=self._on_zoom_selected_layers).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="Reset view",
+               command=self._on_reset_view).pack(side=tk.LEFT, padx=2)
 
         # Row 2: surfaces + volume + section
         bar2 = ttk.Frame(self, padding=(4, 0, 4, 4))
@@ -473,6 +895,21 @@ class KOFViewer(tk.Tk):
         self.bottom_combo = ttk.Combobox(bar2, textvariable=self.bottom_var,
                                          width=28, state="readonly")
         self.bottom_combo.pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(bar2, text="Method:").pack(side=tk.LEFT, padx=(10, 2))
+        self.volume_method_combo = ttk.Combobox(
+            bar2,
+            textvariable=self.volume_method,
+            values=["raster", "triangles"],
+            width=10,
+            state="readonly",
+        )
+        self.volume_method_combo.pack(side=tk.LEFT, padx=2)
+        _HoverTooltip(
+            self.volume_method_combo,
+            "raster: fastest for quick estimates.\n"
+            "triangles: exact overlap integration; slower but more accurate.",
+        )
 
         ttk.Button(bar2, text="Compute volume",
                    command=self._on_compute_volume).pack(side=tk.LEFT, padx=(10, 2))
@@ -505,8 +942,17 @@ class KOFViewer(tk.Tk):
                command=self._on_clear_mask).pack(side=tk.LEFT, padx=2)
 
     def _build_body(self) -> None:
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True)
+        body = ttk.Frame(self)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        self.layers_frame = ttk.LabelFrame(body, text="Layers", padding=6)
+        self.layers_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 2), pady=(0, 4))
+        self.layers_inner = ttk.Frame(self.layers_frame)
+        self.layers_inner.pack(fill=tk.BOTH, expand=True)
+        self._refresh_layer_controls()
+
+        self.notebook = ttk.Notebook(body)
+        self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # 2D tab
         frame2d = ttk.Frame(self.notebook)
@@ -543,10 +989,13 @@ class KOFViewer(tk.Tk):
         for path in paths:
             self._load_file(path, redraw=False)
         self._refresh_file_selectors()
+        self._refresh_layer_controls()
         self._redraw()
 
     def _on_clear(self) -> None:
         self.files.clear()
+        self.layer_vars.clear()
+        self._view_extent_2d = None
         self.last_volume = None
         self.volume_text.set("Volume: (not computed)")
         self._sections.clear()
@@ -555,7 +1004,242 @@ class KOFViewer(tk.Tk):
         if self._mask_mode:
             self._end_mask_mode()
         self._refresh_file_selectors()
+        self._refresh_layer_controls()
         self._redraw()
+
+    def _on_open_raster(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Open raster background",
+            filetypes=[
+                ("Raster images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        self._load_raster(path)
+
+    def _on_clear_raster(self) -> None:
+        had_raster = self._raster_img is not None
+        self.raster_path = None
+        self._raster_img = None
+        self._raster_extent = None
+        self.show_raster.set(False)
+        if had_raster:
+            self._refresh_layer_controls()
+            self._redraw()
+
+    def _on_raster_alpha_change(self) -> None:
+        try:
+            alpha = float(self.raster_alpha.get())
+        except (tk.TclError, ValueError):
+            return
+        alpha = min(max(alpha, 0.05), 1.0)
+        self.raster_alpha.set(alpha)
+        if self._raster_img is not None and self.show_raster.get():
+            self._redraw_2d()
+
+    @staticmethod
+    def _worldfile_candidates(raster_path: str) -> list[str]:
+        base, ext = os.path.splitext(raster_path)
+        ext_l = ext.lower()
+        candidates: list[str] = []
+
+        if ext_l in (".jpg", ".jpeg"):
+            candidates.extend([base + ".jgw", base + ".jpgw", base + ".jpegw"])
+        elif ext_l == ".png":
+            candidates.extend([base + ".pgw", base + ".pngw"])
+        elif ext_l in (".tif", ".tiff"):
+            candidates.extend([base + ".tfw", base + ".tifw", base + ".tiffw"])
+        elif ext_l == ".bmp":
+            candidates.extend([base + ".bpw", base + ".bmpw"])
+
+        candidates.append(base + ".wld")
+        candidates.append(raster_path + "w")
+
+        # Keep order stable and remove duplicates.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for cand in candidates:
+            if cand not in seen:
+                seen.add(cand)
+                ordered.append(cand)
+        return ordered
+
+    @staticmethod
+    def _parse_worldfile(path: str) -> tuple[float, float, float, float, float, float]:
+        values: list[float] = []
+        with open(path, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                txt = raw.strip()
+                if not txt:
+                    continue
+                values.append(float(txt.replace(",", ".")))
+        if len(values) < 6:
+            raise ValueError("World file must contain at least 6 numeric lines.")
+        return values[0], values[1], values[2], values[3], values[4], values[5]
+
+    @staticmethod
+    def _read_raster_for_display(
+        path: str,
+        max_dim: int = 3200,
+    ) -> tuple[np.ndarray, int, int]:
+        """Return display image plus original raster size (rows, cols).
+
+        Uses a downsampled preview for very large rasters while preserving
+        georeferencing based on the original full-resolution dimensions.
+        """
+        if Image is None:
+            arr = mpimg.imread(path)
+            if arr.ndim < 2:
+                raise ValueError("Unsupported raster format.")
+            rows, cols = int(arr.shape[0]), int(arr.shape[1])
+            return arr, rows, cols
+
+        old_max_pixels = Image.MAX_IMAGE_PIXELS
+        try:
+            # Orthophotos can legitimately exceed Pillow's bomb guard threshold.
+            Image.MAX_IMAGE_PIXELS = None
+            with Image.open(path) as src:
+                cols, rows = src.size
+                if rows < 1 or cols < 1:
+                    raise ValueError("Raster image is empty.")
+
+                img = src
+                largest = max(rows, cols)
+                if largest > max_dim:
+                    scale = max_dim / float(largest)
+                    out_cols = max(int(round(cols * scale)), 1)
+                    out_rows = max(int(round(rows * scale)), 1)
+                    try:
+                        img.draft("RGB", (out_cols, out_rows))
+                    except Exception:  # noqa: BLE001
+                        pass
+                    img = img.resize((out_cols, out_rows))
+
+                if img.mode not in ("L", "RGB", "RGBA"):
+                    img = img.convert("RGB")
+                arr = np.asarray(img)
+                return arr, rows, cols
+        finally:
+            Image.MAX_IMAGE_PIXELS = old_max_pixels
+
+    def _load_raster(self, path: str) -> None:
+        worldfile_path = None
+        for candidate in self._worldfile_candidates(path):
+            if os.path.exists(candidate):
+                worldfile_path = candidate
+                break
+
+        if worldfile_path is None:
+            messagebox.showerror(
+                "KOF Viewer",
+                "No world file was found for the selected raster.\n\n"
+                "Expected one of: .jgw/.pgw/.tfw/.wld beside the image.",
+            )
+            return
+
+        try:
+            img, rows, cols = self._read_raster_for_display(path)
+            a, d, b, e, c, f = self._parse_worldfile(worldfile_path)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(
+                "KOF Viewer",
+                f"Failed to load raster or world file:\n{exc}",
+            )
+            return
+
+        if abs(b) > 1e-12 or abs(d) > 1e-12:
+            messagebox.showerror(
+                "KOF Viewer",
+                "Rotated world files are not supported yet (non-zero B/D terms).",
+            )
+            return
+
+        if img.ndim < 2:
+            messagebox.showerror("KOF Viewer", "Unsupported raster format.")
+            return
+
+        x0 = c - (a / 2.0)
+        x1 = c + a * (cols - 0.5)
+        y0 = f - (e / 2.0)
+        y1 = f + e * (rows - 0.5)
+
+        xmin, xmax = (x0, x1) if x0 <= x1 else (x1, x0)
+        ymin, ymax = (y0, y1) if y0 <= y1 else (y1, y0)
+
+        self.raster_path = path
+        self._raster_img = img
+        self._raster_extent = (xmin, xmax, ymin, ymax)
+        self._raster_origin = "upper" if e < 0 else "lower"
+        self.show_raster.set(True)
+        self._refresh_layer_controls()
+        self._redraw()
+
+    def _on_reset_view(self) -> None:
+        self._view_extent_2d = None
+        self._redraw_2d()
+        self._update_status()
+
+    def _on_zoom_selected_layers(self) -> None:
+        bounds = self._selected_layers_2d_bounds()
+        if bounds is None:
+            messagebox.showinfo(
+                "KOF Viewer",
+                "No visible layers with valid extents. Select one or more layers first.",
+            )
+            return
+
+        xmin, xmax, ymin, ymax = bounds
+        span_x = xmax - xmin
+        span_y = ymax - ymin
+        if span_x <= 0 and span_y <= 0:
+            pad_x = 1.0
+            pad_y = 1.0
+        else:
+            pad_x = max(span_x * 0.03, 1.0)
+            pad_y = max(span_y * 0.03, 1.0)
+
+        self._view_extent_2d = (
+            xmin - pad_x,
+            xmax + pad_x,
+            ymin - pad_y,
+            ymax + pad_y,
+        )
+        self.notebook.select(0)
+        self._redraw_2d()
+        self._update_status()
+
+    def _selected_layers_2d_bounds(self) -> Optional[tuple[float, float, float, float]]:
+        xmin: Optional[float] = None
+        xmax: Optional[float] = None
+        ymin: Optional[float] = None
+        ymax: Optional[float] = None
+
+        def include(x0: float, x1: float, y0: float, y1: float) -> None:
+            nonlocal xmin, xmax, ymin, ymax
+            xmin = x0 if xmin is None else min(xmin, x0)
+            xmax = x1 if xmax is None else max(xmax, x1)
+            ymin = y0 if ymin is None else min(ymin, y0)
+            ymax = y1 if ymax is None else max(ymax, y1)
+
+        if self.show_raster.get() and self._raster_extent is not None:
+            rxmin, rxmax, rymin, rymax = self._raster_extent
+            include(rxmin, rxmax, rymin, rymax)
+
+        for idx, kof in enumerate(self.files):
+            if not self._is_layer_visible(idx):
+                continue
+            points = kof.all_points
+            if not points:
+                continue
+            xs = [p.y for p in points]
+            ys = [p.x for p in points]
+            include(min(xs), max(xs), min(ys), max(ys))
+
+        if xmin is None or xmax is None or ymin is None or ymax is None:
+            return None
+        return xmin, xmax, ymin, ymax
 
     def _on_clear_sections(self) -> None:
         if not self._sections:
@@ -570,8 +1254,10 @@ class KOFViewer(tk.Tk):
             messagebox.showerror("KOF Viewer", f"Failed to read '{path}':\n{exc}")
             return
         self.files.append(kof)
+        self.layer_vars.append(tk.BooleanVar(value=True))
         if redraw:
             self._refresh_file_selectors()
+            self._refresh_layer_controls()
             self._redraw()
 
     def _refresh_file_selectors(self) -> None:
@@ -586,6 +1272,47 @@ class KOFViewer(tk.Tk):
         else:
             self.top_var.set("")
             self.bottom_var.set("")
+
+    def _refresh_layer_controls(self) -> None:
+        for child in self.layers_inner.winfo_children():
+            child.destroy()
+
+        has_raster_layer = self.raster_path is not None and self._raster_img is not None
+
+        if not self.files and not has_raster_layer:
+            ttk.Label(self.layers_inner, text="No layers loaded.").pack(anchor="w")
+            return
+
+        if has_raster_layer:
+            raster_name = os.path.basename(self.raster_path)
+            ttk.Checkbutton(
+                self.layers_inner,
+                text=f"Raster: {raster_name}",
+                variable=self.show_raster,
+                command=self._redraw,
+            ).pack(anchor="w", pady=1)
+            ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(
+                fill=tk.X, pady=(2, 4)
+            )
+
+        for idx, kof in enumerate(self.files):
+            if idx >= len(self.layer_vars):
+                self.layer_vars.append(tk.BooleanVar(value=True))
+
+            n_pts = sum(len(b.points) for b in kof.blocks)
+            n_pl = sum(1 for b in kof.blocks if b.is_polyline and b.points)
+            label = f"{kof.name} ({n_pts} pts, {n_pl} pl)"
+            ttk.Checkbutton(
+                self.layers_inner,
+                text=label,
+                variable=self.layer_vars[idx],
+                command=self._redraw,
+            ).pack(anchor="w", pady=1)
+
+    def _is_layer_visible(self, idx: int) -> bool:
+        if idx < 0 or idx >= len(self.layer_vars):
+            return True
+        return bool(self.layer_vars[idx].get())
 
     def _find_file(self, name: str) -> Optional[KOFFile]:
         for k in self.files:
@@ -603,7 +1330,8 @@ class KOFViewer(tk.Tk):
             messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
             return
         mask_poly = self._mask_polygon if len(self._mask_polygon) >= 3 else None
-        result = compute_volume(top, bot, mask_polygon=mask_poly)
+        method = self.volume_method.get().strip().lower()
+        result = compute_volume(top, bot, mask_polygon=mask_poly, method=method)
         if result is None:
             messagebox.showerror(
                 "KOF Viewer",
@@ -614,7 +1342,7 @@ class KOFViewer(tk.Tk):
         self.last_volume = result
         mask_suffix = " (masked)" if mask_poly is not None else ""
         self.volume_text.set(
-            f"Net: {result.net:+,.2f} m³   (Cut {result.cut:,.2f} / "
+            f"{method}: Net {result.net:+,.2f} m³   (Cut {result.cut:,.2f} / "
             f"Fill {result.fill:,.2f})   over {result.area:,.1f} m²{mask_suffix}"
         )
         if self.show_triangulation.get():
@@ -806,7 +1534,22 @@ class KOFViewer(tk.Tk):
         self.ax2d.set_ylabel("Northing (X)")
         self.ax2d.grid(True, linestyle=":", alpha=0.5)
 
+        if (
+            self.show_raster.get()
+            and self._raster_img is not None
+            and self._raster_extent is not None
+        ):
+            self.ax2d.imshow(
+                self._raster_img,
+                extent=self._raster_extent,
+                origin=self._raster_origin,
+                alpha=float(self.raster_alpha.get()),
+                zorder=0,
+            )
+
         for idx, kof in enumerate(self.files):
+            if not self._is_layer_visible(idx):
+                continue
             color = FILE_COLORS[idx % len(FILE_COLORS)]
             labeled = False
             for block in kof.blocks:
@@ -844,6 +1587,11 @@ class KOFViewer(tk.Tk):
             self.ax2d.set_aspect("equal", adjustable="datalim")
         else:
             self.ax2d.set_aspect("auto")
+
+        if self._view_extent_2d is not None:
+            xmin, xmax, ymin, ymax = self._view_extent_2d
+            self.ax2d.set_xlim(xmin, xmax)
+            self.ax2d.set_ylim(ymin, ymax)
 
         # Persisted section lines (drawn on top of surface data).
         for i, ((y0, x0), (y1, x1)) in enumerate(self._sections):
@@ -902,6 +1650,8 @@ class KOFViewer(tk.Tk):
         self.ax3d.set_zlabel("Elevation (H)")
 
         for idx, kof in enumerate(self.files):
+            if not self._is_layer_visible(idx):
+                continue
             color = FILE_COLORS[idx % len(FILE_COLORS)]
             labeled = False
             if self.show_triangulation.get() and kof.ensure_triangulation():
@@ -994,6 +1744,12 @@ class KOFViewer(tk.Tk):
         )
         if len(self._mask_polygon) >= 3:
             base += f"   |   mask: {len(self._mask_polygon)} vertices"
+        if self.raster_path and self._raster_extent is not None:
+            state = "on" if self.show_raster.get() else "off"
+            base += (
+                f"   |   raster: {os.path.basename(self.raster_path)} "
+                f"({state}, alpha={float(self.raster_alpha.get()):.2f})"
+            )
         self.status.set(base)
 
 
