@@ -57,6 +57,19 @@ Or preload one or more KOF files:
 python kof_viewer.py "12_A (1).kof" "12_A(1) (1).kof"
 ```
 
+## Package for End Users (Windows)
+
+Build a distributable app with PyInstaller:
+
+```powershell
+python -m pip install -r requirements-build.txt
+.\scripts\build_pyinstaller.ps1
+```
+
+This produces a release folder and a shareable ZIP in `dist/`.
+
+For full packaging and distribution details, see `docs/pyinstaller-windows.md`.
+
 ## Workflow
 
 1. Open two surface files (for example existing top and design/bottom).
