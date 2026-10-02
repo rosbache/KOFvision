@@ -1,0 +1,8 @@
+# Core dependencies for kof_viewer.py and scripts/generate_readme_images.py
+numpy
+matplotlib
+scipy
+
+# Dependencies for kof_reader.py (GeoPackage/GeoDataFrame export)
+geopandas
+shapely
