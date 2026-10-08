@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Protocol, runtime_checkable
 
 import numpy as np
 from matplotlib.path import Path
@@ -13,6 +13,17 @@ from .geometry import (
     triangulate_simple_polygon,
 )
 from .models import KOFFile
+
+
+@runtime_checkable
+class SurfaceLike(Protocol):
+    name: str
+
+    def xy_bounds(self) -> Optional[tuple[float, float, float, float]]:
+        ...
+
+    def interpolate(self, y: np.ndarray, x: np.ndarray) -> np.ndarray:
+        ...
 
 
 @dataclass
@@ -31,14 +42,47 @@ class VolumeResult:
     x_max: float
 
 
+@dataclass
+class SplitVolumeResult:
+    upper: VolumeResult
+    lower: VolumeResult
+
+    @property
+    def net(self) -> float:
+        return float(self.upper.net + self.lower.net)
+
+    @property
+    def cut(self) -> float:
+        return float(self.upper.cut + self.lower.cut)
+
+    @property
+    def fill(self) -> float:
+        return float(self.upper.fill + self.lower.fill)
+
+
+@dataclass
+class ConstantElevationSurface:
+    name: str
+    z_value: float
+    bounds: tuple[float, float, float, float]
+
+    def xy_bounds(self) -> Optional[tuple[float, float, float, float]]:
+        return self.bounds
+
+    def interpolate(self, y: np.ndarray, x: np.ndarray) -> np.ndarray:  # noqa: ARG002
+        return np.full_like(y, fill_value=float(self.z_value), dtype=float)
+
+
 def _compute_volume_raster(
-    top: KOFFile,
-    bottom: KOFFile,
+    top: SurfaceLike,
+    bottom: SurfaceLike,
     target_cells: int = 200,
     mask_polygon: Optional[list[tuple[float, float]]] = None,
 ) -> Optional[VolumeResult]:
     """Grid-sample both surfaces and sum (top-bottom) * cell_area."""
-    if not top.ensure_triangulation() or not bottom.ensure_triangulation():
+    if isinstance(top, KOFFile) and not top.ensure_triangulation():
+        return None
+    if isinstance(bottom, KOFFile) and not bottom.ensure_triangulation():
         return None
 
     tb = top.xy_bounds()
@@ -209,14 +253,63 @@ def _compute_volume_triangles(
 
 
 def compute_volume(
-    top: KOFFile,
-    bottom: KOFFile,
+    top: SurfaceLike,
+    bottom: SurfaceLike,
     target_cells: int = 200,
     mask_polygon: Optional[list[tuple[float, float]]] = None,
     method: str = "raster",
-) -> Optional[VolumeResult]:
+) -> Optional[VolumeResult | SplitVolumeResult]:
     """Compute volume by raster sampling or direct triangle integration."""
     mode = (method or "raster").strip().lower()
+    return _compute_volume_pair(
+        top,
+        bottom,
+        target_cells=target_cells,
+        mask_polygon=mask_polygon,
+        mode=mode,
+    )
+
+
+def compute_volume_with_intermediate(
+    top: SurfaceLike,
+    intermediate: SurfaceLike,
+    bottom: SurfaceLike,
+    target_cells: int = 200,
+    mask_polygon: Optional[list[tuple[float, float]]] = None,
+    method: str = "raster",
+) -> Optional[SplitVolumeResult]:
+    """Compute split volume as top-intermediate and intermediate-bottom."""
+    mode = (method or "raster").strip().lower()
+    upper = _compute_volume_pair(
+        top,
+        intermediate,
+        target_cells=target_cells,
+        mask_polygon=mask_polygon,
+        mode=mode,
+    )
+    if upper is None:
+        return None
+    lower = _compute_volume_pair(
+        intermediate,
+        bottom,
+        target_cells=target_cells,
+        mask_polygon=mask_polygon,
+        mode=mode,
+    )
+    if lower is None:
+        return None
+    return SplitVolumeResult(upper=upper, lower=lower)
+
+
+def _compute_volume_pair(
+    top: SurfaceLike,
+    bottom: SurfaceLike,
+    target_cells: int,
+    mask_polygon: Optional[list[tuple[float, float]]],
+    mode: str,
+) -> Optional[VolumeResult]:
     if mode == "triangles":
+        if not isinstance(top, KOFFile) or not isinstance(bottom, KOFFile):
+            raise ValueError("'triangles' method only supports KOF-vs-KOF surfaces.")
         return _compute_volume_triangles(top, bottom, mask_polygon=mask_polygon)
     return _compute_volume_raster(top, bottom, target_cells=target_cells, mask_polygon=mask_polygon)
