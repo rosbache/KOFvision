@@ -18,9 +18,11 @@ Features
   cut/fill split.
 - Section tool: click two points on the 2D plot to draw a profile that
   shows both surfaces along the line and the area between them.
+- Export to GeoPackage (original points and polylines only, no triangles).
 
 Only ``matplotlib``, ``numpy`` and ``scipy`` plus the standard library
-(``tkinter``) are required; ``geopandas`` is intentionally not used.
+(``tkinter``) are required for viewing. GeoPackage export additionally
+requires ``geopandas`` and ``shapely``.
 
 Usage
 -----
@@ -31,11 +33,15 @@ Usage
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
-from typing import Optional
+from tkinter import simpledialog
+from typing import Any, Optional
+from datetime import datetime
 
 import matplotlib
 import numpy as np
@@ -49,10 +55,21 @@ from matplotlib.backends.backend_tkagg import (
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
-from kofvision import compute_volume, parse_kof
+from kofvision import compute_volume, compute_volume_with_intermediate, parse_kof
+from kofvision.export import export_kof_files_to_gpkg
 from kofvision.models import KOFFile
-from kofvision.volume import VolumeResult
-from kofvision.raster import load_raster_layer
+from kofvision.mask_io import MaskDataError, load_mask_json, save_mask_json
+from kofvision.section_report import (
+    profile_segment_from_station,
+    sample_profile,
+    save_plan_view_png,
+    save_profile_plot_png,
+    station_values,
+    write_html_report,
+)
+from kofvision.sections_io import SectionDataError, load_sections_json, save_sections_json
+from kofvision.volume import ConstantElevationSurface, SplitVolumeResult, SurfaceLike, VolumeResult
+from kofvision.raster import ElevationRasterSurface, load_elevation_surface, load_raster_layer
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +81,33 @@ FILE_COLORS = [
     "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e",
     "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f",
 ]
+
+VOLUME_MODE_LABELS: dict[str, str] = {
+    "kof_vs_kof": "KOF - KOF",
+    "top_minus_raster": "Top KOF - Raster",
+    "raster_minus_bottom": "Raster - Bottom KOF",
+    "raster_minus_top": "Raster - Top KOF",
+}
+VOLUME_LABEL_TO_MODE: dict[str, str] = {v: k for k, v in VOLUME_MODE_LABELS.items()}
+
+INTERMEDIATE_TYPE_LABELS: dict[str, str] = {
+    "none": "None",
+    "kof": "KOF layer",
+    "raster": "Raster layer",
+    "constant": "Constant Z",
+}
+INTERMEDIATE_LABEL_TO_TYPE: dict[str, str] = {v: k for k, v in INTERMEDIATE_TYPE_LABELS.items()}
+
+
+@dataclass
+class _RasterViewLayer:
+    path: str
+    image: np.ndarray
+    extent: tuple[float, float, float, float]
+    origin: str
+    visible: tk.BooleanVar
+    alpha: tk.DoubleVar
+    elevation_surface: Optional[ElevationRasterSurface]
 
 
 class _HoverTooltip:
@@ -113,7 +157,7 @@ class KOFViewer(tk.Tk):
 
         self.files: list[KOFFile] = []
         self.layer_vars: list[tk.BooleanVar] = []
-        self.last_volume: Optional[VolumeResult] = None
+        self.last_volume: Optional[VolumeResult | SplitVolumeResult] = None
 
         self.show_labels = tk.BooleanVar(value=False)
         self.show_markers = tk.BooleanVar(value=True)
@@ -125,15 +169,23 @@ class KOFViewer(tk.Tk):
 
         self.top_var = tk.StringVar()
         self.bottom_var = tk.StringVar()
+        self.volume_source_mode = tk.StringVar(value=VOLUME_MODE_LABELS["kof_vs_kof"])
         self.volume_method = tk.StringVar(value="raster")
+        self.intermediate_type = tk.StringVar(value=INTERMEDIATE_TYPE_LABELS["none"])
+        self.intermediate_kof_var = tk.StringVar()
+        self.intermediate_raster_var = tk.StringVar()
+        self.intermediate_constant_z = tk.DoubleVar(value=0.0)
         self.volume_text = tk.StringVar(value="Volume: (not computed)")
         self.boundary_factor = tk.DoubleVar(value=2.5)
+        self.raster_clip_to_kof = tk.BooleanVar(value=False)
+        self.raster_clip_buffer_m = tk.DoubleVar(value=10.0)
+        self.active_raster_name = tk.StringVar(value="")
 
         # Raster background state (2D tab only)
-        self.raster_path: Optional[str] = None
-        self._raster_img: Optional[np.ndarray] = None
-        self._raster_extent: Optional[tuple[float, float, float, float]] = None
-        self._raster_origin: str = "upper"
+        self._raster_layers: list[_RasterViewLayer] = []
+        self._active_raster_index: Optional[int] = None
+        self._elevation_raster_index: Optional[int] = None
+        self._intermediate_raster_index_map: dict[str, int] = {}
         self._view_extent_2d: Optional[tuple[float, float, float, float]] = None
 
         # Section-drawing state
@@ -165,16 +217,45 @@ class KOFViewer(tk.Tk):
         bar.pack(side=tk.TOP, fill=tk.X)
 
         ttk.Button(bar, text="Open...", command=self._on_open).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="Export GPKG...",
+               command=self._on_export_gpkg).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="Clear", command=self._on_clear).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(bar, text="Open raster...",
                    command=self._on_open_raster).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="Clear raster",
+        ttk.Button(bar, text="Remove raster",
                    command=self._on_clear_raster).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="Raster up",
+                   command=self._on_move_raster_up).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="Raster down",
+                   command=self._on_move_raster_down).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar, text="Set elevation raster",
+                   command=self._on_set_elevation_raster).pack(side=tk.LEFT, padx=2)
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
         ttk.Checkbutton(bar, text="Raster", variable=self.show_raster,
                         command=self._redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Label(bar, text="Active raster:").pack(side=tk.LEFT, padx=(8, 2))
+        self.active_raster_combo = ttk.Combobox(
+            bar,
+            textvariable=self.active_raster_name,
+            values=[],
+            width=24,
+            state="readonly",
+        )
+        self.active_raster_combo.pack(side=tk.LEFT, padx=2)
+        self.active_raster_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._on_select_active_raster(),
+        )
+        ttk.Checkbutton(bar, text="Clip raster to KOF",
+                        variable=self.raster_clip_to_kof).pack(side=tk.LEFT, padx=(8, 2))
+        ttk.Label(bar, text="Clip buffer (m):").pack(side=tk.LEFT, padx=(4, 2))
+        self.raster_clip_buffer_spin = ttk.Spinbox(
+            bar, from_=0.0, to=10000.0, increment=1.0, width=6,
+            textvariable=self.raster_clip_buffer_m,
+        )
+        self.raster_clip_buffer_spin.pack(side=tk.LEFT, padx=(0, 4))
         ttk.Label(bar, text="Raster alpha:").pack(side=tk.LEFT, padx=(8, 2))
         self.raster_alpha_spin = ttk.Spinbox(
             bar, from_=0.05, to=1.0, increment=0.05, width=5,
@@ -216,6 +297,81 @@ class KOFViewer(tk.Tk):
                                          width=28, state="readonly")
         self.bottom_combo.pack(side=tk.LEFT, padx=2)
 
+        ttk.Label(bar2, text="Volume from:").pack(side=tk.LEFT, padx=(10, 2))
+        self.volume_source_combo = ttk.Combobox(
+            bar2,
+            textvariable=self.volume_source_mode,
+            values=list(VOLUME_MODE_LABELS.values()),
+            width=18,
+            state="readonly",
+        )
+        self.volume_source_combo.pack(side=tk.LEFT, padx=2)
+        _HoverTooltip(
+            self.volume_source_combo,
+            "KOF - KOF: existing KOF top/bottom workflow.\n"
+            "Top KOF - Raster: top KOF minus loaded elevation raster.\n"
+            "Raster - Bottom KOF: loaded elevation raster minus bottom KOF.\n"
+            "Raster - Top KOF: loaded elevation raster minus top KOF.",
+        )
+
+        ttk.Label(bar2, text="Intermediate:").pack(side=tk.LEFT, padx=(10, 2))
+        self.intermediate_type_combo = ttk.Combobox(
+            bar2,
+            textvariable=self.intermediate_type,
+            values=list(INTERMEDIATE_TYPE_LABELS.values()),
+            width=12,
+            state="readonly",
+        )
+        self.intermediate_type_combo.pack(side=tk.LEFT, padx=2)
+        self.intermediate_type_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._on_intermediate_type_change(),
+        )
+        _HoverTooltip(
+            self.intermediate_type_combo,
+            "Optional split-volume reference.\n"
+            "None: single result (top-bottom).\n"
+            "KOF layer: split into Top-KOF and KOF-Bottom.\n"
+            "Raster layer: split into Top-Raster and Raster-Bottom.\n"
+            "Constant Z: split against a horizontal plane.",
+        )
+
+        self.intermediate_kof_combo = ttk.Combobox(
+            bar2,
+            textvariable=self.intermediate_kof_var,
+            values=[],
+            width=18,
+            state="readonly",
+        )
+        self.intermediate_kof_combo.pack(side=tk.LEFT, padx=2)
+
+        self.intermediate_raster_combo = ttk.Combobox(
+            bar2,
+            textvariable=self.intermediate_raster_var,
+            values=[],
+            width=18,
+            state="readonly",
+        )
+        self.intermediate_raster_combo.pack(side=tk.LEFT, padx=2)
+
+        self.intermediate_constant_z_spin = ttk.Spinbox(
+            bar2,
+            from_=-100000.0,
+            to=100000.0,
+            increment=0.1,
+            width=9,
+            textvariable=self.intermediate_constant_z,
+        )
+        self.intermediate_constant_z_spin.pack(side=tk.LEFT, padx=2)
+        self.intermediate_constant_z_spin.bind(
+            "<Return>",
+            lambda _e: self._on_intermediate_type_change(),
+        )
+        self.intermediate_constant_z_spin.bind(
+            "<FocusOut>",
+            lambda _e: self._on_intermediate_type_change(),
+        )
+
         ttk.Label(bar2, text="Method:").pack(side=tk.LEFT, padx=(10, 2))
         self.volume_method_combo = ttk.Combobox(
             bar2,
@@ -229,6 +385,10 @@ class KOFViewer(tk.Tk):
             self.volume_method_combo,
             "raster: fastest for quick estimates.\n"
             "triangles: exact overlap integration; slower but more accurate.",
+        )
+        self.volume_method_combo.bind(
+            "<<ComboboxSelected>>",
+            lambda _e: self._on_intermediate_type_change(),
         )
 
         ttk.Button(bar2, text="Compute volume",
@@ -247,18 +407,35 @@ class KOFViewer(tk.Tk):
         self.boundary_spin.bind("<Return>", lambda _e: self._on_boundary_change())
         self.boundary_spin.bind("<FocusOut>", lambda _e: self._on_boundary_change())
 
-        ttk.Separator(bar2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        self.section_btn = ttk.Button(bar2, text="Draw section",
-                                      command=self._on_toggle_section)
-        self.section_btn.pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar2, text="Clear sections",
-                   command=self._on_clear_sections).pack(side=tk.LEFT, padx=2)
+        self._on_intermediate_type_change()
 
-        ttk.Separator(bar2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        self.mask_btn = ttk.Button(bar2, text="Draw mask",
+        # Row 3: section + mask tools (kept separate to avoid horizontal overflow)
+        bar3 = ttk.Frame(self, padding=(4, 0, 4, 4))
+        bar3.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(bar3, text="Sections:").pack(side=tk.LEFT, padx=(0, 4))
+        self.section_btn = ttk.Button(bar3, text="Draw section",
+                          command=self._on_toggle_section)
+        self.section_btn.pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar3, text="Clear sections",
+               command=self._on_clear_sections).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar3, text="Save sections...",
+               command=self._on_save_sections_json).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar3, text="Load sections...",
+               command=self._on_load_sections_json).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar3, text="Export section report...",
+               command=self._on_export_section_report).pack(side=tk.LEFT, padx=2)
+
+        ttk.Separator(bar3, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Label(bar3, text="Mask:").pack(side=tk.LEFT, padx=(0, 4))
+        self.mask_btn = ttk.Button(bar3, text="Draw mask",
                        command=self._on_toggle_mask)
         self.mask_btn.pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar2, text="Clear mask",
+        ttk.Button(bar3, text="Save mask...",
+               command=self._on_save_mask_json).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar3, text="Load mask...",
+               command=self._on_load_mask_json).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar3, text="Clear mask",
                command=self._on_clear_mask).pack(side=tk.LEFT, padx=2)
 
     def _build_body(self) -> None:
@@ -312,6 +489,49 @@ class KOFViewer(tk.Tk):
         self._refresh_layer_controls()
         self._redraw()
 
+    def _on_export_gpkg(self) -> None:
+        if not self.files:
+            messagebox.showinfo("KOF Viewer", "Load one or more KOF files first.")
+            return
+
+        default_name = "kof_export.gpkg"
+        if self.files:
+            first_name, _ext = os.path.splitext(self.files[0].name)
+            default_name = f"{first_name}_export.gpkg"
+
+        out_path = filedialog.asksaveasfilename(
+            title="Export to GeoPackage",
+            defaultextension=".gpkg",
+            initialfile=default_name,
+            filetypes=[("GeoPackage", "*.gpkg"), ("All files", "*.*")],
+        )
+        if not out_path:
+            return
+
+        try:
+            summary = export_kof_files_to_gpkg(self.files, out_path)
+        except ImportError:
+            messagebox.showerror(
+                "KOF Viewer",
+                "GeoPackage export requires geopandas and shapely.\n\n"
+                "Install with:\n"
+                "  pip install geopandas shapely",
+            )
+            return
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("KOF Viewer", f"Failed to export GeoPackage:\n{exc}")
+            return
+
+        messagebox.showinfo(
+            "KOF Viewer",
+            "GeoPackage export completed.\n\n"
+            f"File: {summary['path']}\n"
+            f"Layers:\n"
+            f"- {summary['points_layer']} ({summary['point_count']} points)\n"
+            f"- {summary['polylines_layer']} "
+            f"({summary['polyline_count']} polylines)",
+        )
+
     def _on_clear(self) -> None:
         self.files.clear()
         self.layer_vars.clear()
@@ -327,6 +547,298 @@ class KOFViewer(tk.Tk):
         self._refresh_layer_controls()
         self._redraw()
 
+    def _on_save_mask_json(self) -> None:
+        if len(self._mask_polygon) < 3:
+            messagebox.showinfo(
+                "KOF Viewer",
+                "No closed mask polygon to save. Draw and close a mask first.",
+            )
+            return
+
+        default_name = "mask_polygon.json"
+        out_path = filedialog.asksaveasfilename(
+            title="Save mask polygon",
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not out_path:
+            return
+
+        try:
+            save_mask_json(
+                out_path,
+                self._mask_polygon,
+                metadata={
+                    "saved_at": datetime.now().isoformat(timespec="seconds"),
+                    "vertex_count": len(self._mask_polygon),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("KOF Viewer", f"Failed to save mask JSON:\n{exc}")
+            return
+
+        messagebox.showinfo(
+            "KOF Viewer",
+            f"Saved mask with {len(self._mask_polygon)} vertices to:\n{out_path}",
+        )
+
+    def _on_load_mask_json(self) -> None:
+        in_path = filedialog.askopenfilename(
+            title="Load mask polygon",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not in_path:
+            return
+
+        try:
+            vertices = load_mask_json(in_path)
+        except (MaskDataError, OSError, ValueError) as exc:
+            messagebox.showerror("KOF Viewer", f"Failed to load mask JSON:\n{exc}")
+            return
+
+        self._mask_click_points.clear()
+        self._mask_polygon = list(vertices)
+        if self._mask_mode:
+            self._end_mask_mode()
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self.notebook.select(0)
+        if len(self._mask_polygon) >= 3:
+            self._zoom_to_bounds(self._polygon_bounds(self._mask_polygon))
+        self._redraw()
+
+    def _on_save_sections_json(self) -> None:
+        if not self._sections:
+            messagebox.showinfo("KOF Viewer", "No section lines to save.")
+            return
+
+        out_path = filedialog.asksaveasfilename(
+            title="Save section lines",
+            defaultextension=".json",
+            initialfile="sections.json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not out_path:
+            return
+
+        try:
+            save_sections_json(out_path, self._sections)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("KOF Viewer", f"Failed to save sections JSON:\n{exc}")
+            return
+
+        messagebox.showinfo(
+            "KOF Viewer",
+            f"Saved {len(self._sections)} section line(s) to:\n{out_path}",
+        )
+
+    def _on_load_sections_json(self) -> None:
+        in_path = filedialog.askopenfilename(
+            title="Load section lines",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not in_path:
+            return
+
+        try:
+            sections = load_sections_json(in_path)
+        except (SectionDataError, OSError, ValueError) as exc:
+            messagebox.showerror("KOF Viewer", f"Failed to load sections JSON:\n{exc}")
+            return
+
+        self._sections = list(sections)
+        self._redraw()
+
+    def _on_export_section_report(self) -> None:
+        top = self._find_file(self.top_var.get())
+        bot = self._find_file(self.bottom_var.get())
+        if top is None or bot is None:
+            messagebox.showwarning("KOF Viewer", "Select both top and bottom surfaces first.")
+            return
+        if top is bot:
+            messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
+            return
+        if not self._sections:
+            messagebox.showinfo(
+                "KOF Viewer",
+                "Draw at least one section line first. The latest line is used as baseline.",
+            )
+            return
+
+        spacing_m = simpledialog.askfloat(
+            "Section report",
+            "Profile spacing along baseline (m):",
+            initialvalue=1.0,
+            minvalue=0.01,
+        )
+        if spacing_m is None:
+            return
+
+        section_length_m = simpledialog.askfloat(
+            "Section report",
+            "Cross-section length (m):",
+            initialvalue=20.0,
+            minvalue=0.1,
+        )
+        if section_length_m is None:
+            return
+
+        n_samples = simpledialog.askinteger(
+            "Section report",
+            "Samples per profile:",
+            initialvalue=200,
+            minvalue=25,
+            maxvalue=2000,
+        )
+        if n_samples is None:
+            return
+
+        out_root = filedialog.askdirectory(title="Choose report output folder")
+        if not out_root:
+            return
+
+        baseline = self._sections[-1]
+        (b0, b1) = baseline
+        baseline_len = float(np.hypot(b1[0] - b0[0], b1[1] - b0[1]))
+        if baseline_len <= 0:
+            messagebox.showerror("KOF Viewer", "Baseline section has zero length.")
+            return
+
+        stations = station_values(baseline_len, float(spacing_m))
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join(out_root, f"section_report_{timestamp}")
+        profiles_dir = os.path.join(run_dir, "profiles")
+        os.makedirs(profiles_dir, exist_ok=True)
+
+        profile_rows: list[dict[str, object]] = []
+        plan_points: list[tuple[str, tuple[float, float]]] = []
+        section_raster = self._section_reference_raster()
+        area_top_surface, area_bottom_surface, area_top_name, area_bottom_name = self._section_area_pair(top, bot)
+
+        for idx, station in enumerate(stations, start=1):
+            profile_id = f"P{idx:04d}"
+            p0, p1, center = profile_segment_from_station(
+                b0,
+                b1,
+                float(station),
+                float(section_length_m),
+            )
+            sample = sample_profile(
+                top,
+                bot,
+                p0,
+                p1,
+                profile_id=profile_id,
+                station_m=float(station),
+                center=center,
+                n_samples=int(n_samples),
+                reference_surface=section_raster,
+                reference_name=section_raster.name if section_raster is not None else None,
+                area_top_surface=area_top_surface,
+                area_bottom_surface=area_bottom_surface,
+                area_top_name=area_top_name,
+                area_bottom_name=area_bottom_name,
+            )
+
+            image_name = f"{profile_id}.png"
+            image_rel = os.path.join("profiles", image_name)
+            image_path = os.path.join(profiles_dir, image_name)
+            save_profile_plot_png(
+                image_path,
+                sample,
+                top_name=top.name,
+                bottom_name=bot.name,
+            )
+
+            profile_rows.append(
+                {
+                    "profile_id": profile_id,
+                    "station_m": sample.station_m,
+                    "length_m": sample.length_m,
+                    "valid_fraction": sample.valid_fraction,
+                    "area_net_m2": sample.area_net_m2,
+                    "area_cut_m2": sample.area_cut_m2,
+                    "area_fill_m2": sample.area_fill_m2,
+                    "image_rel": image_rel.replace("\\", "/"),
+                }
+            )
+            plan_points.append((profile_id, center))
+
+        plan_image_rel = "plan_view.png"
+        plan_image_path = os.path.join(run_dir, plan_image_rel)
+        plan_raster = self._top_visible_raster_layer()
+        save_plan_view_png(
+            plan_image_path,
+            files=[k for i, k in enumerate(self.files) if self._is_layer_visible(i)],
+            show_markers=bool(self.show_markers.get()),
+            show_lines=bool(self.show_lines.get()),
+            show_labels=bool(self.show_labels.get()),
+            show_triangulation=bool(self.show_triangulation.get()),
+            sections=self._sections,
+            baseline=baseline,
+            profile_points=plan_points,
+            raster_img=plan_raster.image if plan_raster is not None else None,
+            raster_extent=plan_raster.extent if plan_raster is not None else None,
+            raster_origin=plan_raster.origin if plan_raster is not None else "upper",
+            raster_alpha=float(plan_raster.alpha.get()) if plan_raster is not None else 1.0,
+        )
+
+        report_path = os.path.join(run_dir, "report.html")
+        write_html_report(
+            report_path,
+            title="KOF Section Report",
+            metadata={
+                "Top surface": top.name,
+                "Bottom surface": bot.name,
+                "Section area pair": f"{area_top_name} - {area_bottom_name}",
+                "Input files": ", ".join(k.name for k in self.files),
+                "Spacing (m)": f"{float(spacing_m):.2f}",
+                "Cross-section length (m)": f"{float(section_length_m):.2f}",
+                "Samples per profile": int(n_samples),
+                "Profile count": len(profile_rows),
+                "Baseline length (m)": f"{baseline_len:.2f}",
+            },
+            plan_image_rel=plan_image_rel,
+            profile_rows=profile_rows,
+        )
+
+        manifest_path = os.path.join(run_dir, "report_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "type": "kofvision.section_report",
+                    "version": 1,
+                    "generated_at": datetime.now().isoformat(timespec="seconds"),
+                    "top_surface": top.name,
+                    "bottom_surface": bot.name,
+                    "section_area_pair": {
+                        "top": area_top_name,
+                        "bottom": area_bottom_name,
+                    },
+                    "input_files": [k.name for k in self.files],
+                    "spacing_m": float(spacing_m),
+                    "section_length_m": float(section_length_m),
+                    "samples_per_profile": int(n_samples),
+                    "baseline": {
+                        "start": [float(b0[0]), float(b0[1])],
+                        "end": [float(b1[0]), float(b1[1])],
+                        "length_m": baseline_len,
+                    },
+                    "profiles": profile_rows,
+                },
+                fh,
+                indent=2,
+            )
+
+        messagebox.showinfo(
+            "KOF Viewer",
+            "Section report export completed.\n\n"
+            f"Output folder:\n{run_dir}\n\n"
+            f"Profiles exported: {len(profile_rows)}\n"
+            "Baseline: latest drawn section line",
+        )
+
     def _on_open_raster(self) -> None:
         path = filedialog.askopenfilename(
             title="Open raster background",
@@ -339,15 +851,130 @@ class KOFViewer(tk.Tk):
             return
         self._load_raster(path)
 
+    def _raster_display_name(self, idx: int) -> str:
+        layer = self._raster_layers[idx]
+        name = os.path.basename(layer.path)
+        marks: list[str] = []
+        if idx == self._elevation_raster_index:
+            marks.append("elev")
+        if idx == len(self._raster_layers) - 1:
+            marks.append("top")
+        if marks:
+            return f"{name} ({', '.join(marks)})"
+        return name
+
+    def _refresh_raster_selector(self) -> None:
+        names = [self._raster_display_name(i) for i in range(len(self._raster_layers))]
+        self.active_raster_combo["values"] = names
+        if not names:
+            self._active_raster_index = None
+            self.active_raster_name.set("")
+            self._refresh_intermediate_raster_selector()
+            return
+        if self._active_raster_index is None or self._active_raster_index >= len(names):
+            self._active_raster_index = len(names) - 1
+        self.active_raster_name.set(names[self._active_raster_index])
+        self._sync_alpha_from_active()
+        self._refresh_intermediate_raster_selector()
+
+    def _set_active_raster_index(self, idx: Optional[int]) -> None:
+        if idx is None or idx < 0 or idx >= len(self._raster_layers):
+            self._active_raster_index = None
+            self.active_raster_name.set("")
+            return
+        self._active_raster_index = idx
+        self._refresh_raster_selector()
+
+    def _on_select_active_raster(self) -> None:
+        idx = self.active_raster_combo.current()
+        if idx < 0 or idx >= len(self._raster_layers):
+            return
+        self._active_raster_index = idx
+        self._sync_alpha_from_active()
+
+    def _sync_alpha_from_active(self) -> None:
+        layer = self._get_active_raster_layer()
+        if layer is None:
+            return
+        self.raster_alpha.set(float(layer.alpha.get()))
+
+    def _get_active_raster_layer(self) -> Optional[_RasterViewLayer]:
+        idx = self._active_raster_index
+        if idx is None or idx < 0 or idx >= len(self._raster_layers):
+            return None
+        return self._raster_layers[idx]
+
+    def _top_visible_raster_layer(self) -> Optional[_RasterViewLayer]:
+        if not self.show_raster.get():
+            return None
+        for layer in reversed(self._raster_layers):
+            if layer.visible.get():
+                return layer
+        return None
+
+    def _on_move_raster_up(self) -> None:
+        idx = self._active_raster_index
+        if idx is None or idx >= len(self._raster_layers) - 1:
+            return
+        self._raster_layers[idx], self._raster_layers[idx + 1] = self._raster_layers[idx + 1], self._raster_layers[idx]
+        if self._elevation_raster_index == idx:
+            self._elevation_raster_index = idx + 1
+        elif self._elevation_raster_index == idx + 1:
+            self._elevation_raster_index = idx
+        self._active_raster_index = idx + 1
+        self._refresh_raster_selector()
+        self._refresh_layer_controls()
+        self._redraw()
+
+    def _on_move_raster_down(self) -> None:
+        idx = self._active_raster_index
+        if idx is None or idx <= 0:
+            return
+        self._raster_layers[idx], self._raster_layers[idx - 1] = self._raster_layers[idx - 1], self._raster_layers[idx]
+        if self._elevation_raster_index == idx:
+            self._elevation_raster_index = idx - 1
+        elif self._elevation_raster_index == idx - 1:
+            self._elevation_raster_index = idx
+        self._active_raster_index = idx - 1
+        self._refresh_raster_selector()
+        self._refresh_layer_controls()
+        self._redraw()
+
+    def _on_set_elevation_raster(self) -> None:
+        idx = self._active_raster_index
+        if idx is None:
+            messagebox.showinfo("KOF Viewer", "No active raster selected.")
+            return
+        layer = self._raster_layers[idx]
+        if layer.elevation_surface is None:
+            messagebox.showwarning(
+                "KOF Viewer",
+                "Selected raster is not a supported single-band elevation raster.",
+            )
+            return
+        self._elevation_raster_index = idx
+        self._refresh_raster_selector()
+        self._refresh_layer_controls()
+        self._redraw_2d()
+
     def _on_clear_raster(self) -> None:
-        had_raster = self._raster_img is not None
-        self.raster_path = None
-        self._raster_img = None
-        self._raster_extent = None
-        self.show_raster.set(False)
-        if had_raster:
-            self._refresh_layer_controls()
-            self._redraw()
+        idx = self._active_raster_index
+        if idx is None or idx < 0 or idx >= len(self._raster_layers):
+            return
+        self._raster_layers.pop(idx)
+        if self._elevation_raster_index is not None:
+            if self._elevation_raster_index == idx:
+                self._elevation_raster_index = None
+            elif self._elevation_raster_index > idx:
+                self._elevation_raster_index -= 1
+        if not self._raster_layers:
+            self.show_raster.set(False)
+            self._active_raster_index = None
+        else:
+            self._active_raster_index = min(idx, len(self._raster_layers) - 1)
+        self._refresh_raster_selector()
+        self._refresh_layer_controls()
+        self._redraw()
 
     def _on_raster_alpha_change(self) -> None:
         try:
@@ -356,12 +983,22 @@ class KOFViewer(tk.Tk):
             return
         alpha = min(max(alpha, 0.05), 1.0)
         self.raster_alpha.set(alpha)
-        if self._raster_img is not None and self.show_raster.get():
+        layer = self._get_active_raster_layer()
+        if layer is not None:
+            layer.alpha.set(alpha)
+        if self._raster_layers and self.show_raster.get():
             self._redraw_2d()
 
     def _load_raster(self, path: str) -> None:
+        clip_bounds = self._all_files_bounds()
+        clip_buffer_m = self._safe_clip_buffer_m()
         try:
-            layer = load_raster_layer(path)
+            layer = load_raster_layer(
+                path,
+                clip_bounds=clip_bounds,
+                clip_buffer_m=clip_buffer_m,
+                prefer_clip=bool(self.raster_clip_to_kof.get()),
+            )
         except FileNotFoundError:
             messagebox.showerror(
                 "KOF Viewer",
@@ -376,13 +1013,42 @@ class KOFViewer(tk.Tk):
             )
             return
 
-        self.raster_path = path
-        self._raster_img = layer.image
-        self._raster_extent = layer.extent
-        self._raster_origin = layer.origin
+        elevation_surface: Optional[ElevationRasterSurface] = None
+        try:
+            elevation_surface = load_elevation_surface(
+                path,
+                clip_bounds=clip_bounds,
+                clip_buffer_m=clip_buffer_m,
+                prefer_clip=bool(self.raster_clip_to_kof.get()),
+            )
+        except Exception:
+            elevation_surface = None
+
+        self._raster_layers.append(
+            _RasterViewLayer(
+                path=path,
+                image=layer.image,
+                extent=layer.extent,
+                origin=layer.origin,
+                visible=tk.BooleanVar(value=True),
+                alpha=tk.DoubleVar(value=float(self.raster_alpha.get())),
+                elevation_surface=elevation_surface,
+            )
+        )
+        self._active_raster_index = len(self._raster_layers) - 1
+        if self._elevation_raster_index is None and elevation_surface is not None:
+            self._elevation_raster_index = self._active_raster_index
         self.show_raster.set(True)
+        self._refresh_raster_selector()
         self._refresh_layer_controls()
         self._redraw()
+
+        if elevation_surface is None:
+            messagebox.showinfo(
+                "KOF Viewer",
+                "Raster loaded for display, but it is not a supported single-band elevation raster.\n"
+                "Volume modes using raster elevation require a single-band DEM.",
+            )
 
     def _on_reset_view(self) -> None:
         self._view_extent_2d = None
@@ -397,7 +1063,20 @@ class KOFViewer(tk.Tk):
                 "No visible layers with valid extents. Select one or more layers first.",
             )
             return
+        self._zoom_to_bounds(bounds)
+        self.notebook.select(0)
+        self._redraw_2d()
+        self._update_status()
 
+    @staticmethod
+    def _polygon_bounds(
+        polygon: list[tuple[float, float]],
+    ) -> tuple[float, float, float, float]:
+        xs = [p[0] for p in polygon]
+        ys = [p[1] for p in polygon]
+        return min(xs), max(xs), min(ys), max(ys)
+
+    def _zoom_to_bounds(self, bounds: tuple[float, float, float, float]) -> None:
         xmin, xmax, ymin, ymax = bounds
         span_x = xmax - xmin
         span_y = ymax - ymin
@@ -414,9 +1093,6 @@ class KOFViewer(tk.Tk):
             ymin - pad_y,
             ymax + pad_y,
         )
-        self.notebook.select(0)
-        self._redraw_2d()
-        self._update_status()
 
     def _selected_layers_2d_bounds(self) -> Optional[tuple[float, float, float, float]]:
         xmin: Optional[float] = None
@@ -431,9 +1107,12 @@ class KOFViewer(tk.Tk):
             ymin = y0 if ymin is None else min(ymin, y0)
             ymax = y1 if ymax is None else max(ymax, y1)
 
-        if self.show_raster.get() and self._raster_extent is not None:
-            rxmin, rxmax, rymin, rymax = self._raster_extent
-            include(rxmin, rxmax, rymin, rymax)
+        if self.show_raster.get():
+            for layer in self._raster_layers:
+                if not layer.visible.get():
+                    continue
+                rxmin, rxmax, rymin, rymax = layer.extent
+                include(rxmin, rxmax, rymin, rymax)
 
         for idx, kof in enumerate(self.files):
             if not self._is_layer_visible(idx):
@@ -472,36 +1151,67 @@ class KOFViewer(tk.Tk):
         names = [k.name for k in self.files]
         self.top_combo["values"] = names
         self.bottom_combo["values"] = names
+        self.intermediate_kof_combo["values"] = names
         if names:
             if self.top_var.get() not in names:
                 self.top_var.set(names[0])
             if self.bottom_var.get() not in names:
                 self.bottom_var.set(names[1] if len(names) > 1 else names[0])
+            if self.intermediate_kof_var.get() not in names:
+                self.intermediate_kof_var.set(names[0])
         else:
             self.top_var.set("")
             self.bottom_var.set("")
+            self.intermediate_kof_var.set("")
+
+    def _refresh_intermediate_raster_selector(self) -> None:
+        self._intermediate_raster_index_map.clear()
+        names: list[str] = []
+        for idx, layer in enumerate(self._raster_layers):
+            if layer.elevation_surface is None:
+                continue
+            label = self._raster_display_name(idx)
+            names.append(label)
+            self._intermediate_raster_index_map[label] = idx
+        self.intermediate_raster_combo["values"] = names
+        if names and self.intermediate_raster_var.get() not in self._intermediate_raster_index_map:
+            self.intermediate_raster_var.set(names[0])
+        if not names:
+            self.intermediate_raster_var.set("")
 
     def _refresh_layer_controls(self) -> None:
         for child in self.layers_inner.winfo_children():
             child.destroy()
 
-        has_raster_layer = self.raster_path is not None and self._raster_img is not None
+        has_raster_layer = bool(self._raster_layers)
 
         if not self.files and not has_raster_layer:
             ttk.Label(self.layers_inner, text="No layers loaded.").pack(anchor="w")
             return
 
         if has_raster_layer:
-            raster_name = os.path.basename(self.raster_path)
             ttk.Checkbutton(
                 self.layers_inner,
-                text=f"Raster: {raster_name}",
+                text="Raster layers",
                 variable=self.show_raster,
                 command=self._redraw,
             ).pack(anchor="w", pady=1)
-            ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(
-                fill=tk.X, pady=(2, 4)
-            )
+            for idx in range(len(self._raster_layers) - 1, -1, -1):
+                layer = self._raster_layers[idx]
+                name = os.path.basename(layer.path)
+                marks: list[str] = []
+                if idx == self._elevation_raster_index:
+                    marks.append("elev")
+                if idx == len(self._raster_layers) - 1:
+                    marks.append("top")
+                suffix = f" ({', '.join(marks)})" if marks else ""
+                ttk.Checkbutton(
+                    self.layers_inner,
+                    text=f"  Raster: {name}{suffix}",
+                    variable=layer.visible,
+                    command=self._redraw,
+                ).pack(anchor="w", pady=1)
+            ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(2, 4))
 
         for idx, kof in enumerate(self.files):
             if idx >= len(self.layer_vars):
@@ -528,18 +1238,250 @@ class KOFViewer(tk.Tk):
                 return k
         return None
 
+    def _all_files_bounds(self) -> Optional[tuple[float, float, float, float]]:
+        bounds = [k.xy_bounds() for k in self.files]
+        valid = [b for b in bounds if b is not None]
+        if not valid:
+            return None
+        y_mins, x_mins, y_maxs, x_maxs = zip(*valid)
+        return min(y_mins), min(x_mins), max(y_maxs), max(x_maxs)
+
+    def _safe_clip_buffer_m(self) -> float:
+        try:
+            buf = float(self.raster_clip_buffer_m.get())
+        except (tk.TclError, ValueError):
+            buf = 10.0
+        if not np.isfinite(buf) or buf < 0.0:
+            buf = 10.0
+        self.raster_clip_buffer_m.set(buf)
+        return buf
+
+    def _current_volume_mode_key(self) -> str:
+        """Resolve combobox value to internal mode key."""
+        raw = self.volume_source_mode.get().strip()
+        if raw in VOLUME_LABEL_TO_MODE:
+            return VOLUME_LABEL_TO_MODE[raw]
+        key = raw.lower()
+        if key in VOLUME_MODE_LABELS:
+            return key
+        return "kof_vs_kof"
+
+    def _current_intermediate_type_key(self) -> str:
+        raw = self.intermediate_type.get().strip()
+        if raw in INTERMEDIATE_LABEL_TO_TYPE:
+            return INTERMEDIATE_LABEL_TO_TYPE[raw]
+        key = raw.lower()
+        if key in INTERMEDIATE_TYPE_LABELS:
+            return key
+        return "none"
+
+    def _set_widget_state(self, widget: tk.Widget, enabled: bool) -> None:
+        desired = "readonly" if enabled else "disabled"
+        try:
+            widget.configure(state=desired)
+        except tk.TclError:
+            widget.configure(state="normal" if enabled else "disabled")
+
+    def _on_intermediate_type_change(self) -> None:
+        key = self._current_intermediate_type_key()
+        method = self.volume_method.get().strip().lower()
+        allow_intermediate = method != "triangles"
+
+        self._set_widget_state(self.intermediate_type_combo, allow_intermediate)
+        self._set_widget_state(self.intermediate_kof_combo, allow_intermediate and key == "kof")
+        self._set_widget_state(self.intermediate_raster_combo, allow_intermediate and key == "raster")
+        self._set_widget_state(self.intermediate_constant_z_spin, allow_intermediate and key == "constant")
+
+    def _all_surface_bounds(self) -> Optional[tuple[float, float, float, float]]:
+        bounds: list[tuple[float, float, float, float]] = []
+        kof_bounds = self._all_files_bounds()
+        if kof_bounds is not None:
+            bounds.append(kof_bounds)
+        for layer in self._raster_layers:
+            surface = layer.elevation_surface
+            if surface is None:
+                continue
+            sb = surface.xy_bounds()
+            if sb is not None:
+                bounds.append(sb)
+        if not bounds:
+            return None
+        y_mins, x_mins, y_maxs, x_maxs = zip(*bounds)
+        return min(y_mins), min(x_mins), max(y_maxs), max(x_maxs)
+
+    def _resolve_intermediate_surface(self) -> Optional[SurfaceLike]:
+        key = self._current_intermediate_type_key()
+        if key == "none":
+            return None
+        if key == "kof":
+            surface = self._find_file(self.intermediate_kof_var.get())
+            if surface is None:
+                messagebox.showwarning("KOF Viewer", "Select an intermediate KOF layer.")
+                return None
+            return surface
+        if key == "raster":
+            idx = self._intermediate_raster_index_map.get(self.intermediate_raster_var.get())
+            if idx is None:
+                messagebox.showwarning("KOF Viewer", "Select an intermediate raster layer.")
+                return None
+            if idx < 0 or idx >= len(self._raster_layers):
+                messagebox.showwarning("KOF Viewer", "Selected intermediate raster is no longer available.")
+                return None
+            layer = self._raster_layers[idx]
+            if layer.elevation_surface is None:
+                messagebox.showwarning(
+                    "KOF Viewer",
+                    "Selected intermediate raster is not a supported single-band elevation raster.",
+                )
+                return None
+            return layer.elevation_surface
+        if key == "constant":
+            try:
+                z_val = float(self.intermediate_constant_z.get())
+            except (tk.TclError, ValueError):
+                messagebox.showwarning("KOF Viewer", "Intermediate Constant Z must be numeric.")
+                return None
+            if not np.isfinite(z_val):
+                messagebox.showwarning("KOF Viewer", "Intermediate Constant Z must be finite.")
+                return None
+            bounds = self._all_surface_bounds()
+            if bounds is None:
+                messagebox.showwarning(
+                    "KOF Viewer",
+                    "No surface bounds available to build Constant Z layer.",
+                )
+                return None
+            return ConstantElevationSurface(name=f"Constant Z {z_val:.3f} m", z_value=z_val, bounds=bounds)
+        messagebox.showwarning("KOF Viewer", f"Unknown intermediate layer type: {key}")
+        return None
+
+    def _section_reference_raster(self) -> Optional[ElevationRasterSurface]:
+        if self._elevation_raster_index is None:
+            return None
+        if self._elevation_raster_index < 0 or self._elevation_raster_index >= len(self._raster_layers):
+            return None
+        layer = self._raster_layers[self._elevation_raster_index]
+        if layer.elevation_surface is None:
+            return None
+        mode = self._current_volume_mode_key()
+        if mode in {"top_minus_raster", "raster_minus_bottom", "raster_minus_top"}:
+            return layer.elevation_surface
+        return None
+
+    def _section_area_pair(
+        self,
+        top: KOFFile,
+        bottom: KOFFile,
+    ) -> tuple[Any, Any, str, str]:
+        """Return surfaces used for section area shading based on active volume mode."""
+        mode = self._current_volume_mode_key()
+        raster = self._section_reference_raster()
+
+        if mode == "top_minus_raster" and raster is not None:
+            return top, raster, top.name, raster.name
+        if mode == "raster_minus_bottom" and raster is not None:
+            return raster, bottom, raster.name, bottom.name
+        if mode == "raster_minus_top" and raster is not None:
+            return raster, top, raster.name, top.name
+
+        return top, bottom, top.name, bottom.name
+
     def _on_compute_volume(self) -> None:
         top = self._find_file(self.top_var.get())
         bot = self._find_file(self.bottom_var.get())
-        if top is None or bot is None:
-            messagebox.showwarning("KOF Viewer", "Select both a top and bottom surface.")
+        mode = self._current_volume_mode_key()
+        intermediate_type = self._current_intermediate_type_key()
+
+        if mode == "kof_vs_kof":
+            if top is None or bot is None:
+                messagebox.showwarning("KOF Viewer", "Select both a top and bottom surface.")
+                return
+            if top is bot:
+                messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
+                return
+            top_surface = top
+            bottom_surface = bot
+        elif mode == "top_minus_raster":
+            if top is None:
+                messagebox.showwarning("KOF Viewer", "Select a top KOF surface.")
+                return
+            elev = self._section_reference_raster()
+            if elev is None:
+                messagebox.showwarning(
+                    "KOF Viewer",
+                    "Set a single-band elevation raster first (Set elevation raster).",
+                )
+                return
+            top_surface = top
+            bottom_surface = elev
+        elif mode == "raster_minus_bottom":
+            if bot is None:
+                messagebox.showwarning("KOF Viewer", "Select a bottom KOF surface.")
+                return
+            elev = self._section_reference_raster()
+            if elev is None:
+                messagebox.showwarning(
+                    "KOF Viewer",
+                    "Set a single-band elevation raster first (Set elevation raster).",
+                )
+                return
+            top_surface = elev
+            bottom_surface = bot
+        elif mode == "raster_minus_top":
+            if top is None:
+                messagebox.showwarning("KOF Viewer", "Select a top KOF surface.")
+                return
+            elev = self._section_reference_raster()
+            if elev is None:
+                messagebox.showwarning(
+                    "KOF Viewer",
+                    "Set a single-band elevation raster first (Set elevation raster).",
+                )
+                return
+            top_surface = elev
+            bottom_surface = top
+        else:
+            messagebox.showwarning("KOF Viewer", f"Unknown volume mode: {mode}")
             return
-        if top is bot:
-            messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
-            return
+
         mask_poly = self._mask_polygon if len(self._mask_polygon) >= 3 else None
         method = self.volume_method.get().strip().lower()
-        result = compute_volume(top, bot, mask_polygon=mask_poly, method=method)
+
+        if method == "triangles" and intermediate_type != "none":
+            messagebox.showwarning(
+                "KOF Viewer",
+                "Intermediate layer split requires 'raster' method. "
+                "'triangles' currently supports KOF-vs-KOF pairs only.",
+            )
+            return
+
+        intermediate_surface: Optional[SurfaceLike] = None
+        if intermediate_type != "none":
+            intermediate_surface = self._resolve_intermediate_surface()
+            if intermediate_surface is None:
+                return
+
+        if intermediate_surface is top_surface or intermediate_surface is bottom_surface:
+            messagebox.showwarning(
+                "KOF Viewer",
+                "Intermediate layer must be different from top and bottom surfaces.",
+            )
+            return
+
+        try:
+            if intermediate_surface is None:
+                result = compute_volume(top_surface, bottom_surface, mask_polygon=mask_poly, method=method)
+            else:
+                result = compute_volume_with_intermediate(
+                    top_surface,
+                    intermediate_surface,
+                    bottom_surface,
+                    mask_polygon=mask_poly,
+                    method=method,
+                )
+        except ValueError as exc:
+            messagebox.showerror("KOF Viewer", str(exc))
+            return
         if result is None:
             messagebox.showerror(
                 "KOF Viewer",
@@ -549,10 +1491,19 @@ class KOFViewer(tk.Tk):
             return
         self.last_volume = result
         mask_suffix = " (masked)" if mask_poly is not None else ""
-        self.volume_text.set(
-            f"{method}: Net {result.net:+,.2f} m³   (Cut {result.cut:,.2f} / "
-            f"Fill {result.fill:,.2f})   over {result.area:,.1f} m²{mask_suffix}"
-        )
+        if isinstance(result, SplitVolumeResult):
+            upper = result.upper
+            lower = result.lower
+            self.volume_text.set(
+                f"{mode}/{method} split: {upper.top_name}-{upper.bottom_name} "
+                f"Net {upper.net:+,.2f} m³; {lower.top_name}-{lower.bottom_name} "
+                f"Net {lower.net:+,.2f} m³; Total {result.net:+,.2f} m³{mask_suffix}"
+            )
+        else:
+            self.volume_text.set(
+                f"{mode}/{method}: Net {result.net:+,.2f} m³   (Cut {result.cut:,.2f} / "
+                f"Fill {result.fill:,.2f})   over {result.area:,.1f} m²{mask_suffix}"
+            )
         if self.show_triangulation.get():
             self._redraw()
 
@@ -635,8 +1586,20 @@ class KOFViewer(tk.Tk):
         self._end_section_mode()
         self._redraw_2d()  # draw the persisted section (and clear preview)
         if top is not None and bot is not None:
-            SectionWindow(self, top, bot, (y0, x0), (y1, x1),
-                          label=self._section_label(len(self._sections) - 1))
+            area_top_surface, area_bottom_surface, area_top_name, area_bottom_name = self._section_area_pair(top, bot)
+            SectionWindow(
+                self,
+                top,
+                bot,
+                (y0, x0),
+                (y1, x1),
+                raster_surface=self._section_reference_raster(),
+                area_top_surface=area_top_surface,
+                area_bottom_surface=area_bottom_surface,
+                area_top_name=area_top_name,
+                area_bottom_name=area_bottom_name,
+                label=self._section_label(len(self._sections) - 1),
+            )
 
     # ----------------------------------------------------------- Polygon mask
     def _on_toggle_mask(self) -> None:
@@ -742,18 +1705,17 @@ class KOFViewer(tk.Tk):
         self.ax2d.set_ylabel("Northing (X)")
         self.ax2d.grid(True, linestyle=":", alpha=0.5)
 
-        if (
-            self.show_raster.get()
-            and self._raster_img is not None
-            and self._raster_extent is not None
-        ):
-            self.ax2d.imshow(
-                self._raster_img,
-                extent=self._raster_extent,
-                origin=self._raster_origin,
-                alpha=float(self.raster_alpha.get()),
-                zorder=0,
-            )
+        if self.show_raster.get() and self._raster_layers:
+            for layer in self._raster_layers:
+                if not layer.visible.get():
+                    continue
+                self.ax2d.imshow(
+                    layer.image,
+                    extent=layer.extent,
+                    origin=layer.origin,
+                    alpha=float(layer.alpha.get()),
+                    zorder=0,
+                )
 
         for idx, kof in enumerate(self.files):
             if not self._is_layer_visible(idx):
@@ -952,11 +1914,15 @@ class KOFViewer(tk.Tk):
         )
         if len(self._mask_polygon) >= 3:
             base += f"   |   mask: {len(self._mask_polygon)} vertices"
-        if self.raster_path and self._raster_extent is not None:
+        if self._raster_layers:
             state = "on" if self.show_raster.get() else "off"
+            n_visible = sum(1 for r in self._raster_layers if r.visible.get())
+            elev_name = "none"
+            if self._elevation_raster_index is not None and 0 <= self._elevation_raster_index < len(self._raster_layers):
+                elev_name = os.path.basename(self._raster_layers[self._elevation_raster_index].path)
             base += (
-                f"   |   raster: {os.path.basename(self.raster_path)} "
-                f"({state}, alpha={float(self.raster_alpha.get()):.2f})"
+                f"   |   rasters: {len(self._raster_layers)} ({n_visible} visible, {state})"
+                f"   |   elevation raster: {elev_name}"
             )
         self.status.set(base)
 
@@ -976,13 +1942,19 @@ class SectionWindow(tk.Toplevel):
         bottom: KOFFile,
         p0: tuple[float, float],
         p1: tuple[float, float],
+        raster_surface: Optional[ElevationRasterSurface] = None,
+        area_top_surface: Optional[Any] = None,
+        area_bottom_surface: Optional[Any] = None,
+        area_top_name: Optional[str] = None,
+        area_bottom_name: Optional[str] = None,
         n_samples: int = 200,
         label: str = "",
     ) -> None:
         super().__init__(master)
         title_label = f" ({label}–{label}')" if label else ""
+        raster_title = " + raster" if raster_surface is not None else ""
         self.title(
-            f"Section{title_label}: {top.name} (top) vs {bottom.name} (bottom)"
+            f"Section{title_label}: {top.name} (top) vs {bottom.name} (bottom){raster_title}"
         )
         self.geometry("900x520")
 
@@ -1000,10 +1972,15 @@ class SectionWindow(tk.Toplevel):
 
         z_top = top.interpolate(ys, xs)
         z_bot = bottom.interpolate(ys, xs)
+        z_raster = raster_surface.interpolate(ys, xs) if raster_surface is not None else None
+        z_area_top = area_top_surface.interpolate(ys, xs) if area_top_surface is not None else z_top
+        z_area_bottom = area_bottom_surface.interpolate(ys, xs) if area_bottom_surface is not None else z_bot
+        area_top_label = area_top_name or top.name
+        area_bottom_label = area_bottom_name or bottom.name
 
         # Area between curves (m² of cross-section); split into cut (top above
         # bottom) and fill (top below bottom).
-        diff = z_top - z_bot
+        diff = z_area_top - z_area_bottom
         mask = np.isfinite(diff)
         if mask.any():
             d_valid = dists[mask]
@@ -1026,18 +2003,29 @@ class SectionWindow(tk.Toplevel):
         if np.any(np.isfinite(z_bot)):
             ax.plot(dists, z_bot, color="#d62728", linewidth=1.6,
                     label=f"Bottom: {bottom.name}")
+        if z_raster is not None and np.any(np.isfinite(z_raster)):
+            ax.plot(
+                dists,
+                z_raster,
+                color="#2ca02c",
+                linewidth=1.4,
+                linestyle="--",
+                label=f"Raster: {raster_surface.name}",
+            )
 
         # Shade the area between surfaces where both are defined.
-        both = np.isfinite(z_top) & np.isfinite(z_bot)
+        both = np.isfinite(z_area_top) & np.isfinite(z_area_bottom)
         if both.any():
-            cut_mask = both & (z_top >= z_bot)
-            fill_mask = both & (z_top < z_bot)
+            cut_mask = both & (z_area_top >= z_area_bottom)
+            fill_mask = both & (z_area_top < z_area_bottom)
             if cut_mask.any():
-                ax.fill_between(dists, z_bot, z_top, where=cut_mask,
-                                color="#1f77b4", alpha=0.25, label="Cut (top ≥ bottom)")
+                ax.fill_between(dists, z_area_bottom, z_area_top, where=cut_mask,
+                                color="#1f77b4", alpha=0.25,
+                                label=f"Cut ({area_top_label} ≥ {area_bottom_label})")
             if fill_mask.any():
-                ax.fill_between(dists, z_bot, z_top, where=fill_mask,
-                                color="#d62728", alpha=0.25, label="Fill (top < bottom)")
+                ax.fill_between(dists, z_area_bottom, z_area_top, where=fill_mask,
+                                color="#d62728", alpha=0.25,
+                                label=f"Fill ({area_top_label} < {area_bottom_label})")
 
         ax.set_xlabel("Distance along section (m)")
         ax.set_ylabel("Elevation (m)")
@@ -1045,7 +2033,7 @@ class SectionWindow(tk.Toplevel):
         ax.legend(loc="best", fontsize=8)
         ax.set_title(
             f"Length {total_len:,.2f} m   |   "
-            f"Area net {area_net:+,.2f} m²   "
+            f"Area ({area_top_label} - {area_bottom_label}) net {area_net:+,.2f} m²   "
             f"(cut {area_cut:,.2f} / fill {area_fill:,.2f})"
         )
 
