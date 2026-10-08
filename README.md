@@ -24,10 +24,21 @@ The main app is implemented in `kof_viewer.py`.
 	- cut volume
 	- fill volume
 	- overlap area
+- Optional intermediate layer for split-volume calculation:
+	- KOF layer
+	- raster elevation layer
+	- virtual constant Z plane
 - Draw one or more section lines in 2D and open section windows with:
 	- top and bottom profiles
 	- shaded cut/fill regions
 	- net/cut/fill cross-section area
+- Save and load polygon masks as JSON
+- Save and load section lines as JSON
+- Export a section-report package:
+	- profile images at fixed spacing along a baseline (for example every 1 m)
+	- plan-view image with baseline and profile numbers
+	- HTML report and JSON manifest
+- Export loaded KOF source data to GeoPackage (points + original polylines)
 
 ## Requirements
 
@@ -41,6 +52,12 @@ Install Python dependencies:
 
 ```bash
 pip install numpy matplotlib scipy
+```
+
+Optional (required only for GeoPackage export from the viewer):
+
+```bash
+pip install geopandas shapely
 ```
 
 ## Run
@@ -75,10 +92,43 @@ For full packaging and distribution details, see `docs/pyinstaller-windows.md`.
 1. Open two surface files (for example existing top and design/bottom).
 2. Select Top and Bottom in the second toolbar row.
 3. Choose volume Method (`raster` or `triangles`).
-4. Optionally enable Triangulation.
-5. Click Compute volume.
-6. Read net/cut/fill in the toolbar summary.
-7. Click Draw section and pick two points in 2D to open a section profile window.
+4. Optionally choose Intermediate (`None`, `KOF layer`, `Raster layer`, or `Constant Z`).
+5. If intermediate is set, volume is reported as two legs:
+	- Top - Intermediate
+	- Intermediate - Bottom
+6. Optionally enable Triangulation.
+6. Click Compute volume.
+7. Read net/cut/fill (or split results) in the toolbar summary.
+8. Click Draw section and pick two points in 2D to open a section profile window.
+
+## Mask And Section Persistence
+
+- Draw mask: create polygon by left-clicking vertices in 2D, close with right-click or double-click.
+- Save mask...: write the current closed mask polygon to JSON.
+- Load mask...: restore a previously saved mask polygon from JSON.
+- Draw section: create section lines in 2D.
+- Save sections...: store all currently drawn section lines as JSON.
+- Load sections...: restore section lines from JSON.
+
+## Section Report Export
+
+Use Export section report... in the second toolbar row.
+
+Current behavior:
+
+1. Uses the latest drawn section line as report baseline.
+2. Prompts for:
+	- profile spacing in meters (for example 1.0)
+	- cross-section length in meters
+	- number of interpolation samples per profile
+	- output folder
+3. Creates one timestamped output folder containing:
+	- `plan_view.png`
+	- `profiles/P0001.png`, `profiles/P0002.png`, ...
+	- `report.html`
+	- `report_manifest.json`
+
+The HTML report includes plan view, profile summary table, and all profile images with profile IDs and station distances.
 
 ### View Controls
 
@@ -163,4 +213,5 @@ It writes PNG files to `docs/images/`.
 - Volume method options:
 	- `raster` (default): grid sampling over overlapping extents of the triangulated surfaces.
 	- `triangles`: direct integration over overlapping triangle polygons from both surfaces.
+	- split-volume with intermediate layer is currently available with `raster` method.
 - Interpolation outside the filtered triangulation boundary is ignored.
