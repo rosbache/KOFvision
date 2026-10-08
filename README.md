@@ -24,12 +24,25 @@ The main app is implemented in `kof_viewer.py`.
 	- cut volume
 	- fill volume
 	- overlap area
+	- volume source modes:
+		- `KOF - KOF`
+		- `Top KOF - Raster`
+		- `Raster - Bottom KOF`
+		- `Raster - Top KOF`
 - Optional intermediate layer for split-volume calculation:
 	- KOF layer
 	- raster elevation layer
 	- virtual constant Z plane
+	- split output:
+		- Top - Intermediate
+		- Intermediate - Bottom
+		- Total (sum of both legs)
+- Load multiple raster layers, reorder them (up/down), toggle visibility, and set per-layer alpha
+- Set an active single-band elevation raster used for raster-based volume modes and section reference profile
+- Optionally clip raster loading to current KOF bounds with user-defined buffer
 - Draw one or more section lines in 2D and open section windows with:
 	- top and bottom profiles
+	- optional raster reference profile (when raster volume mode is active)
 	- shaded cut/fill regions
 	- net/cut/fill cross-section area
 - Save and load polygon masks as JSON
@@ -60,6 +73,12 @@ Optional (required only for GeoPackage export from the viewer):
 pip install geopandas shapely
 ```
 
+Development/testing dependencies:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
 ## Run
 
 Start empty and load files from the UI:
@@ -72,6 +91,14 @@ Or preload one or more KOF files:
 
 ```bash
 python kof_viewer.py "12_A (1).kof" "12_A(1) (1).kof"
+```
+
+## Tests
+
+Run automated regression tests:
+
+```bash
+python -m pytest -q
 ```
 
 ## Package for End Users (Windows)
@@ -97,9 +124,88 @@ For full packaging and distribution details, see `docs/pyinstaller-windows.md`.
 	- Top - Intermediate
 	- Intermediate - Bottom
 6. Optionally enable Triangulation.
-6. Click Compute volume.
-7. Read net/cut/fill (or split results) in the toolbar summary.
-8. Click Draw section and pick two points in 2D to open a section profile window.
+7. Click Compute volume.
+8. Read net/cut/fill (or split results) in the toolbar summary.
+9. Click Draw section and pick two points in 2D to open a section profile window.
+
+## Volume Calculation Methods
+
+KOFvision computes signed difference as:
+
+- `difference = top_surface - bottom_surface`
+- Positive difference contributes to `cut`
+- Negative difference contributes to `fill`
+- `net = cut - fill` (equivalently, signed integral of `difference`)
+
+### Quick Method Comparison
+
+| Method | Typical speed | Accuracy profile | Supported inputs | Intermediate split support |
+|---|---|---|---|---|
+| `raster` | Faster (default workflow) | Grid-approximation; accuracy depends on sampling resolution (`target_cells`) | `KOF - KOF`, `Top KOF - Raster`, `Raster - Bottom KOF`, `Raster - Top KOF` | Yes (`KOF`, `Raster`, `Constant Z`) |
+| `triangles` | Slower | Exact polygon-overlap integration on triangulated KOF surfaces | `KOF - KOF` only | No |
+
+### 1) `raster` method (default)
+
+Used by `compute_volume(..., method="raster")`.
+
+How it works:
+
+1. Finds XY overlap of top and bottom surface bounds.
+2. Builds a regular sampling grid over overlap (resolution from `target_cells`, default ~200 across max span).
+3. Interpolates top and bottom elevations at cell centers.
+4. Optionally applies polygon mask (only samples inside mask are counted).
+5. Integrates with:
+	- `net = sum(diff) * cell_area`
+	- `cut = sum(diff where diff>0) * cell_area`
+	- `fill = -sum(diff where diff<0) * cell_area`
+
+Supports:
+
+- KOF vs KOF
+- KOF vs raster elevation surface
+- raster elevation surface vs KOF
+- split-volume with intermediate layer (`KOF`, `Raster`, `Constant Z`)
+
+### 2) `triangles` method
+
+Used by `compute_volume(..., method="triangles")`.
+
+How it works:
+
+1. Triangulates both KOF surfaces (Delaunay + boundary filtering).
+2. Finds overlapping top/bottom triangle pairs by bounding-box prefilter.
+3. Computes exact convex polygon intersections for candidate pairs.
+4. Integrates linear surface difference analytically over each overlap polygon.
+5. Splits positive and negative contributions into cut/fill.
+
+This method is more exact for triangulated KOF pairs, and usually slower than `raster`.
+
+Supports:
+
+- KOF vs KOF only
+
+Current limitations:
+
+- No intermediate split-volume with `triangles`.
+- No raster surface participation in `triangles`.
+
+### Intermediate Split-Volume
+
+When `Intermediate` is set and method is `raster`, KOFvision computes two legs:
+
+- `upper = Top - Intermediate`
+- `lower = Intermediate - Bottom`
+
+The UI reports both leg nets and total net. Intermediate must be different from top and bottom.
+
+### Boundary Tightness
+
+Boundary tightness filters long triangulation edges (relative to median edge length) before interpolation/integration.
+
+- Lower values: tighter boundary, more outer triangles removed.
+- Higher values: looser boundary, more outer triangles retained.
+
+Changing boundary tightness marks previous volume results as stale; recompute volume after adjustment.
 
 ## Mask And Section Persistence
 
@@ -143,8 +249,16 @@ behind KOF points and polylines.
 Use the top toolbar:
 
 - Open raster...: load raster image (`.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`, `.bmp`)
+- Set elevation raster: mark one loaded single-band DEM raster for raster-based volume modes
+- Raster up / Raster down: reorder raster draw order
+- Remove raster: remove the active raster layer
 - Raster alpha: control transparency
-- Clear raster: remove the loaded raster
+
+Additional behavior:
+
+- Multiple rasters can be loaded simultaneously.
+- Elevation-based volume modes require a supported single-band elevation raster.
+- Non-elevation rasters can still be shown in 2D as visual background.
 
 Raster visibility is controlled in the left Layers panel, where raster appears
 as its own layer entry.
@@ -165,15 +279,6 @@ Notes:
 - Rotated world files (non-zero rotation terms) are currently not supported.
 - Very large rasters are automatically loaded as a downsampled preview for
 	faster display; georeferencing still uses full-resolution world-file metadata.
-
-## Boundary Tightness
-
-The Boundary tightness control filters long triangulation edges (relative to the median edge length).
-
-- Lower values: tighter concave boundary (drops more outer triangles)
-- Higher values: looser boundary (keeps more triangles)
-
-If you change this value after computing volume, the app marks the result as stale and you should recompute.
 
 ## Example Images
 
@@ -211,7 +316,7 @@ It writes PNG files to `docs/images/`.
 	- `Y` = Easting
 	- `H` = Elevation
 - Volume method options:
-	- `raster` (default): grid sampling over overlapping extents of the triangulated surfaces.
-	- `triangles`: direct integration over overlapping triangle polygons from both surfaces.
-	- split-volume with intermediate layer is currently available with `raster` method.
+	- `raster` (default): grid sampling over overlap between selected surfaces (KOF and/or elevation raster).
+	- `triangles`: direct polygon-overlap integration on triangulated KOF pairs.
+	- split-volume with intermediate layer is available only with `raster`.
 - Interpolation outside the filtered triangulation boundary is ignored.
