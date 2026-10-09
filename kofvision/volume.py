@@ -12,9 +12,6 @@ from .geometry import (
     integrate_diff_over_polygon,
     triangulate_simple_polygon,
 )
-from .models import KOFFile
-
-
 @runtime_checkable
 class SurfaceLike(Protocol):
     name: str
@@ -23,6 +20,12 @@ class SurfaceLike(Protocol):
         ...
 
     def interpolate(self, y: np.ndarray, x: np.ndarray) -> np.ndarray:
+        ...
+
+
+@runtime_checkable
+class TriangulatedSurfaceLike(SurfaceLike, Protocol):
+    def triangulation_data(self) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         ...
 
 
@@ -80,11 +83,6 @@ def _compute_volume_raster(
     mask_polygon: Optional[list[tuple[float, float]]] = None,
 ) -> Optional[VolumeResult]:
     """Grid-sample both surfaces and sum (top-bottom) * cell_area."""
-    if isinstance(top, KOFFile) and not top.ensure_triangulation():
-        return None
-    if isinstance(bottom, KOFFile) and not bottom.ensure_triangulation():
-        return None
-
     tb = top.xy_bounds()
     bb = bottom.xy_bounds()
     if tb is None or bb is None:
@@ -141,19 +139,18 @@ def _compute_volume_raster(
 
 
 def _compute_volume_triangles(
-    top: KOFFile,
-    bottom: KOFFile,
+    top: TriangulatedSurfaceLike,
+    bottom: TriangulatedSurfaceLike,
     mask_polygon: Optional[list[tuple[float, float]]] = None,
 ) -> Optional[VolumeResult]:
     """Integrate (top-bottom) over overlap polygons from both triangulations."""
-    if not top.ensure_triangulation() or not bottom.ensure_triangulation():
+    top_data = top.triangulation_data()
+    bottom_data = bottom.triangulation_data()
+    if top_data is None or bottom_data is None:
         return None
-    if top._xy is None or top._z is None or bottom._xy is None or bottom._z is None:
-        return None
-
-    top_simp = top.kept_simplices
-    bot_simp = bottom.kept_simplices
-    if top_simp is None or bot_simp is None or len(top_simp) == 0 or len(bot_simp) == 0:
+    top_xy_all, top_z_all, top_simp = top_data
+    bot_xy_all, bot_z_all, bot_simp = bottom_data
+    if len(top_simp) == 0 or len(bot_simp) == 0:
         return None
 
     tb = top.xy_bounds()
@@ -167,10 +164,10 @@ def _compute_volume_triangles(
     if y_min >= y_max or x_min >= x_max:
         return None
 
-    top_xy = top._xy[top_simp]
-    top_z = top._z[top_simp]
-    bot_xy = bottom._xy[bot_simp]
-    bot_z = bottom._z[bot_simp]
+    top_xy = top_xy_all[top_simp]
+    top_z = top_z_all[top_simp]
+    bot_xy = bot_xy_all[bot_simp]
+    bot_z = bot_z_all[bot_simp]
 
     top_ymin = np.min(top_xy[:, :, 0], axis=1)
     top_ymax = np.max(top_xy[:, :, 0], axis=1)
@@ -309,7 +306,7 @@ def _compute_volume_pair(
     mode: str,
 ) -> Optional[VolumeResult]:
     if mode == "triangles":
-        if not isinstance(top, KOFFile) or not isinstance(bottom, KOFFile):
-            raise ValueError("'triangles' method only supports KOF-vs-KOF surfaces.")
+        if not isinstance(top, TriangulatedSurfaceLike) or not isinstance(bottom, TriangulatedSurfaceLike):
+            raise ValueError("'triangles' method requires triangulated surfaces.")
         return _compute_volume_triangles(top, bottom, mask_polygon=mask_polygon)
     return _compute_volume_raster(top, bottom, target_cells=target_cells, mask_polygon=mask_polygon)
