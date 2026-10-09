@@ -55,9 +55,9 @@ from matplotlib.backends.backend_tkagg import (
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
-from kofvision import compute_volume, compute_volume_with_intermediate, parse_kof
+from kofvision import compute_volume, compute_volume_with_intermediate, parse_kof, parse_landxml
 from kofvision.export import export_kof_files_to_gpkg
-from kofvision.models import KOFFile
+from kofvision.models import KOFFile, LandXMLFile, LandXMLStation, LandXMLSurface
 from kofvision.mask_io import MaskDataError, load_mask_json, save_mask_json
 from kofvision.section_report import (
     profile_segment_from_station,
@@ -155,14 +155,20 @@ class KOFViewer(tk.Tk):
         self.title("KOF Viewer – 2D / 3D / Volume / Section")
         self.geometry("1300x860")
 
-        self.files: list[KOFFile] = []
+        self.files: list[KOFFile | LandXMLSurface] = []
+        self.landxml_files: list[LandXMLFile] = []
         self.layer_vars: list[tk.BooleanVar] = []
+        self._surface_owner_paths: list[Optional[str]] = []
+        self._landxml_group_vars: dict[str, tk.BooleanVar] = {}
         self.last_volume: Optional[VolumeResult | SplitVolumeResult] = None
 
         self.show_labels = tk.BooleanVar(value=False)
+        self.show_stations = tk.BooleanVar(value=True)
         self.show_markers = tk.BooleanVar(value=True)
         self.show_lines = tk.BooleanVar(value=True)
         self.show_triangulation = tk.BooleanVar(value=False)
+        self.show_tin_fill = tk.BooleanVar(value=True)
+        self.tin_fill_alpha = tk.DoubleVar(value=0.14)
         self.equal_aspect = tk.BooleanVar(value=True)
         self.show_raster = tk.BooleanVar(value=False)
         self.raster_alpha = tk.DoubleVar(value=0.7)
@@ -180,6 +186,11 @@ class KOFViewer(tk.Tk):
         self.raster_clip_to_kof = tk.BooleanVar(value=False)
         self.raster_clip_buffer_m = tk.DoubleVar(value=10.0)
         self.active_raster_name = tk.StringVar(value="")
+        self.station_interval_m = tk.DoubleVar(value=10.0)
+        self.station_label_format = tk.StringVar(value="plain")
+        self.strict_xsd_validation = tk.BooleanVar(value=False)
+        self.xsd_allow_network = tk.BooleanVar(value=True)
+        self.xsd_local_schema_path = tk.StringVar(value="")
 
         # Raster background state (2D tab only)
         self._raster_layers: list[_RasterViewLayer] = []
@@ -268,22 +279,91 @@ class KOFViewer(tk.Tk):
         self.raster_alpha_spin.bind("<FocusOut>",
                                    lambda _e: self._on_raster_alpha_change())
 
-        ttk.Checkbutton(bar, text="Labels", variable=self.show_labels,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(bar, text="Markers", variable=self.show_markers,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(bar, text="Lines", variable=self.show_lines,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(bar, text="Triangulation", variable=self.show_triangulation,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(bar, text="Equal aspect (2D)", variable=self.equal_aspect,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-
         ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
         ttk.Button(bar, text="Zoom to selected layers",
                command=self._on_zoom_selected_layers).pack(side=tk.LEFT, padx=2)
         ttk.Button(bar, text="Reset view",
                command=self._on_reset_view).pack(side=tk.LEFT, padx=2)
+
+        # Row 1b: display + station + schema controls to avoid horizontal overflow.
+        bar_display = ttk.Frame(self, padding=(4, 0, 4, 4))
+        bar_display.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Checkbutton(bar_display, text="Labels", variable=self.show_labels,
+                        command=self._redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(bar_display, text="Stations", variable=self.show_stations,
+                        command=self._redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Label(bar_display, text="Station step (m):").pack(side=tk.LEFT, padx=(8, 2))
+        self.station_interval_spin = ttk.Spinbox(
+            bar_display,
+            from_=1.0,
+            to=1000.0,
+            increment=1.0,
+            width=5,
+            textvariable=self.station_interval_m,
+            command=self._on_station_settings_changed,
+        )
+        self.station_interval_spin.pack(side=tk.LEFT, padx=2)
+        self.station_interval_spin.bind("<Return>", lambda _e: self._on_station_settings_changed())
+        self.station_interval_spin.bind("<FocusOut>", lambda _e: self._on_station_settings_changed())
+        ttk.Label(bar_display, text="Station labels:").pack(side=tk.LEFT, padx=(4, 2))
+        self.station_label_combo = ttk.Combobox(
+            bar_display,
+            textvariable=self.station_label_format,
+            values=["plain", "chainage"],
+            width=9,
+            state="readonly",
+        )
+        self.station_label_combo.pack(side=tk.LEFT, padx=2)
+        self.station_label_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_station_settings_changed())
+
+        ttk.Separator(bar_display, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Checkbutton(bar_display, text="Markers", variable=self.show_markers,
+                        command=self._redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(bar_display, text="Lines", variable=self.show_lines,
+                        command=self._redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(bar_display, text="Triangulation", variable=self.show_triangulation,
+                        command=self._redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(bar_display, text="TIN fill", variable=self.show_tin_fill,
+                        command=self._redraw).pack(side=tk.LEFT, padx=2)
+        ttk.Label(bar_display, text="TIN alpha:").pack(side=tk.LEFT, padx=(6, 2))
+        self.tin_fill_alpha_spin = ttk.Spinbox(
+            bar_display,
+            from_=0.0,
+            to=1.0,
+            increment=0.01,
+            width=5,
+            textvariable=self.tin_fill_alpha,
+            command=self._on_tin_fill_alpha_change,
+        )
+        self.tin_fill_alpha_spin.pack(side=tk.LEFT, padx=2)
+        self.tin_fill_alpha_spin.bind("<Return>", lambda _e: self._on_tin_fill_alpha_change())
+        self.tin_fill_alpha_spin.bind("<FocusOut>", lambda _e: self._on_tin_fill_alpha_change())
+        self.tin_fill_alpha_scale = ttk.Scale(
+            bar_display,
+            from_=0.0,
+            to=1.0,
+            orient=tk.HORIZONTAL,
+            variable=self.tin_fill_alpha,
+            command=self._on_tin_fill_alpha_scale,
+            length=120,
+        )
+        self.tin_fill_alpha_scale.pack(side=tk.LEFT, padx=(2, 6))
+        ttk.Checkbutton(bar_display, text="Equal aspect (2D)", variable=self.equal_aspect,
+                        command=self._redraw).pack(side=tk.LEFT, padx=2)
+
+        ttk.Separator(bar_display, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Checkbutton(
+            bar_display,
+            text="Strict XSD",
+            variable=self.strict_xsd_validation,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Checkbutton(
+            bar_display,
+            text="Allow net schema",
+            variable=self.xsd_allow_network,
+        ).pack(side=tk.LEFT, padx=2)
+        ttk.Button(bar_display, text="XSD file...", command=self._on_pick_local_xsd).pack(side=tk.LEFT, padx=2)
 
         # Row 2: surfaces + volume + section
         bar2 = ttk.Frame(self, padding=(4, 0, 4, 4))
@@ -478,10 +558,102 @@ class KOFViewer(tk.Tk):
         ttk.Label(bar, textvariable=self.status, anchor=tk.W).pack(fill=tk.X)
 
     # -------------------------------------------------------------- Actions
+    def _on_pick_local_xsd(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Select local LandXML XSD",
+            filetypes=[("XSD files", "*.xsd"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.xsd_local_schema_path.set(path)
+
+    @staticmethod
+    def _format_station_label(station_m: float, label_format: str) -> str:
+        if label_format == "chainage":
+            rounded = int(round(station_m))
+            km = rounded // 1000
+            m = rounded % 1000
+            return f"{km}+{m:03d}"
+        return f"{station_m:.0f}"
+
+    @staticmethod
+    def _interpolate_alignment_point(
+        centerline: list[tuple[float, float]],
+        offset: float,
+    ) -> Optional[tuple[float, float]]:
+        if len(centerline) < 2 or offset < 0:
+            return None
+        for i in range(1, len(centerline)):
+            y0, x0 = centerline[i - 1]
+            y1, x1 = centerline[i]
+            seg_len = float(np.hypot(y1 - y0, x1 - x0))
+            if seg_len <= 0:
+                continue
+            if offset <= seg_len:
+                t = offset / seg_len
+                return (y0 + (y1 - y0) * t, x0 + (x1 - x0) * t)
+            offset -= seg_len
+        return centerline[-1]
+
+    def _rebuild_alignment_stations(self) -> None:
+        try:
+            step = float(self.station_interval_m.get())
+        except (tk.TclError, ValueError):
+            step = 10.0
+        if not np.isfinite(step) or step <= 0:
+            step = 10.0
+        self.station_interval_m.set(step)
+
+        fmt = self.station_label_format.get().strip().lower() or "plain"
+        if fmt not in {"plain", "chainage"}:
+            fmt = "plain"
+            self.station_label_format.set(fmt)
+
+        for lx in self.landxml_files:
+            for alignment in lx.alignments:
+                alignment.stations.clear()
+                if len(alignment.centerline) < 2 or alignment.length <= 0:
+                    continue
+                n_steps = int(np.floor(alignment.length / step))
+                for i in range(n_steps + 1):
+                    sta = alignment.sta_start + i * step
+                    if sta > alignment.sta_start + alignment.length + 1e-6:
+                        break
+                    pt = self._interpolate_alignment_point(alignment.centerline, sta - alignment.sta_start)
+                    if pt is None:
+                        continue
+                    alignment.stations.append(
+                        LandXMLStation(
+                            label=self._format_station_label(sta, fmt),
+                            station=sta,
+                            y=pt[0],
+                            x=pt[1],
+                            z=None,
+                        )
+                    )
+                end_sta = alignment.sta_start + alignment.length
+                if not alignment.stations or abs(alignment.stations[-1].station - end_sta) > 1e-6:
+                    end_pt = self._interpolate_alignment_point(alignment.centerline, alignment.length)
+                    if end_pt is not None:
+                        alignment.stations.append(
+                            LandXMLStation(
+                                label=self._format_station_label(end_sta, fmt),
+                                station=end_sta,
+                                y=end_pt[0],
+                                x=end_pt[1],
+                                z=None,
+                            )
+                        )
+
+    def _on_station_settings_changed(self) -> None:
+        self._rebuild_alignment_stations()
+        self._redraw_2d()
+        self._update_status()
+
     def _on_open(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="Open KOF file(s)",
-            filetypes=[("KOF files", "*.kof"), ("All files", "*.*")],
+            title="Open surface/alignment file(s)",
+            filetypes=[("Supported files", "*.kof *.xml"), ("KOF files", "*.kof"), ("LandXML", "*.xml"), ("All files", "*.*")],
         )
         for path in paths:
             self._load_file(path, redraw=False)
@@ -490,13 +662,14 @@ class KOFViewer(tk.Tk):
         self._redraw()
 
     def _on_export_gpkg(self) -> None:
-        if not self.files:
+        kof_files = [k for k in self.files if isinstance(k, KOFFile)]
+        if not kof_files:
             messagebox.showinfo("KOF Viewer", "Load one or more KOF files first.")
             return
 
         default_name = "kof_export.gpkg"
-        if self.files:
-            first_name, _ext = os.path.splitext(self.files[0].name)
+        if kof_files:
+            first_name, _ext = os.path.splitext(kof_files[0].name)
             default_name = f"{first_name}_export.gpkg"
 
         out_path = filedialog.asksaveasfilename(
@@ -509,7 +682,7 @@ class KOFViewer(tk.Tk):
             return
 
         try:
-            summary = export_kof_files_to_gpkg(self.files, out_path)
+            summary = export_kof_files_to_gpkg(kof_files, out_path)
         except ImportError:
             messagebox.showerror(
                 "KOF Viewer",
@@ -534,7 +707,10 @@ class KOFViewer(tk.Tk):
 
     def _on_clear(self) -> None:
         self.files.clear()
+        self.landxml_files.clear()
         self.layer_vars.clear()
+        self._surface_owner_paths.clear()
+        self._landxml_group_vars.clear()
         self._view_extent_2d = None
         self.last_volume = None
         self.volume_text.set("Volume: (not computed)")
@@ -989,6 +1165,19 @@ class KOFViewer(tk.Tk):
         if self._raster_layers and self.show_raster.get():
             self._redraw_2d()
 
+    def _on_tin_fill_alpha_change(self) -> None:
+        try:
+            alpha = float(self.tin_fill_alpha.get())
+        except (tk.TclError, ValueError):
+            alpha = 0.14
+        alpha = min(max(alpha, 0.0), 1.0)
+        self.tin_fill_alpha.set(alpha)
+        self._redraw_2d()
+
+    def _on_tin_fill_alpha_scale(self, _value: str) -> None:
+        # Scale updates the same variable continuously; just redraw.
+        self._on_tin_fill_alpha_change()
+
     def _load_raster(self, path: str) -> None:
         clip_bounds = self._all_files_bounds()
         clip_buffer_m = self._safe_clip_buffer_m()
@@ -1117,12 +1306,26 @@ class KOFViewer(tk.Tk):
         for idx, kof in enumerate(self.files):
             if not self._is_layer_visible(idx):
                 continue
-            points = kof.all_points
-            if not points:
-                continue
-            xs = [p.y for p in points]
-            ys = [p.x for p in points]
-            include(min(xs), max(xs), min(ys), max(ys))
+            if isinstance(kof, KOFFile):
+                points = kof.all_points
+                if not points:
+                    continue
+                xs = [p.y for p in points]
+                ys = [p.x for p in points]
+                include(min(xs), max(xs), min(ys), max(ys))
+            else:
+                b = kof.xy_bounds()
+                if b is None:
+                    continue
+                include(b[0], b[2], b[1], b[3])
+
+        for lx in self.landxml_files:
+            for alignment in lx.alignments:
+                if len(alignment.centerline) < 2:
+                    continue
+                ys = [pt[0] for pt in alignment.centerline]
+                xs = [pt[1] for pt in alignment.centerline]
+                include(min(ys), max(ys), min(xs), max(xs))
 
         if xmin is None or xmax is None or ymin is None or ymax is None:
             return None
@@ -1135,13 +1338,52 @@ class KOFViewer(tk.Tk):
         self._redraw()
 
     def _load_file(self, path: str, *, redraw: bool = True) -> None:
+        ext = os.path.splitext(path)[1].lower()
         try:
-            kof = parse_kof(path)
+            if ext == ".xml":
+                schema_path = self.xsd_local_schema_path.get().strip() or None
+                landxml = parse_landxml(
+                    path,
+                    station_interval=float(self.station_interval_m.get()),
+                    strict_xsd_validation=bool(self.strict_xsd_validation.get()),
+                    local_schema_path=schema_path,
+                    allow_network_schema=bool(self.xsd_allow_network.get()),
+                )
+                self.landxml_files.append(landxml)
+                self._landxml_group_vars[path] = tk.BooleanVar(value=True)
+                for surface in landxml.surfaces:
+                    self.files.append(surface)
+                    self.layer_vars.append(tk.BooleanVar(value=True))
+                    self._surface_owner_paths.append(path)
+                self._on_toggle_landxml_child(path)
+                self._rebuild_alignment_stations()
+                if not landxml.surfaces and not landxml.alignments:
+                    messagebox.showwarning(
+                        "KOF Viewer",
+                        f"LandXML '{os.path.basename(path)}' did not contain supported surfaces or alignments.",
+                    )
+                if landxml.xsd_validation_enabled:
+                    verdict = "PASS" if landxml.xsd_validation_passed else "FAIL"
+                    details = "\n".join(landxml.xsd_validation_errors[:8])
+                    source = landxml.xsd_schema_source or "(unknown schema source)"
+                    if landxml.xsd_validation_passed:
+                        messagebox.showinfo(
+                            "KOF Viewer",
+                            f"Strict XSD validation {verdict}\nFile: {landxml.name}\nSchema: {source}",
+                        )
+                    else:
+                        messagebox.showwarning(
+                            "KOF Viewer",
+                            f"Strict XSD validation {verdict}\nFile: {landxml.name}\nSchema: {source}\n\n{details}",
+                        )
+            else:
+                kof = parse_kof(path)
+                self.files.append(kof)
+                self.layer_vars.append(tk.BooleanVar(value=True))
+                self._surface_owner_paths.append(None)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("KOF Viewer", f"Failed to read '{path}':\n{exc}")
             return
-        self.files.append(kof)
-        self.layer_vars.append(tk.BooleanVar(value=True))
         if redraw:
             self._refresh_file_selectors()
             self._refresh_layer_controls()
@@ -1185,7 +1427,7 @@ class KOFViewer(tk.Tk):
 
         has_raster_layer = bool(self._raster_layers)
 
-        if not self.files and not has_raster_layer:
+        if not self.files and not has_raster_layer and not self.landxml_files:
             ttk.Label(self.layers_inner, text="No layers loaded.").pack(anchor="w")
             return
 
@@ -1213,13 +1455,22 @@ class KOFViewer(tk.Tk):
                 ).pack(anchor="w", pady=1)
             ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(2, 4))
 
-        for idx, kof in enumerate(self.files):
+        # Flat KOF entries.
+        for idx, surface in enumerate(self.files):
             if idx >= len(self.layer_vars):
                 self.layer_vars.append(tk.BooleanVar(value=True))
+            owner_path = self._surface_owner_paths[idx] if idx < len(self._surface_owner_paths) else None
+            if owner_path is not None:
+                continue
 
-            n_pts = sum(len(b.points) for b in kof.blocks)
-            n_pl = sum(1 for b in kof.blocks if b.is_polyline and b.points)
-            label = f"{kof.name} ({n_pts} pts, {n_pl} pl)"
+            if isinstance(surface, KOFFile):
+                n_pts = sum(len(b.points) for b in surface.blocks)
+                n_pl = sum(1 for b in surface.blocks if b.is_polyline and b.points)
+                label = f"{surface.name} ({n_pts} pts, {n_pl} pl)"
+            else:
+                n_pts = len(surface.all_points)
+                n_pl = len(surface.faces)
+                label = f"{surface.name} ({n_pts} pts, {n_pl} tri)"
             ttk.Checkbutton(
                 self.layers_inner,
                 text=label,
@@ -1227,12 +1478,71 @@ class KOFViewer(tk.Tk):
                 command=self._redraw,
             ).pack(anchor="w", pady=1)
 
+        # Nested LandXML groups + child surfaces.
+        if self.landxml_files:
+            ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(2, 4))
+            for lx in self.landxml_files:
+                group_var = self._landxml_group_vars.setdefault(lx.path, tk.BooleanVar(value=True))
+                n_align = len(lx.alignments)
+                n_sta = sum(len(a.stations) for a in lx.alignments)
+                child_indices = [
+                    i for i, owner in enumerate(self._surface_owner_paths)
+                    if owner == lx.path
+                ]
+                ttk.Checkbutton(
+                    self.layers_inner,
+                    text=f"LandXML: {lx.name} ({len(child_indices)} surfaces, {n_align} alignments, {n_sta} stations)",
+                    variable=group_var,
+                    command=lambda p=lx.path: self._on_toggle_landxml_group(p),
+                ).pack(anchor="w", pady=(1, 0))
+
+                for idx in child_indices:
+                    surface = self.files[idx]
+                    if not isinstance(surface, LandXMLSurface):
+                        continue
+                    n_pts = len(surface.all_points)
+                    n_tri = len(surface.faces)
+                    label = f"    - {surface.layer_name} ({n_pts} pts, {n_tri} tri)"
+                    ttk.Checkbutton(
+                        self.layers_inner,
+                        text=label,
+                        variable=self.layer_vars[idx],
+                        command=lambda p=lx.path: self._on_toggle_landxml_child(p),
+                    ).pack(anchor="w", pady=1)
+
     def _is_layer_visible(self, idx: int) -> bool:
         if idx < 0 or idx >= len(self.layer_vars):
             return True
-        return bool(self.layer_vars[idx].get())
+        visible = bool(self.layer_vars[idx].get())
+        owner_path = self._surface_owner_paths[idx] if idx < len(self._surface_owner_paths) else None
+        if owner_path is not None:
+            group_var = self._landxml_group_vars.get(owner_path)
+            if group_var is not None and not bool(group_var.get()):
+                return False
+        return visible
 
-    def _find_file(self, name: str) -> Optional[KOFFile]:
+    def _on_toggle_landxml_group(self, owner_path: str) -> None:
+        group_var = self._landxml_group_vars.get(owner_path)
+        if group_var is None:
+            return
+        state = bool(group_var.get())
+        for idx, owner in enumerate(self._surface_owner_paths):
+            if owner == owner_path and idx < len(self.layer_vars):
+                self.layer_vars[idx].set(state)
+        self._redraw()
+
+    def _on_toggle_landxml_child(self, owner_path: str) -> None:
+        selected = [
+            bool(self.layer_vars[idx].get())
+            for idx, owner in enumerate(self._surface_owner_paths)
+            if owner == owner_path and idx < len(self.layer_vars)
+        ]
+        group_var = self._landxml_group_vars.get(owner_path)
+        if group_var is not None:
+            group_var.set(any(selected) if selected else False)
+        self._redraw()
+
+    def _find_file(self, name: str) -> Optional[SurfaceLike]:
         for k in self.files:
             if k.name == name:
                 return k
@@ -1370,8 +1680,8 @@ class KOFViewer(tk.Tk):
 
     def _section_area_pair(
         self,
-        top: KOFFile,
-        bottom: KOFFile,
+        top: SurfaceLike,
+        bottom: SurfaceLike,
     ) -> tuple[Any, Any, str, str]:
         """Return surfaces used for section area shading based on active volume mode."""
         mode = self._current_volume_mode_key()
@@ -1451,7 +1761,7 @@ class KOFViewer(tk.Tk):
             messagebox.showwarning(
                 "KOF Viewer",
                 "Intermediate layer split requires 'raster' method. "
-                "'triangles' currently supports KOF-vs-KOF pairs only.",
+                "'triangles' currently supports top-bottom pairs only.",
             )
             return
 
@@ -1721,37 +2031,93 @@ class KOFViewer(tk.Tk):
             if not self._is_layer_visible(idx):
                 continue
             color = FILE_COLORS[idx % len(FILE_COLORS)]
-            labeled = False
-            for block in kof.blocks:
-                if not block.points:
-                    continue
-                xs = [p.y for p in block.points]
-                ys = [p.x for p in block.points]
-                label = kof.name if not labeled else None
-                labeled = True
-                if block.is_polyline and self.show_lines.get() and len(block.points) >= 2:
-                    self.ax2d.plot(xs, ys, "-", color=color, linewidth=1.2, label=label)
-                    if self.show_markers.get():
-                        self.ax2d.plot(xs, ys, "o", color=color, markersize=3)
-                else:
-                    marker = "o" if self.show_markers.get() else "."
-                    self.ax2d.plot(xs, ys, marker, color=color, markersize=4,
-                                   linestyle="None", label=label)
+            if isinstance(kof, KOFFile):
+                labeled = False
+                for block in kof.blocks:
+                    if not block.points:
+                        continue
+                    xs = [p.y for p in block.points]
+                    ys = [p.x for p in block.points]
+                    label = kof.name if not labeled else None
+                    labeled = True
+                    if block.is_polyline and self.show_lines.get() and len(block.points) >= 2:
+                        self.ax2d.plot(xs, ys, "-", color=color, linewidth=1.2, label=label)
+                        if self.show_markers.get():
+                            self.ax2d.plot(xs, ys, "o", color=color, markersize=3)
+                    else:
+                        marker = "o" if self.show_markers.get() else "."
+                        self.ax2d.plot(xs, ys, marker, color=color, markersize=4,
+                                       linestyle="None", label=label)
 
-                if self.show_labels.get():
-                    for p in block.points:
-                        self.ax2d.annotate(
-                            p.pkt, (p.y, p.x), fontsize=7,
-                            xytext=(3, 3), textcoords="offset points", color=color,
-                        )
+                    if self.show_labels.get():
+                        for p in block.points:
+                            self.ax2d.annotate(
+                                p.pkt, (p.y, p.x), fontsize=7,
+                                xytext=(3, 3), textcoords="offset points", color=color,
+                            )
+            else:
+                if self.show_markers.get() and kof.ensure_triangulation() and kof._xy is not None:
+                    self.ax2d.plot(
+                        kof._xy[:, 0],
+                        kof._xy[:, 1],
+                        "o",
+                        color=color,
+                        markersize=2,
+                        linestyle="None",
+                        label=kof.name,
+                    )
 
-            if self.show_triangulation.get() and kof.ensure_triangulation():
+            draw_tin_faces = isinstance(kof, LandXMLSurface) and len(kof.faces) > 0 and self.show_lines.get()
+            if (self.show_triangulation.get() or draw_tin_faces) and kof.ensure_triangulation():
                 kept = kof.kept_simplices
                 if kept is not None and len(kept) > 0:
+                    if draw_tin_faces and self.show_tin_fill.get() and kof._xy is not None:
+                        face_vals = np.zeros(len(kept), dtype=float)
+                        self.ax2d.tripcolor(
+                            kof._xy[:, 0],
+                            kof._xy[:, 1],
+                            face_vals,
+                            triangles=kept,
+                            shading="flat",
+                            vmin=0.0,
+                            vmax=1.0,
+                            color=color,
+                            alpha=float(self.tin_fill_alpha.get()),
+                            zorder=1,
+                        )
                     self.ax2d.triplot(
                         kof._xy[:, 0], kof._xy[:, 1], kept,
-                        color=color, linewidth=0.4, alpha=0.5,
+                        color=color, linewidth=0.45, alpha=0.75,
                     )
+
+        for lidx, lx in enumerate(self.landxml_files):
+            color = FILE_COLORS[(len(self.files) + lidx) % len(FILE_COLORS)]
+            labeled = False
+            for alignment in lx.alignments:
+                if self.show_lines.get() and len(alignment.centerline) >= 2:
+                    ys = [pt[0] for pt in alignment.centerline]
+                    xs = [pt[1] for pt in alignment.centerline]
+                    self.ax2d.plot(
+                        ys,
+                        xs,
+                        "-",
+                        color=color,
+                        linewidth=1.6,
+                        alpha=0.85,
+                        label=f"{lx.name}::{alignment.name}" if not labeled else None,
+                    )
+                    labeled = True
+                if self.show_stations.get():
+                    for st in alignment.stations:
+                        self.ax2d.plot([st.y], [st.x], marker="x", color=color, markersize=4)
+                        self.ax2d.annotate(
+                            st.label,
+                            (st.y, st.x),
+                            fontsize=7,
+                            xytext=(3, 3),
+                            textcoords="offset points",
+                            color=color,
+                        )
 
         if self.equal_aspect.get():
             self.ax2d.set_aspect("equal", adjustable="datalim")
@@ -1802,11 +2168,11 @@ class KOFViewer(tk.Tk):
                 self.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]],
                                ":", color="#cc8a00", linewidth=1.0, zorder=11)
 
-        if self.files:
+        if self.files or self.landxml_files:
             self.ax2d.legend(loc="best", fontsize=8)
         else:
             self.ax2d.text(
-                0.5, 0.5, "Open a .kof file to begin",
+                0.5, 0.5, "Open a .kof or .xml file to begin",
                 transform=self.ax2d.transAxes, ha="center", va="center", color="gray",
             )
 
@@ -1824,7 +2190,7 @@ class KOFViewer(tk.Tk):
                 continue
             color = FILE_COLORS[idx % len(FILE_COLORS)]
             labeled = False
-            if self.show_triangulation.get() and kof.ensure_triangulation():
+            if self.show_triangulation.get() and hasattr(kof, "ensure_triangulation") and kof.ensure_triangulation():
                 kept = kof.kept_simplices
                 if kept is not None and len(kept) > 0:
                     self.ax3d.plot_trisurf(
@@ -1832,33 +2198,37 @@ class KOFViewer(tk.Tk):
                         triangles=kept,
                         color=color, alpha=0.35, linewidth=0.2, edgecolor=color,
                     )
-            for block in kof.blocks:
-                if not block.points:
-                    continue
-                xs = [p.y for p in block.points]
-                ys = [p.x for p in block.points]
-                zs = [p.h for p in block.points]
-                label = kof.name if not labeled else None
-                labeled = True
-                if block.is_polyline and self.show_lines.get() and len(block.points) >= 2:
-                    self.ax3d.plot(xs, ys, zs, "-", color=color,
-                                   linewidth=1.2, label=label)
-                    if self.show_markers.get():
-                        self.ax3d.scatter(xs, ys, zs, color=color, s=10)
-                else:
-                    if self.show_markers.get():
-                        self.ax3d.scatter(xs, ys, zs, color=color, s=12, label=label)
+            if isinstance(kof, KOFFile):
+                for block in kof.blocks:
+                    if not block.points:
+                        continue
+                    xs = [p.y for p in block.points]
+                    ys = [p.x for p in block.points]
+                    zs = [p.h for p in block.points]
+                    label = kof.name if not labeled else None
+                    labeled = True
+                    if block.is_polyline and self.show_lines.get() and len(block.points) >= 2:
+                        self.ax3d.plot(xs, ys, zs, "-", color=color,
+                                       linewidth=1.2, label=label)
+                        if self.show_markers.get():
+                            self.ax3d.scatter(xs, ys, zs, color=color, s=10)
+                    else:
+                        if self.show_markers.get():
+                            self.ax3d.scatter(xs, ys, zs, color=color, s=12, label=label)
 
-                if self.show_labels.get():
-                    for p in block.points:
-                        self.ax3d.text(p.y, p.x, p.h, p.pkt, fontsize=7, color=color)
+                    if self.show_labels.get():
+                        for p in block.points:
+                            self.ax3d.text(p.y, p.x, p.h, p.pkt, fontsize=7, color=color)
+            else:
+                if kof.ensure_triangulation() and kof._xy is not None and kof._z is not None and self.show_markers.get():
+                    self.ax3d.scatter(kof._xy[:, 0], kof._xy[:, 1], kof._z, color=color, s=10, label=kof.name)
 
         if self.files:
             self.ax3d.legend(loc="best", fontsize=8)
             self._equalize_3d_aspect()
         else:
             self.ax3d.text2D(
-                0.5, 0.5, "Open a .kof file to begin",
+                0.5, 0.5, "Open a surface-enabled file to begin",
                 transform=self.ax3d.transAxes, ha="center", va="center", color="gray",
             )
 
@@ -1870,10 +2240,16 @@ class KOFViewer(tk.Tk):
         all_y: list[float] = []
         all_z: list[float] = []
         for kof in self.files:
-            for p in kof.all_points:
-                all_x.append(p.y)
-                all_y.append(p.x)
-                all_z.append(p.h)
+            if isinstance(kof, KOFFile):
+                for p in kof.all_points:
+                    all_x.append(p.y)
+                    all_y.append(p.x)
+                    all_z.append(p.h)
+            else:
+                if kof.ensure_triangulation() and kof._xy is not None and kof._z is not None:
+                    all_x.extend(kof._xy[:, 0].tolist())
+                    all_y.extend(kof._xy[:, 1].tolist())
+                    all_z.extend(kof._z.tolist())
         if not all_x:
             return
         rx = max(all_x) - min(all_x)
@@ -1896,21 +2272,32 @@ class KOFViewer(tk.Tk):
             return
         if self._mask_mode:
             return
-        if not self.files:
+        if not self.files and not self.landxml_files:
             self.status.set("No file loaded.")
             return
         parts = []
         total_points = 0
         total_blocks = 0
         for kof in self.files:
-            n_pts = sum(len(b.points) for b in kof.blocks)
-            n_pl = sum(1 for b in kof.blocks if b.is_polyline and b.points)
-            total_points += n_pts
-            total_blocks += n_pl
-            parts.append(f"{kof.name}: {n_pts} pts / {n_pl} polylines")
+            if isinstance(kof, KOFFile):
+                n_pts = sum(len(b.points) for b in kof.blocks)
+                n_pl = sum(1 for b in kof.blocks if b.is_polyline and b.points)
+                total_points += n_pts
+                total_blocks += n_pl
+                parts.append(f"{kof.name}: {n_pts} pts / {n_pl} polylines")
+            else:
+                n_pts = len(kof.all_points)
+                n_tri = len(kof.faces)
+                total_points += n_pts
+                total_blocks += n_tri
+                parts.append(f"{kof.name}: {n_pts} pts / {n_tri} triangles")
+        for lx in self.landxml_files:
+            n_align = len(lx.alignments)
+            n_sta = sum(len(a.stations) for a in lx.alignments)
+            parts.append(f"{lx.name}: {n_align} alignments / {n_sta} stations")
         base = (
-            f"{len(self.files)} file(s), {total_points} points, "
-            f"{total_blocks} polylines   |   " + "  ·  ".join(parts)
+            f"{len(self.files)} surface layer(s), {total_points} points, "
+            f"{total_blocks} primitives   |   " + "  ·  ".join(parts)
         )
         if len(self._mask_polygon) >= 3:
             base += f"   |   mask: {len(self._mask_polygon)} vertices"
@@ -1938,8 +2325,8 @@ class SectionWindow(tk.Toplevel):
     def __init__(
         self,
         master: tk.Misc,
-        top: KOFFile,
-        bottom: KOFFile,
+        top: SurfaceLike,
+        bottom: SurfaceLike,
         p0: tuple[float, float],
         p1: tuple[float, float],
         raster_surface: Optional[ElevationRasterSurface] = None,
