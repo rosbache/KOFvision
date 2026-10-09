@@ -37,6 +37,7 @@ import json
 import os
 import sys
 import tkinter as tk
+import tkinter.font as tkfont
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from tkinter import simpledialog
@@ -70,6 +71,11 @@ from kofvision.section_report import (
 from kofvision.sections_io import SectionDataError, load_sections_json, save_sections_json
 from kofvision.volume import ConstantElevationSurface, SplitVolumeResult, SurfaceLike, VolumeResult
 from kofvision.raster import ElevationRasterSurface, load_elevation_surface, load_raster_layer
+
+try:
+    import customtkinter as ctk
+except Exception:  # noqa: BLE001
+    ctk = None
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +160,10 @@ class KOFViewer(tk.Tk):
         super().__init__()
         self.title("KOF Viewer – 2D / 3D / Volume / Section")
         self.geometry("1300x860")
+        self._ctk_enabled = ctk is not None and os.environ.get("KOFVISION_DISABLE_CTK", "0") != "1"
+        if self._ctk_enabled:
+            ctk.set_appearance_mode("Dark")
+            ctk.set_default_color_theme("blue")
 
         self.files: list[KOFFile | LandXMLSurface] = []
         self.landxml_files: list[LandXMLFile] = []
@@ -181,6 +191,7 @@ class KOFViewer(tk.Tk):
         self.intermediate_kof_var = tk.StringVar()
         self.intermediate_raster_var = tk.StringVar()
         self.intermediate_constant_z = tk.DoubleVar(value=0.0)
+        self.intermediate_constant_step = tk.DoubleVar(value=0.1)
         self.volume_text = tk.StringVar(value="Volume: (not computed)")
         self.boundary_factor = tk.DoubleVar(value=2.5)
         self.raster_clip_to_kof = tk.BooleanVar(value=False)
@@ -212,9 +223,12 @@ class KOFViewer(tk.Tk):
         self._mask_polygon: list[tuple[float, float]] = []
         self._mask_cid: Optional[int] = None
 
+        self._configure_styles()
+
         self._build_toolbar()
         self._build_body()
         self._build_statusbar()
+        self._bind_shortcuts()
 
         for path in initial_files or []:
             self._load_file(path, redraw=False)
@@ -222,125 +236,194 @@ class KOFViewer(tk.Tk):
         self._refresh_layer_controls()
         self._redraw()
 
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        base_font = tkfont.nametofont("TkDefaultFont")
+        header_font = base_font.copy()
+        header_font.configure(weight="bold", size=max(base_font.cget("size"), 10))
+        style.configure("TopBar.TFrame", padding=4)
+        style.configure("PanelHeader.TLabel", font=header_font)
+        style.configure("PanelBody.TFrame", relief="groove", borderwidth=1)
+        style.configure("Primary.TButton", padding=(10, 6))
+
+    def _bind_shortcuts(self) -> None:
+        self.bind_all("<Control-o>", lambda _e: self._invoke_shortcut(self._on_open))
+        self.bind_all("<Control-e>", lambda _e: self._invoke_shortcut(self._on_export_gpkg))
+        self.bind_all("<Control-Shift-K>", lambda _e: self._invoke_shortcut(self._on_clear))
+        self.bind_all("<Control-Shift-Z>", lambda _e: self._invoke_shortcut(self._on_zoom_selected_layers))
+        self.bind_all("<Control-Shift-R>", lambda _e: self._invoke_shortcut(self._on_reset_view))
+        self.bind_all("<Control-Shift-V>", lambda _e: self._invoke_shortcut(self._on_compute_volume))
+        self.bind_all("<Control-Shift-S>", lambda _e: self._invoke_shortcut(self._on_toggle_section))
+        self.bind_all("<Control-Shift-M>", lambda _e: self._invoke_shortcut(self._on_toggle_mask))
+
+    @staticmethod
+    def _invoke_shortcut(callback) -> str:  # noqa: ANN001
+        callback()
+        return "break"
+
+    def _make_toolbar_button(
+        self,
+        parent: tk.Widget,
+        *,
+        text: str,
+        command,
+        primary: bool = False,
+    ) -> tk.Widget:
+        if self._ctk_enabled:
+            fg = "#1f6aa5" if primary else None
+            btn = ctk.CTkButton(
+                parent,
+                text=text,
+                command=command,
+                height=30,
+                corner_radius=8,
+                fg_color=fg,
+            )
+            return btn
+        style = "Primary.TButton" if primary else "TButton"
+        return ttk.Button(parent, text=text, command=command, style=style)
+
     # ------------------------------------------------------------------ UI
     def _build_toolbar(self) -> None:
-        bar = ttk.Frame(self, padding=4)
-        bar.pack(side=tk.TOP, fill=tk.X)
+        top = ttk.Frame(self, style="TopBar.TFrame", padding=(8, 6, 8, 6))
+        top.pack(side=tk.TOP, fill=tk.X)
 
-        ttk.Button(bar, text="Open...", command=self._on_open).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="Export GPKG...",
-               command=self._on_export_gpkg).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="Clear", command=self._on_clear).pack(side=tk.LEFT, padx=2)
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Button(bar, text="Open raster...",
-                   command=self._on_open_raster).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="Remove raster",
-                   command=self._on_clear_raster).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="Raster up",
-                   command=self._on_move_raster_up).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="Raster down",
-                   command=self._on_move_raster_down).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="Set elevation raster",
-                   command=self._on_set_elevation_raster).pack(side=tk.LEFT, padx=2)
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        open_btn = self._make_toolbar_button(top, text="Open", command=self._on_open)
+        open_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(open_btn, "Shortcut: Ctrl+O")
 
-        ttk.Checkbutton(bar, text="Raster", variable=self.show_raster,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Label(bar, text="Active raster:").pack(side=tk.LEFT, padx=(8, 2))
-        self.active_raster_combo = ttk.Combobox(
-            bar,
-            textvariable=self.active_raster_name,
-            values=[],
-            width=24,
-            state="readonly",
-        )
-        self.active_raster_combo.pack(side=tk.LEFT, padx=2)
-        self.active_raster_combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _e: self._on_select_active_raster(),
-        )
-        ttk.Checkbutton(bar, text="Clip raster to KOF",
-                        variable=self.raster_clip_to_kof).pack(side=tk.LEFT, padx=(8, 2))
-        ttk.Label(bar, text="Clip buffer (m):").pack(side=tk.LEFT, padx=(4, 2))
-        self.raster_clip_buffer_spin = ttk.Spinbox(
-            bar, from_=0.0, to=10000.0, increment=1.0, width=6,
-            textvariable=self.raster_clip_buffer_m,
-        )
-        self.raster_clip_buffer_spin.pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Label(bar, text="Raster alpha:").pack(side=tk.LEFT, padx=(8, 2))
-        self.raster_alpha_spin = ttk.Spinbox(
-            bar, from_=0.05, to=1.0, increment=0.05, width=5,
-            textvariable=self.raster_alpha,
-            command=self._on_raster_alpha_change,
-        )
-        self.raster_alpha_spin.pack(side=tk.LEFT)
-        self.raster_alpha_spin.bind("<Return>",
-                                   lambda _e: self._on_raster_alpha_change())
-        self.raster_alpha_spin.bind("<FocusOut>",
-                                   lambda _e: self._on_raster_alpha_change())
+        export_btn = self._make_toolbar_button(top, text="Export GPKG", command=self._on_export_gpkg)
+        export_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(export_btn, "Shortcut: Ctrl+E")
 
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Button(bar, text="Zoom to selected layers",
-               command=self._on_zoom_selected_layers).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar, text="Reset view",
-               command=self._on_reset_view).pack(side=tk.LEFT, padx=2)
+        clear_btn = self._make_toolbar_button(top, text="Clear", command=self._on_clear)
+        clear_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(clear_btn, "Shortcut: Ctrl+Shift+K")
 
-        # Row 1b: display + station + schema controls to avoid horizontal overflow.
-        bar_display = ttk.Frame(self, padding=(4, 0, 4, 4))
-        bar_display.pack(side=tk.TOP, fill=tk.X)
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
-        ttk.Checkbutton(bar_display, text="Labels", variable=self.show_labels,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(bar_display, text="Stations", variable=self.show_stations,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Label(bar_display, text="Station step (m):").pack(side=tk.LEFT, padx=(8, 2))
+        zoom_btn = self._make_toolbar_button(top, text="Zoom to selected", command=self._on_zoom_selected_layers)
+        zoom_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(zoom_btn, "Shortcut: Ctrl+Shift+Z")
+
+        reset_btn = self._make_toolbar_button(top, text="Reset view", command=self._on_reset_view)
+        reset_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(reset_btn, "Shortcut: Ctrl+Shift+R")
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        compute_btn = self._make_toolbar_button(top, text="Compute volume", command=self._on_compute_volume, primary=True)
+        compute_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(compute_btn, "Shortcut: Ctrl+Shift+V")
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        self.section_btn = self._make_toolbar_button(top, text="Draw section", command=self._on_toggle_section)
+        self.section_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.section_btn, "Shortcut: Ctrl+Shift+S")
+
+        self.mask_btn = self._make_toolbar_button(top, text="Draw mask", command=self._on_toggle_mask)
+        self.mask_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.mask_btn, "Shortcut: Ctrl+Shift+M")
+
+        ttk.Label(
+            top,
+            text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute",
+            foreground="#4a5a70",
+        ).pack(side=tk.RIGHT, padx=(8, 0))
+
+    def _add_collapsible_panel(
+        self,
+        parent: tk.Widget,
+        title: str,
+        *,
+        expanded: bool = True,
+    ) -> ttk.Frame:
+        panel = ttk.Frame(parent, padding=(0, 0, 0, 2))
+        panel.pack(fill=tk.X, pady=(0, 8))
+
+        header = ttk.Frame(panel, padding=(2, 2, 2, 2))
+        header.pack(fill=tk.X)
+        indicator = tk.StringVar(value="▼" if expanded else "▶")
+        content = ttk.Frame(panel, style="PanelBody.TFrame", padding=(8, 8, 8, 8))
+
+        def toggle() -> None:
+            if content.winfo_ismapped():
+                content.pack_forget()
+                indicator.set("▶")
+            else:
+                content.pack(fill=tk.X, pady=(3, 0))
+                indicator.set("▼")
+
+        ttk.Button(header, textvariable=indicator, width=2, command=toggle).pack(side=tk.LEFT)
+        ttk.Label(header, text=title, style="PanelHeader.TLabel").pack(side=tk.LEFT, padx=(4, 0))
+
+        if expanded:
+            content.pack(fill=tk.X, pady=(3, 0))
+        return content
+
+    def _build_control_panels(self, parent: tk.Widget) -> None:
+        ttk.Label(parent, text="Analysis Controls", style="PanelHeader.TLabel").pack(anchor="w", padx=2, pady=(0, 8))
+
+        display_panel = self._add_collapsible_panel(parent, "Display", expanded=True)
+        ttk.Checkbutton(display_panel, text="Labels", variable=self.show_labels, command=self._redraw).pack(anchor="w")
+        ttk.Checkbutton(display_panel, text="Stations", variable=self.show_stations, command=self._redraw).pack(anchor="w")
+        ttk.Checkbutton(display_panel, text="Markers", variable=self.show_markers, command=self._redraw).pack(anchor="w")
+        ttk.Checkbutton(display_panel, text="Lines", variable=self.show_lines, command=self._redraw).pack(anchor="w")
+        ttk.Checkbutton(display_panel, text="Triangulation", variable=self.show_triangulation, command=self._redraw).pack(anchor="w")
+        ttk.Checkbutton(display_panel, text="TIN fill", variable=self.show_tin_fill, command=self._redraw).pack(anchor="w")
+        ttk.Checkbutton(display_panel, text="Equal aspect (2D)", variable=self.equal_aspect, command=self._redraw).pack(anchor="w")
+
+        station_row = ttk.Frame(display_panel)
+        station_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(station_row, text="Station step (m):").pack(side=tk.LEFT)
         self.station_interval_spin = ttk.Spinbox(
-            bar_display,
+            station_row,
             from_=1.0,
             to=1000.0,
             increment=1.0,
-            width=5,
+            width=6,
             textvariable=self.station_interval_m,
             command=self._on_station_settings_changed,
         )
-        self.station_interval_spin.pack(side=tk.LEFT, padx=2)
+        self.station_interval_spin.pack(side=tk.LEFT, padx=(6, 0))
         self.station_interval_spin.bind("<Return>", lambda _e: self._on_station_settings_changed())
         self.station_interval_spin.bind("<FocusOut>", lambda _e: self._on_station_settings_changed())
-        ttk.Label(bar_display, text="Station labels:").pack(side=tk.LEFT, padx=(4, 2))
+
+        station_label_row = ttk.Frame(display_panel)
+        station_label_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(station_label_row, text="Station labels:").pack(side=tk.LEFT)
         self.station_label_combo = ttk.Combobox(
-            bar_display,
+            station_label_row,
             textvariable=self.station_label_format,
             values=["plain", "chainage"],
-            width=9,
+            width=11,
             state="readonly",
         )
-        self.station_label_combo.pack(side=tk.LEFT, padx=2)
+        self.station_label_combo.pack(side=tk.LEFT, padx=(6, 0))
         self.station_label_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_station_settings_changed())
 
-        ttk.Separator(bar_display, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Checkbutton(bar_display, text="Markers", variable=self.show_markers,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(bar_display, text="Lines", variable=self.show_lines,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(bar_display, text="Triangulation", variable=self.show_triangulation,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(bar_display, text="TIN fill", variable=self.show_tin_fill,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
-        ttk.Label(bar_display, text="TIN alpha:").pack(side=tk.LEFT, padx=(6, 2))
+        tin_row = ttk.Frame(display_panel)
+        tin_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(tin_row, text="TIN alpha:").pack(side=tk.LEFT)
         self.tin_fill_alpha_spin = ttk.Spinbox(
-            bar_display,
+            tin_row,
             from_=0.0,
             to=1.0,
             increment=0.01,
-            width=5,
+            width=6,
             textvariable=self.tin_fill_alpha,
             command=self._on_tin_fill_alpha_change,
         )
-        self.tin_fill_alpha_spin.pack(side=tk.LEFT, padx=2)
+        self.tin_fill_alpha_spin.pack(side=tk.LEFT, padx=(6, 6))
         self.tin_fill_alpha_spin.bind("<Return>", lambda _e: self._on_tin_fill_alpha_change())
         self.tin_fill_alpha_spin.bind("<FocusOut>", lambda _e: self._on_tin_fill_alpha_change())
         self.tin_fill_alpha_scale = ttk.Scale(
-            bar_display,
+            tin_row,
             from_=0.0,
             to=1.0,
             orient=tk.HORIZONTAL,
@@ -348,44 +431,86 @@ class KOFViewer(tk.Tk):
             command=self._on_tin_fill_alpha_scale,
             length=120,
         )
-        self.tin_fill_alpha_scale.pack(side=tk.LEFT, padx=(2, 6))
-        ttk.Checkbutton(bar_display, text="Equal aspect (2D)", variable=self.equal_aspect,
-                        command=self._redraw).pack(side=tk.LEFT, padx=2)
+        self.tin_fill_alpha_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        ttk.Separator(bar_display, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Checkbutton(
-            bar_display,
-            text="Strict XSD",
-            variable=self.strict_xsd_validation,
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Checkbutton(
-            bar_display,
-            text="Allow net schema",
-            variable=self.xsd_allow_network,
-        ).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar_display, text="XSD file...", command=self._on_pick_local_xsd).pack(side=tk.LEFT, padx=2)
+        raster_panel = self._add_collapsible_panel(parent, "Raster", expanded=False)
+        raster_btns = ttk.Frame(raster_panel)
+        raster_btns.pack(fill=tk.X)
+        ttk.Button(raster_btns, text="Open...", command=self._on_open_raster).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(raster_btns, text="Remove", command=self._on_clear_raster).pack(side=tk.LEFT, padx=4)
+        ttk.Button(raster_btns, text="Up", command=self._on_move_raster_up).pack(side=tk.LEFT, padx=4)
+        ttk.Button(raster_btns, text="Down", command=self._on_move_raster_down).pack(side=tk.LEFT, padx=4)
 
-        # Row 2: surfaces + volume + section
-        bar2 = ttk.Frame(self, padding=(4, 0, 4, 4))
-        bar2.pack(side=tk.TOP, fill=tk.X)
-        ttk.Label(bar2, text="Top:").pack(side=tk.LEFT, padx=(0, 2))
-        self.top_combo = ttk.Combobox(bar2, textvariable=self.top_var,
-                                      width=28, state="readonly")
-        self.top_combo.pack(side=tk.LEFT, padx=2)
-        ttk.Label(bar2, text="Bottom:").pack(side=tk.LEFT, padx=(10, 2))
-        self.bottom_combo = ttk.Combobox(bar2, textvariable=self.bottom_var,
-                                         width=28, state="readonly")
-        self.bottom_combo.pack(side=tk.LEFT, padx=2)
+        ttk.Button(raster_panel, text="Set elevation raster", command=self._on_set_elevation_raster).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(raster_panel, text="Show raster", variable=self.show_raster, command=self._redraw).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(raster_panel, text="Clip raster to KOF", variable=self.raster_clip_to_kof).pack(anchor="w")
 
-        ttk.Label(bar2, text="Volume from:").pack(side=tk.LEFT, padx=(10, 2))
-        self.volume_source_combo = ttk.Combobox(
-            bar2,
-            textvariable=self.volume_source_mode,
-            values=list(VOLUME_MODE_LABELS.values()),
-            width=18,
+        active_row = ttk.Frame(raster_panel)
+        active_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(active_row, text="Active:").pack(side=tk.LEFT)
+        self.active_raster_combo = ttk.Combobox(
+            active_row,
+            textvariable=self.active_raster_name,
+            values=[],
+            width=24,
             state="readonly",
         )
-        self.volume_source_combo.pack(side=tk.LEFT, padx=2)
+        self.active_raster_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+        self.active_raster_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_select_active_raster())
+
+        clip_row = ttk.Frame(raster_panel)
+        clip_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(clip_row, text="Clip buffer (m):").pack(side=tk.LEFT)
+        self.raster_clip_buffer_spin = ttk.Spinbox(
+            clip_row,
+            from_=0.0,
+            to=10000.0,
+            increment=1.0,
+            width=8,
+            textvariable=self.raster_clip_buffer_m,
+        )
+        self.raster_clip_buffer_spin.pack(side=tk.LEFT, padx=(6, 0))
+
+        alpha_row = ttk.Frame(raster_panel)
+        alpha_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(alpha_row, text="Raster alpha:").pack(side=tk.LEFT)
+        self.raster_alpha_spin = ttk.Spinbox(
+            alpha_row,
+            from_=0.05,
+            to=1.0,
+            increment=0.05,
+            width=8,
+            textvariable=self.raster_alpha,
+            command=self._on_raster_alpha_change,
+        )
+        self.raster_alpha_spin.pack(side=tk.LEFT, padx=(6, 0))
+        self.raster_alpha_spin.bind("<Return>", lambda _e: self._on_raster_alpha_change())
+        self.raster_alpha_spin.bind("<FocusOut>", lambda _e: self._on_raster_alpha_change())
+
+        volume_panel = self._add_collapsible_panel(parent, "Volume setup", expanded=True)
+        top_row = ttk.Frame(volume_panel)
+        top_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(top_row, text="Top:").pack(side=tk.LEFT)
+        self.top_combo = ttk.Combobox(top_row, textvariable=self.top_var, width=28, state="readonly")
+        self.top_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+
+        bottom_row = ttk.Frame(volume_panel)
+        bottom_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(bottom_row, text="Bottom:").pack(side=tk.LEFT)
+        self.bottom_combo = ttk.Combobox(bottom_row, textvariable=self.bottom_var, width=28, state="readonly")
+        self.bottom_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+
+        source_row = ttk.Frame(volume_panel)
+        source_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(source_row, text="Volume from:").pack(side=tk.LEFT)
+        self.volume_source_combo = ttk.Combobox(
+            source_row,
+            textvariable=self.volume_source_mode,
+            values=list(VOLUME_MODE_LABELS.values()),
+            width=20,
+            state="readonly",
+        )
+        self.volume_source_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
         _HoverTooltip(
             self.volume_source_combo,
             "KOF - KOF: existing KOF top/bottom workflow.\n"
@@ -394,19 +519,18 @@ class KOFViewer(tk.Tk):
             "Raster - Top KOF: loaded elevation raster minus top KOF.",
         )
 
-        ttk.Label(bar2, text="Intermediate:").pack(side=tk.LEFT, padx=(10, 2))
+        int_type_row = ttk.Frame(volume_panel)
+        int_type_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(int_type_row, text="Intermediate:").pack(side=tk.LEFT)
         self.intermediate_type_combo = ttk.Combobox(
-            bar2,
+            int_type_row,
             textvariable=self.intermediate_type,
             values=list(INTERMEDIATE_TYPE_LABELS.values()),
-            width=12,
+            width=20,
             state="readonly",
         )
-        self.intermediate_type_combo.pack(side=tk.LEFT, padx=2)
-        self.intermediate_type_combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _e: self._on_intermediate_type_change(),
-        )
+        self.intermediate_type_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+        self.intermediate_type_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_intermediate_type_change())
         _HoverTooltip(
             self.intermediate_type_combo,
             "Optional split-volume reference.\n"
@@ -417,106 +541,121 @@ class KOFViewer(tk.Tk):
         )
 
         self.intermediate_kof_combo = ttk.Combobox(
-            bar2,
+            volume_panel,
             textvariable=self.intermediate_kof_var,
             values=[],
-            width=18,
+            width=26,
             state="readonly",
         )
-        self.intermediate_kof_combo.pack(side=tk.LEFT, padx=2)
+        self.intermediate_kof_combo.pack(fill=tk.X, pady=(0, 2))
 
         self.intermediate_raster_combo = ttk.Combobox(
-            bar2,
+            volume_panel,
             textvariable=self.intermediate_raster_var,
             values=[],
-            width=18,
+            width=26,
             state="readonly",
         )
-        self.intermediate_raster_combo.pack(side=tk.LEFT, padx=2)
+        self.intermediate_raster_combo.pack(fill=tk.X, pady=(0, 2))
 
+        const_row = ttk.Frame(volume_panel)
+        const_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(const_row, text="Constant Z:").pack(side=tk.LEFT)
         self.intermediate_constant_z_spin = ttk.Spinbox(
-            bar2,
+            const_row,
             from_=-100000.0,
             to=100000.0,
             increment=0.1,
-            width=9,
+            width=12,
             textvariable=self.intermediate_constant_z,
         )
-        self.intermediate_constant_z_spin.pack(side=tk.LEFT, padx=2)
-        self.intermediate_constant_z_spin.bind(
-            "<Return>",
-            lambda _e: self._on_intermediate_type_change(),
+        self.intermediate_constant_z_spin.pack(side=tk.LEFT, padx=(6, 4))
+        self.intermediate_constant_down_btn = ttk.Button(
+            const_row,
+            text="-",
+            width=3,
+            command=lambda: self._nudge_intermediate_constant_z(-1),
         )
-        self.intermediate_constant_z_spin.bind(
-            "<FocusOut>",
-            lambda _e: self._on_intermediate_type_change(),
+        self.intermediate_constant_down_btn.pack(side=tk.LEFT, padx=(0, 2))
+        self.intermediate_constant_up_btn = ttk.Button(
+            const_row,
+            text="+",
+            width=3,
+            command=lambda: self._nudge_intermediate_constant_z(+1),
         )
+        self.intermediate_constant_up_btn.pack(side=tk.LEFT)
 
-        ttk.Label(bar2, text="Method:").pack(side=tk.LEFT, padx=(10, 2))
+        const_step_row = ttk.Frame(volume_panel)
+        const_step_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(const_step_row, text="Step:").pack(side=tk.LEFT)
+        self.intermediate_constant_step_spin = ttk.Spinbox(
+            const_step_row,
+            from_=0.01,
+            to=1000.0,
+            increment=0.01,
+            width=8,
+            textvariable=self.intermediate_constant_step,
+        )
+        self.intermediate_constant_step_spin.pack(side=tk.LEFT, padx=(6, 0))
+
+        self.intermediate_constant_z_spin.bind("<Return>", lambda _e: self._on_intermediate_type_change())
+        self.intermediate_constant_z_spin.bind("<FocusOut>", lambda _e: self._on_intermediate_type_change())
+        self.intermediate_constant_z_spin.bind("<Up>", lambda _e: self._nudge_intermediate_constant_z(+1))
+        self.intermediate_constant_z_spin.bind("<Down>", lambda _e: self._nudge_intermediate_constant_z(-1))
+
+        method_row = ttk.Frame(volume_panel)
+        method_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(method_row, text="Method:").pack(side=tk.LEFT)
         self.volume_method_combo = ttk.Combobox(
-            bar2,
+            method_row,
             textvariable=self.volume_method,
             values=["raster", "triangles"],
-            width=10,
+            width=12,
             state="readonly",
         )
-        self.volume_method_combo.pack(side=tk.LEFT, padx=2)
+        self.volume_method_combo.pack(side=tk.LEFT, padx=(6, 0))
+        self.volume_method_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_intermediate_type_change())
         _HoverTooltip(
             self.volume_method_combo,
             "raster: fastest for quick estimates.\n"
             "triangles: exact overlap integration; slower but more accurate.",
         )
-        self.volume_method_combo.bind(
-            "<<ComboboxSelected>>",
-            lambda _e: self._on_intermediate_type_change(),
-        )
 
-        ttk.Button(bar2, text="Compute volume",
-                   command=self._on_compute_volume).pack(side=tk.LEFT, padx=(10, 2))
-        ttk.Label(bar2, textvariable=self.volume_text,
-                  foreground="#204080").pack(side=tk.LEFT, padx=10)
-
-        ttk.Separator(bar2, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Label(bar2, text="Boundary tightness:").pack(side=tk.LEFT, padx=(0, 2))
+        boundary_row = ttk.Frame(volume_panel)
+        boundary_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(boundary_row, text="Boundary tightness:").pack(side=tk.LEFT)
         self.boundary_spin = ttk.Spinbox(
-            bar2, from_=1.0, to=10.0, increment=0.5, width=5,
+            boundary_row,
+            from_=1.0,
+            to=10.0,
+            increment=0.5,
+            width=6,
             textvariable=self.boundary_factor,
             command=self._on_boundary_change,
         )
-        self.boundary_spin.pack(side=tk.LEFT)
+        self.boundary_spin.pack(side=tk.LEFT, padx=(6, 0))
         self.boundary_spin.bind("<Return>", lambda _e: self._on_boundary_change())
         self.boundary_spin.bind("<FocusOut>", lambda _e: self._on_boundary_change())
 
+        ttk.Button(volume_panel, text="Compute volume", command=self._on_compute_volume).pack(anchor="w", pady=(2, 0))
+        ttk.Label(volume_panel, textvariable=self.volume_text, foreground="#204080", wraplength=300, justify=tk.LEFT).pack(fill=tk.X, pady=(4, 0))
+
+        sections_panel = self._add_collapsible_panel(parent, "Sections and mask", expanded=False)
+        ttk.Button(sections_panel, text="Clear sections", command=self._on_clear_sections).pack(fill=tk.X, pady=(0, 2))
+        ttk.Button(sections_panel, text="Save sections...", command=self._on_save_sections_json).pack(fill=tk.X, pady=2)
+        ttk.Button(sections_panel, text="Load sections...", command=self._on_load_sections_json).pack(fill=tk.X, pady=2)
+        ttk.Button(sections_panel, text="Export section report...", command=self._on_export_section_report).pack(fill=tk.X, pady=2)
+        ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        ttk.Button(sections_panel, text="Save mask...", command=self._on_save_mask_json).pack(fill=tk.X, pady=2)
+        ttk.Button(sections_panel, text="Load mask...", command=self._on_load_mask_json).pack(fill=tk.X, pady=2)
+        ttk.Button(sections_panel, text="Clear mask", command=self._on_clear_mask).pack(fill=tk.X, pady=2)
+
+        schema_panel = self._add_collapsible_panel(parent, "LandXML schema", expanded=False)
+        ttk.Checkbutton(schema_panel, text="Strict XSD", variable=self.strict_xsd_validation).pack(anchor="w")
+        ttk.Checkbutton(schema_panel, text="Allow net schema", variable=self.xsd_allow_network).pack(anchor="w")
+        ttk.Button(schema_panel, text="XSD file...", command=self._on_pick_local_xsd).pack(anchor="w", pady=(4, 0))
+
         self._on_intermediate_type_change()
-
-        # Row 3: section + mask tools (kept separate to avoid horizontal overflow)
-        bar3 = ttk.Frame(self, padding=(4, 0, 4, 4))
-        bar3.pack(side=tk.TOP, fill=tk.X)
-
-        ttk.Label(bar3, text="Sections:").pack(side=tk.LEFT, padx=(0, 4))
-        self.section_btn = ttk.Button(bar3, text="Draw section",
-                          command=self._on_toggle_section)
-        self.section_btn.pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar3, text="Clear sections",
-               command=self._on_clear_sections).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar3, text="Save sections...",
-               command=self._on_save_sections_json).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar3, text="Load sections...",
-               command=self._on_load_sections_json).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar3, text="Export section report...",
-               command=self._on_export_section_report).pack(side=tk.LEFT, padx=2)
-
-        ttk.Separator(bar3, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        ttk.Label(bar3, text="Mask:").pack(side=tk.LEFT, padx=(0, 4))
-        self.mask_btn = ttk.Button(bar3, text="Draw mask",
-                       command=self._on_toggle_mask)
-        self.mask_btn.pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar3, text="Save mask...",
-               command=self._on_save_mask_json).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar3, text="Load mask...",
-               command=self._on_load_mask_json).pack(side=tk.LEFT, padx=2)
-        ttk.Button(bar3, text="Clear mask",
-               command=self._on_clear_mask).pack(side=tk.LEFT, padx=2)
 
     def _build_body(self) -> None:
         body = ttk.Frame(self)
@@ -528,7 +667,10 @@ class KOFViewer(tk.Tk):
         self.layers_inner.pack(fill=tk.BOTH, expand=True)
         self._refresh_layer_controls()
 
-        self.notebook = ttk.Notebook(body)
+        center = ttk.Frame(body)
+        center.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.notebook = ttk.Notebook(center)
         self.notebook.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # 2D tab
@@ -550,6 +692,72 @@ class KOFViewer(tk.Tk):
         toolbar3d = NavigationToolbar2Tk(self.canvas3d, frame3d)
         toolbar3d.update()
         self.notebook.add(frame3d, text="3D")
+
+        self.controls_frame = ttk.Frame(body, padding=(2, 2, 4, 4), width=380)
+        self.controls_frame.pack(side=tk.RIGHT, fill=tk.Y)
+        self.controls_frame.pack_propagate(False)
+
+        controls_header = ttk.Frame(self.controls_frame)
+        controls_header.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(controls_header, text="Panels", style="PanelHeader.TLabel").pack(side=tk.LEFT)
+
+        self.controls_canvas = tk.Canvas(self.controls_frame, highlightthickness=0, borderwidth=0)
+        self.controls_scrollbar = ttk.Scrollbar(
+            self.controls_frame,
+            orient=tk.VERTICAL,
+            command=self.controls_canvas.yview,
+        )
+        self.controls_canvas.configure(yscrollcommand=self.controls_scrollbar.set)
+
+        self.controls_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.controls_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.controls_inner = ttk.Frame(self.controls_canvas)
+        self._controls_inner_window = self.controls_canvas.create_window(
+            (0, 0),
+            window=self.controls_inner,
+            anchor="nw",
+        )
+
+        self.controls_inner.bind(
+            "<Configure>",
+            lambda _e: self.controls_canvas.configure(scrollregion=self.controls_canvas.bbox("all")),
+        )
+        self.controls_canvas.bind(
+            "<Configure>",
+            lambda e: self.controls_canvas.itemconfigure(self._controls_inner_window, width=e.width),
+        )
+        self._wire_mousewheel_scrolling(self.controls_canvas)
+        self._wire_mousewheel_scrolling(self.controls_inner)
+
+        self._build_control_panels(self.controls_inner)
+
+    def _wire_mousewheel_scrolling(self, target: tk.Widget) -> None:
+        def _on_wheel(event) -> str:  # noqa: ANN001
+            if getattr(event, "num", None) == 4:
+                self.controls_canvas.yview_scroll(-1, "units")
+                return "break"
+            if getattr(event, "num", None) == 5:
+                self.controls_canvas.yview_scroll(1, "units")
+                return "break"
+            delta = int(getattr(event, "delta", 0))
+            if delta == 0:
+                return "break"
+            self.controls_canvas.yview_scroll(-int(delta / 120), "units")
+            return "break"
+
+        def _bind_wheel(_event=None) -> None:  # noqa: ANN001
+            self.bind_all("<MouseWheel>", _on_wheel)
+            self.bind_all("<Button-4>", _on_wheel)
+            self.bind_all("<Button-5>", _on_wheel)
+
+        def _unbind_wheel(_event=None) -> None:  # noqa: ANN001
+            self.unbind_all("<MouseWheel>")
+            self.unbind_all("<Button-4>")
+            self.unbind_all("<Button-5>")
+
+        target.bind("<Enter>", _bind_wheel)
+        target.bind("<Leave>", _unbind_wheel)
 
     def _build_statusbar(self) -> None:
         self.status = tk.StringVar(value="No file loaded.")
@@ -890,6 +1098,7 @@ class KOFViewer(tk.Tk):
         profile_rows: list[dict[str, object]] = []
         plan_points: list[tuple[str, tuple[float, float]]] = []
         section_raster = self._section_reference_raster()
+        section_intermediate = self._section_intermediate_surface()
         area_top_surface, area_bottom_surface, area_top_name, area_bottom_name = self._section_area_pair(top, bot)
 
         for idx, station in enumerate(stations, start=1):
@@ -911,6 +1120,8 @@ class KOFViewer(tk.Tk):
                 n_samples=int(n_samples),
                 reference_surface=section_raster,
                 reference_name=section_raster.name if section_raster is not None else None,
+                secondary_reference_surface=section_intermediate,
+                secondary_reference_name=section_intermediate.name if section_intermediate is not None else None,
                 area_top_surface=area_top_surface,
                 area_bottom_surface=area_bottom_surface,
                 area_top_name=area_top_name,
@@ -1585,22 +1796,71 @@ class KOFViewer(tk.Tk):
             return key
         return "none"
 
-    def _set_widget_state(self, widget: tk.Widget, enabled: bool) -> None:
-        desired = "readonly" if enabled else "disabled"
+    def _set_widget_state(
+        self,
+        widget: tk.Widget,
+        enabled: bool,
+        *,
+        mode_when_enabled: str = "readonly",
+    ) -> None:
+        desired = mode_when_enabled if enabled else "disabled"
         try:
             widget.configure(state=desired)
         except tk.TclError:
             widget.configure(state="normal" if enabled else "disabled")
 
+    def _safe_constant_step(self) -> float:
+        try:
+            step = float(self.intermediate_constant_step.get())
+        except (tk.TclError, ValueError):
+            step = 0.1
+        if not np.isfinite(step) or step <= 0.0:
+            step = 0.1
+        self.intermediate_constant_step.set(step)
+        return step
+
+    def _nudge_intermediate_constant_z(self, direction: int) -> str:
+        step = self._safe_constant_step()
+        try:
+            z_val = float(self.intermediate_constant_z.get())
+        except (tk.TclError, ValueError):
+            z_val = 0.0
+        if not np.isfinite(z_val):
+            z_val = 0.0
+        z_val += float(direction) * step
+        self.intermediate_constant_z.set(z_val)
+        self._on_intermediate_type_change()
+        return "break"
+
     def _on_intermediate_type_change(self) -> None:
         key = self._current_intermediate_type_key()
         method = self.volume_method.get().strip().lower()
         allow_intermediate = method != "triangles"
+        constant_enabled = allow_intermediate and key == "constant"
 
         self._set_widget_state(self.intermediate_type_combo, allow_intermediate)
         self._set_widget_state(self.intermediate_kof_combo, allow_intermediate and key == "kof")
         self._set_widget_state(self.intermediate_raster_combo, allow_intermediate and key == "raster")
-        self._set_widget_state(self.intermediate_constant_z_spin, allow_intermediate and key == "constant")
+        self._set_widget_state(
+            self.intermediate_constant_z_spin,
+            constant_enabled,
+            mode_when_enabled="normal",
+        )
+        self._set_widget_state(
+            self.intermediate_constant_step_spin,
+            constant_enabled,
+            mode_when_enabled="normal",
+        )
+        self._set_widget_state(
+            self.intermediate_constant_down_btn,
+            constant_enabled,
+            mode_when_enabled="normal",
+        )
+        self._set_widget_state(
+            self.intermediate_constant_up_btn,
+            constant_enabled,
+            mode_when_enabled="normal",
+        )
 
     def _all_surface_bounds(self) -> Optional[tuple[float, float, float, float]]:
         bounds: list[tuple[float, float, float, float]] = []
@@ -1620,50 +1880,64 @@ class KOFViewer(tk.Tk):
         return min(y_mins), min(x_mins), max(y_maxs), max(x_maxs)
 
     def _resolve_intermediate_surface(self) -> Optional[SurfaceLike]:
+        return self._resolve_intermediate_surface_with_feedback(show_warnings=True)
+
+    def _resolve_intermediate_surface_with_feedback(
+        self,
+        *,
+        show_warnings: bool,
+    ) -> Optional[SurfaceLike]:
         key = self._current_intermediate_type_key()
+
+        def _warn(msg: str) -> None:
+            if show_warnings:
+                messagebox.showwarning("KOF Viewer", msg)
+
         if key == "none":
             return None
         if key == "kof":
             surface = self._find_file(self.intermediate_kof_var.get())
             if surface is None:
-                messagebox.showwarning("KOF Viewer", "Select an intermediate KOF layer.")
+                _warn("Select an intermediate KOF layer.")
                 return None
             return surface
         if key == "raster":
             idx = self._intermediate_raster_index_map.get(self.intermediate_raster_var.get())
             if idx is None:
-                messagebox.showwarning("KOF Viewer", "Select an intermediate raster layer.")
+                _warn("Select an intermediate raster layer.")
                 return None
             if idx < 0 or idx >= len(self._raster_layers):
-                messagebox.showwarning("KOF Viewer", "Selected intermediate raster is no longer available.")
+                _warn("Selected intermediate raster is no longer available.")
                 return None
             layer = self._raster_layers[idx]
             if layer.elevation_surface is None:
-                messagebox.showwarning(
-                    "KOF Viewer",
-                    "Selected intermediate raster is not a supported single-band elevation raster.",
-                )
+                _warn("Selected intermediate raster is not a supported single-band elevation raster.")
                 return None
             return layer.elevation_surface
         if key == "constant":
             try:
                 z_val = float(self.intermediate_constant_z.get())
             except (tk.TclError, ValueError):
-                messagebox.showwarning("KOF Viewer", "Intermediate Constant Z must be numeric.")
+                _warn("Intermediate Constant Z must be numeric.")
                 return None
             if not np.isfinite(z_val):
-                messagebox.showwarning("KOF Viewer", "Intermediate Constant Z must be finite.")
+                _warn("Intermediate Constant Z must be finite.")
                 return None
             bounds = self._all_surface_bounds()
             if bounds is None:
-                messagebox.showwarning(
-                    "KOF Viewer",
-                    "No surface bounds available to build Constant Z layer.",
-                )
+                _warn("No surface bounds available to build Constant Z layer.")
                 return None
             return ConstantElevationSurface(name=f"Constant Z {z_val:.3f} m", z_value=z_val, bounds=bounds)
-        messagebox.showwarning("KOF Viewer", f"Unknown intermediate layer type: {key}")
+        _warn(f"Unknown intermediate layer type: {key}")
         return None
+
+    def _section_intermediate_surface(self) -> Optional[SurfaceLike]:
+        """Return currently selected intermediate surface for section/profile visualization."""
+        if self.volume_method.get().strip().lower() == "triangles":
+            return None
+        if self._current_intermediate_type_key() == "none":
+            return None
+        return self._resolve_intermediate_surface_with_feedback(show_warnings=False)
 
     def _section_reference_raster(self) -> Optional[ElevationRasterSurface]:
         if self._elevation_raster_index is None:
@@ -1896,6 +2170,7 @@ class KOFViewer(tk.Tk):
         self._end_section_mode()
         self._redraw_2d()  # draw the persisted section (and clear preview)
         if top is not None and bot is not None:
+            section_intermediate = self._section_intermediate_surface()
             area_top_surface, area_bottom_surface, area_top_name, area_bottom_name = self._section_area_pair(top, bot)
             SectionWindow(
                 self,
@@ -1904,6 +2179,7 @@ class KOFViewer(tk.Tk):
                 (y0, x0),
                 (y1, x1),
                 raster_surface=self._section_reference_raster(),
+                intermediate_surface=section_intermediate,
                 area_top_surface=area_top_surface,
                 area_bottom_surface=area_bottom_surface,
                 area_top_name=area_top_name,
@@ -2330,6 +2606,7 @@ class SectionWindow(tk.Toplevel):
         p0: tuple[float, float],
         p1: tuple[float, float],
         raster_surface: Optional[ElevationRasterSurface] = None,
+        intermediate_surface: Optional[Any] = None,
         area_top_surface: Optional[Any] = None,
         area_bottom_surface: Optional[Any] = None,
         area_top_name: Optional[str] = None,
@@ -2340,8 +2617,9 @@ class SectionWindow(tk.Toplevel):
         super().__init__(master)
         title_label = f" ({label}–{label}')" if label else ""
         raster_title = " + raster" if raster_surface is not None else ""
+        intermediate_title = " + intermediate" if intermediate_surface is not None else ""
         self.title(
-            f"Section{title_label}: {top.name} (top) vs {bottom.name} (bottom){raster_title}"
+            f"Section{title_label}: {top.name} (top) vs {bottom.name} (bottom){raster_title}{intermediate_title}"
         )
         self.geometry("900x520")
 
@@ -2360,6 +2638,11 @@ class SectionWindow(tk.Toplevel):
         z_top = top.interpolate(ys, xs)
         z_bot = bottom.interpolate(ys, xs)
         z_raster = raster_surface.interpolate(ys, xs) if raster_surface is not None else None
+        z_intermediate = (
+            intermediate_surface.interpolate(ys, xs)
+            if intermediate_surface is not None
+            else None
+        )
         z_area_top = area_top_surface.interpolate(ys, xs) if area_top_surface is not None else z_top
         z_area_bottom = area_bottom_surface.interpolate(ys, xs) if area_bottom_surface is not None else z_bot
         area_top_label = area_top_name or top.name
@@ -2399,20 +2682,56 @@ class SectionWindow(tk.Toplevel):
                 linestyle="--",
                 label=f"Raster: {raster_surface.name}",
             )
+        if z_intermediate is not None and np.any(np.isfinite(z_intermediate)):
+            intermediate_name = getattr(intermediate_surface, "name", "Intermediate")
+            ax.plot(
+                dists,
+                z_intermediate,
+                color="#ff7f0e",
+                linewidth=1.4,
+                linestyle=":",
+                label=f"Intermediate: {intermediate_name}",
+            )
 
-        # Shade the area between surfaces where both are defined.
-        both = np.isfinite(z_area_top) & np.isfinite(z_area_bottom)
-        if both.any():
-            cut_mask = both & (z_area_top >= z_area_bottom)
-            fill_mask = both & (z_area_top < z_area_bottom)
-            if cut_mask.any():
-                ax.fill_between(dists, z_area_bottom, z_area_top, where=cut_mask,
-                                color="#1f77b4", alpha=0.25,
-                                label=f"Cut ({area_top_label} ≥ {area_bottom_label})")
-            if fill_mask.any():
-                ax.fill_between(dists, z_area_bottom, z_area_top, where=fill_mask,
-                                color="#d62728", alpha=0.25,
-                                label=f"Fill ({area_top_label} < {area_bottom_label})")
+        # Shade split legs in different colors when intermediate is shown.
+        if z_intermediate is not None and np.any(np.isfinite(z_intermediate)):
+            both_upper = np.isfinite(z_top) & np.isfinite(z_intermediate)
+            both_lower = np.isfinite(z_intermediate) & np.isfinite(z_bot)
+            intermediate_name = getattr(intermediate_surface, "name", "Intermediate")
+            if both_upper.any():
+                ax.fill_between(
+                    dists,
+                    z_intermediate,
+                    z_top,
+                    where=both_upper,
+                    color="#4c78a8",
+                    alpha=0.22,
+                    label=f"Upper leg ({top.name} - {intermediate_name})",
+                )
+            if both_lower.any():
+                ax.fill_between(
+                    dists,
+                    z_bot,
+                    z_intermediate,
+                    where=both_lower,
+                    color="#f58518",
+                    alpha=0.22,
+                    label=f"Lower leg ({intermediate_name} - {bottom.name})",
+                )
+        else:
+            # Shade the area between surfaces where both are defined.
+            both = np.isfinite(z_area_top) & np.isfinite(z_area_bottom)
+            if both.any():
+                cut_mask = both & (z_area_top >= z_area_bottom)
+                fill_mask = both & (z_area_top < z_area_bottom)
+                if cut_mask.any():
+                    ax.fill_between(dists, z_area_bottom, z_area_top, where=cut_mask,
+                                    color="#1f77b4", alpha=0.25,
+                                    label=f"Cut ({area_top_label} ≥ {area_bottom_label})")
+                if fill_mask.any():
+                    ax.fill_between(dists, z_area_bottom, z_area_top, where=fill_mask,
+                                    color="#d62728", alpha=0.25,
+                                    label=f"Fill ({area_top_label} < {area_bottom_label})")
 
         ax.set_xlabel("Distance along section (m)")
         ax.set_ylabel("Elevation (m)")
