@@ -9,9 +9,6 @@ from typing import Any, Optional, Protocol
 import numpy as np
 from matplotlib.figure import Figure
 
-from .models import KOFFile
-
-
 FILE_COLORS = [
     "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e",
     "#8c564b", "#e377c2", "#17becf", "#bcbd22", "#7f7f7f",
@@ -92,8 +89,8 @@ def profile_segment_from_station(
 
 
 def sample_profile(
-    top: KOFFile,
-    bottom: KOFFile,
+    top: _ProfileSurfaceLike,
+    bottom: _ProfileSurfaceLike,
     p0: tuple[float, float],
     p1: tuple[float, float],
     *,
@@ -249,7 +246,7 @@ def save_profile_plot_png(path: str, sample: ProfileSample, *, top_name: str, bo
 def save_plan_view_png(
     path: str,
     *,
-    files: list[KOFFile],
+    files: list[Any],
     show_markers: bool,
     show_lines: bool,
     show_labels: bool,
@@ -279,32 +276,43 @@ def save_plan_view_png(
 
     for idx, kof in enumerate(files):
         color = FILE_COLORS[idx % len(FILE_COLORS)]
-        labeled = False
-        for block in kof.blocks:
-            if not block.points:
-                continue
-            ys = [p.y for p in block.points]
-            xs = [p.x for p in block.points]
-            label = kof.name if not labeled else None
-            labeled = True
-            if block.is_polyline and show_lines and len(block.points) >= 2:
-                ax.plot(ys, xs, "-", color=color, linewidth=1.2, label=label)
-                if show_markers:
-                    ax.plot(ys, xs, "o", color=color, markersize=3)
-            else:
-                marker = "o" if show_markers else "."
-                ax.plot(ys, xs, marker, color=color, markersize=4, linestyle="None", label=label)
+        if hasattr(kof, "blocks"):
+            labeled = False
+            for block in kof.blocks:
+                if not block.points:
+                    continue
+                ys = [p.y for p in block.points]
+                xs = [p.x for p in block.points]
+                label = kof.name if not labeled else None
+                labeled = True
+                if block.is_polyline and show_lines and len(block.points) >= 2:
+                    ax.plot(ys, xs, "-", color=color, linewidth=1.2, label=label)
+                    if show_markers:
+                        ax.plot(ys, xs, "o", color=color, markersize=3)
+                else:
+                    marker = "o" if show_markers else "."
+                    ax.plot(ys, xs, marker, color=color, markersize=4, linestyle="None", label=label)
 
-            if show_labels:
-                for p in block.points:
-                    ax.annotate(
-                        p.pkt,
-                        (p.y, p.x),
-                        fontsize=7,
-                        xytext=(3, 3),
-                        textcoords="offset points",
-                        color=color,
-                    )
+                if show_labels:
+                    for p in block.points:
+                        ax.annotate(
+                            p.pkt,
+                            (p.y, p.x),
+                            fontsize=7,
+                            xytext=(3, 3),
+                            textcoords="offset points",
+                            color=color,
+                        )
+        elif hasattr(kof, "ensure_triangulation") and kof.ensure_triangulation() and getattr(kof, "_xy", None) is not None:
+            ax.plot(
+                kof._xy[:, 0],
+                kof._xy[:, 1],
+                "o" if show_markers else ".",
+                color=color,
+                markersize=2,
+                linestyle="None",
+                label=kof.name,
+            )
 
         if show_triangulation and kof.ensure_triangulation():
             kept = kof.kept_simplices
