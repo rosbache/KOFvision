@@ -28,6 +28,8 @@ class ProfileSample:
     z_bottom: np.ndarray
     z_reference: Optional[np.ndarray]
     reference_name: Optional[str]
+    z_secondary_reference: Optional[np.ndarray]
+    secondary_reference_name: Optional[str]
     z_area_top: np.ndarray
     z_area_bottom: np.ndarray
     area_top_name: str
@@ -100,6 +102,8 @@ def sample_profile(
     n_samples: int = 200,
     reference_surface: Optional[_ProfileSurfaceLike] = None,
     reference_name: Optional[str] = None,
+    secondary_reference_surface: Optional[_ProfileSurfaceLike] = None,
+    secondary_reference_name: Optional[str] = None,
     area_top_surface: Optional[_ProfileSurfaceLike] = None,
     area_bottom_surface: Optional[_ProfileSurfaceLike] = None,
     area_top_name: Optional[str] = None,
@@ -121,6 +125,9 @@ def sample_profile(
     z_ref = None
     if reference_surface is not None:
         z_ref = reference_surface.interpolate(ys, xs)
+    z_secondary_ref = None
+    if secondary_reference_surface is not None:
+        z_secondary_ref = secondary_reference_surface.interpolate(ys, xs)
 
     z_area_top = area_top_surface.interpolate(ys, xs) if area_top_surface is not None else z_top
     z_area_bottom = area_bottom_surface.interpolate(ys, xs) if area_bottom_surface is not None else z_bot
@@ -155,6 +162,8 @@ def sample_profile(
         z_bottom=z_bot,
         z_reference=z_ref,
         reference_name=reference_name,
+        z_secondary_reference=z_secondary_ref,
+        secondary_reference_name=secondary_reference_name,
         z_area_top=z_area_top,
         z_area_bottom=z_area_bottom,
         area_top_name=area_top_label,
@@ -187,29 +196,64 @@ def save_profile_plot_png(path: str, sample: ProfileSample, *, top_name: str, bo
             linestyle="--",
             label=f"Raster: {ref_name}",
         )
+    if sample.z_secondary_reference is not None and np.any(np.isfinite(sample.z_secondary_reference)):
+        secondary_name = sample.secondary_reference_name or "Intermediate"
+        ax.plot(
+            sample.dists_m,
+            sample.z_secondary_reference,
+            color="#ff7f0e",
+            linewidth=1.4,
+            linestyle=":",
+            label=f"Intermediate: {secondary_name}",
+        )
 
-    both = np.isfinite(sample.z_area_top) & np.isfinite(sample.z_area_bottom)
-    if both.any():
-        cut_mask = both & (sample.z_area_top >= sample.z_area_bottom)
-        fill_mask = both & (sample.z_area_top < sample.z_area_bottom)
-        if cut_mask.any():
+    if sample.z_secondary_reference is not None:
+        both_upper = np.isfinite(sample.z_top) & np.isfinite(sample.z_secondary_reference)
+        both_lower = np.isfinite(sample.z_secondary_reference) & np.isfinite(sample.z_bottom)
+        secondary_name = sample.secondary_reference_name or "Intermediate"
+        if both_upper.any():
             ax.fill_between(
                 sample.dists_m,
-                sample.z_area_bottom,
-                sample.z_area_top,
-                where=cut_mask,
-                color="#1f77b4",
-                alpha=0.22,
+                sample.z_secondary_reference,
+                sample.z_top,
+                where=both_upper,
+                color="#4c78a8",
+                alpha=0.20,
+                label=f"Upper leg ({top_name} - {secondary_name})",
             )
-        if fill_mask.any():
+        if both_lower.any():
             ax.fill_between(
                 sample.dists_m,
-                sample.z_area_bottom,
-                sample.z_area_top,
-                where=fill_mask,
-                color="#d62728",
-                alpha=0.22,
+                sample.z_bottom,
+                sample.z_secondary_reference,
+                where=both_lower,
+                color="#f58518",
+                alpha=0.20,
+                label=f"Lower leg ({secondary_name} - {bottom_name})",
             )
+    else:
+        both = np.isfinite(sample.z_area_top) & np.isfinite(sample.z_area_bottom)
+        if both.any():
+            cut_mask = both & (sample.z_area_top >= sample.z_area_bottom)
+            fill_mask = both & (sample.z_area_top < sample.z_area_bottom)
+            if cut_mask.any():
+                ax.fill_between(
+                    sample.dists_m,
+                    sample.z_area_bottom,
+                    sample.z_area_top,
+                    where=cut_mask,
+                    color="#1f77b4",
+                    alpha=0.22,
+                )
+            if fill_mask.any():
+                ax.fill_between(
+                    sample.dists_m,
+                    sample.z_area_bottom,
+                    sample.z_area_top,
+                    where=fill_mask,
+                    color="#d62728",
+                    alpha=0.22,
+                )
 
     # Show the profile center line (midpoint between start/end section endpoints).
     center_dist = sample.length_m * 0.5
