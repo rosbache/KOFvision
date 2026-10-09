@@ -2,6 +2,7 @@
 numpy
 matplotlib
 scipy
+lxml
 
 # Dependencies for kof_reader.py (GeoPackage/GeoDataFrame export)
 geopandas
