@@ -40,6 +40,8 @@ The main app is implemented in `kof_viewer.py`.
 - Load multiple raster layers, reorder them (up/down), toggle visibility, and set per-layer alpha
 - Set an active single-band elevation raster used for raster-based volume modes and section reference profile
 - Optionally clip raster loading to current KOF bounds with user-defined buffer
+- Modern hybrid UI: slim top command bar + collapsible right-side analysis panels
+- Scrollable right-side panel column for smaller screen heights
 - Draw one or more section lines in 2D and open section windows with:
 	- top and bottom profiles
 	- optional raster reference profile (when raster volume mode is active)
@@ -73,6 +75,14 @@ Optional (required only for GeoPackage export from the viewer):
 pip install geopandas shapely
 ```
 
+Optional (for enhanced button styling in the top command bar):
+
+```bash
+pip install customtkinter
+```
+
+If CustomTkinter is not installed, KOFvision automatically falls back to standard ttk widgets.
+
 Development/testing dependencies:
 
 ```bash
@@ -92,6 +102,43 @@ Or preload one or more KOF files:
 ```bash
 python kof_viewer.py "12_A (1).kof" "12_A(1) (1).kof"
 ```
+
+## UI Layout (Current)
+
+KOFvision now uses a hybrid layout aimed at faster access to common actions and cleaner advanced settings:
+
+- Top command bar:
+	- Open
+	- Export GPKG
+	- Clear
+	- Zoom to selected
+	- Reset view
+	- Compute volume
+	- Draw section
+	- Draw mask
+- Left panel:
+	- Layer visibility (KOF, LandXML, and raster layers)
+- Center:
+	- 2D and 3D tabs
+- Right panel (scrollable):
+	- Display
+	- Raster
+	- Volume setup
+	- Sections and mask
+	- LandXML schema
+
+The right panel supports collapse/expand per section and vertical scrolling for smaller screens.
+
+## Keyboard Shortcuts
+
+- Ctrl+O: Open files
+- Ctrl+E: Export GPKG
+- Ctrl+Shift+K: Clear loaded data
+- Ctrl+Shift+Z: Zoom to selected visible layers
+- Ctrl+Shift+R: Reset 2D view
+- Ctrl+Shift+V: Compute volume
+- Ctrl+Shift+S: Toggle Draw section mode
+- Ctrl+Shift+M: Toggle Draw mask mode
 
 ## Tests
 
@@ -117,16 +164,17 @@ For full packaging and distribution details, see `docs/pyinstaller-windows.md`.
 ## Workflow
 
 1. Open two surface files (for example existing top and design/bottom).
-2. Select Top and Bottom in the second toolbar row.
+2. In the right-side Volume setup panel, select Top and Bottom.
 3. Choose volume Method (`raster` or `triangles`).
 4. Optionally choose Intermediate (`None`, `KOF layer`, `Raster layer`, or `Constant Z`).
-5. If intermediate is set, volume is reported as two legs:
+5. If Intermediate is `Constant Z`, type Z directly and optionally use +/- with configurable step.
+6. If intermediate is set, volume is reported as two legs:
 	- Top - Intermediate
 	- Intermediate - Bottom
-6. Optionally enable Triangulation.
-7. Click Compute volume.
-8. Read net/cut/fill (or split results) in the toolbar summary.
-9. Click Draw section and pick two points in 2D to open a section profile window.
+7. Optionally enable Triangulation.
+8. Click Compute volume (top bar or in Volume setup panel).
+9. Read net/cut/fill (or split results) in the Volume setup panel summary.
+10. Click Draw section and pick two points in 2D to open a section profile window.
 
 ## Volume Calculation Methods
 
@@ -218,7 +266,7 @@ Changing boundary tightness marks previous volume results as stale; recompute vo
 
 ## Section Report Export
 
-Use Export section report... in the second toolbar row.
+Use Export section report... in the right-side Sections and mask panel.
 
 Current behavior:
 
@@ -236,17 +284,36 @@ Current behavior:
 
 The HTML report includes plan view, profile summary table, and all profile images with profile IDs and station distances.
 
+### Section Plot Legend And Styles
+
+Lines:
+
+- Top surface: solid blue line
+- Bottom surface: solid red line
+- Raster reference (when active): dashed green line
+- Intermediate layer (when selected): dotted orange line
+
+Shading:
+
+- Without intermediate: cut/fill area between top and bottom is shaded by sign.
+- With intermediate selected: section is split into two colored legs:
+	- Upper leg (Top - Intermediate): blue-toned fill
+	- Lower leg (Intermediate - Bottom): orange-toned fill
+
+This legend applies to both interactive section windows and exported section report profile images.
+
 ### View Controls
 
 - Zoom to selected layers: fit the 2D view to visible layers.
 - Reset view: clear manual zoom and return to auto extents.
+- Both controls are available on the top command bar.
 
 ## Raster Background (Orthophoto)
 
 The 2D tab can display a raster image as background (for example orthophoto)
 behind KOF points and polylines.
 
-Use the top toolbar:
+Use the right-side Raster panel:
 
 - Open raster...: load raster image (`.jpg`, `.jpeg`, `.png`, `.tif`, `.tiff`, `.bmp`)
 - Set elevation raster: mark one loaded single-band DEM raster for raster-based volume modes
