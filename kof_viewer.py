@@ -1105,7 +1105,20 @@ class KOFViewer(tk.Tk):
         if not out_path:
             return
 
-        fieldnames = ["mask_name", "area_m2", "net_m3", "cut_m3", "fill_m3", "status"]
+        fieldnames = [
+            "mask_name",
+            "area_m2",
+            "net_m3",
+            "cut_m3",
+            "fill_m3",
+            "top_to_intermediate_m3",
+            "top_to_intermediate_cut_m3",
+            "top_to_intermediate_fill_m3",
+            "intermediate_to_bottom_m3",
+            "intermediate_to_bottom_cut_m3",
+            "intermediate_to_bottom_fill_m3",
+            "status",
+        ]
         try:
             with open(out_path, "w", newline="", encoding="utf-8") as fh:
                 writer = csv.DictWriter(fh, fieldnames=fieldnames)
@@ -1118,6 +1131,12 @@ class KOFViewer(tk.Tk):
                             "net_m3": row.get("net_m3", ""),
                             "cut_m3": row.get("cut_m3", ""),
                             "fill_m3": row.get("fill_m3", ""),
+                            "top_to_intermediate_m3": row.get("top_to_intermediate_m3", ""),
+                            "top_to_intermediate_cut_m3": row.get("top_to_intermediate_cut_m3", ""),
+                            "top_to_intermediate_fill_m3": row.get("top_to_intermediate_fill_m3", ""),
+                            "intermediate_to_bottom_m3": row.get("intermediate_to_bottom_m3", ""),
+                            "intermediate_to_bottom_cut_m3": row.get("intermediate_to_bottom_cut_m3", ""),
+                            "intermediate_to_bottom_fill_m3": row.get("intermediate_to_bottom_fill_m3", ""),
                             "status": row.get("status", ""),
                         }
                     )
@@ -1690,6 +1709,34 @@ class KOFViewer(tk.Tk):
         return float(np.trapezoid(a_valid[order], s_valid[order]))
 
     @staticmethod
+    def _cumulative_profile_volumes(stations_m: list[float], areas_m2: list[float]) -> list[float]:
+        n = min(len(stations_m), len(areas_m2))
+        if n == 0:
+            return []
+
+        s = np.asarray(stations_m[:n], dtype=float)
+        a = np.asarray(areas_m2[:n], dtype=float)
+        order = np.argsort(s)
+        s_sorted = s[order]
+        a_sorted = a[order]
+
+        cumulative_sorted = np.full(n, np.nan, dtype=float)
+        cumulative_sorted[0] = 0.0
+        for i in range(1, n):
+            s0 = s_sorted[i - 1]
+            s1 = s_sorted[i]
+            a0 = a_sorted[i - 1]
+            a1 = a_sorted[i]
+            prev = cumulative_sorted[i - 1]
+            if np.isfinite(prev) and np.isfinite(s0) and np.isfinite(s1) and np.isfinite(a0) and np.isfinite(a1):
+                dv = 0.5 * (a0 + a1) * (s1 - s0)
+                cumulative_sorted[i] = prev + dv
+
+        cumulative = np.full(n, np.nan, dtype=float)
+        cumulative[order] = cumulative_sorted
+        return [float(v) for v in cumulative]
+
+    @staticmethod
     def _open_path_in_browser(path: str) -> bool:
         try:
             return bool(webbrowser.open_new_tab(Path(path).resolve().as_uri()))
@@ -1813,7 +1860,11 @@ class KOFViewer(tk.Tk):
                     "area_cut_m2": sample.area_cut_m2,
                     "area_fill_m2": sample.area_fill_m2,
                     "area_upper_leg_m2": sample.area_upper_leg_m2,
+                    "area_upper_leg_cut_m2": sample.area_upper_leg_cut_m2,
+                    "area_upper_leg_fill_m2": sample.area_upper_leg_fill_m2,
                     "area_lower_leg_m2": sample.area_lower_leg_m2,
+                    "area_lower_leg_cut_m2": sample.area_lower_leg_cut_m2,
+                    "area_lower_leg_fill_m2": sample.area_lower_leg_fill_m2,
                     "image_rel": image_rel.replace("\\", "/"),
                 }
             )
@@ -1829,8 +1880,16 @@ class KOFViewer(tk.Tk):
 
         upper_leg_values = [r.get("area_upper_leg_m2") for r in profile_rows]
         lower_leg_values = [r.get("area_lower_leg_m2") for r in profile_rows]
+        upper_leg_cut_values = [r.get("area_upper_leg_cut_m2") for r in profile_rows]
+        upper_leg_fill_values = [r.get("area_upper_leg_fill_m2") for r in profile_rows]
+        lower_leg_cut_values = [r.get("area_lower_leg_cut_m2") for r in profile_rows]
+        lower_leg_fill_values = [r.get("area_lower_leg_fill_m2") for r in profile_rows]
         upper_leg_volume_m3 = float("nan")
         lower_leg_volume_m3 = float("nan")
+        upper_leg_cut_volume_m3 = float("nan")
+        upper_leg_fill_volume_m3 = float("nan")
+        lower_leg_cut_volume_m3 = float("nan")
+        lower_leg_fill_volume_m3 = float("nan")
         if any(v not in (None, "") for v in upper_leg_values):
             upper_leg_volume_m3 = self._integrate_profile_areas_to_volume(
                 stations_list,
@@ -1841,6 +1900,54 @@ class KOFViewer(tk.Tk):
                 stations_list,
                 [float(v) if v not in (None, "") else float("nan") for v in lower_leg_values],
             )
+        if any(v not in (None, "") for v in upper_leg_cut_values):
+            upper_leg_cut_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in upper_leg_cut_values],
+            )
+        if any(v not in (None, "") for v in upper_leg_fill_values):
+            upper_leg_fill_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in upper_leg_fill_values],
+            )
+        if any(v not in (None, "") for v in lower_leg_cut_values):
+            lower_leg_cut_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in lower_leg_cut_values],
+            )
+        if any(v not in (None, "") for v in lower_leg_fill_values):
+            lower_leg_fill_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in lower_leg_fill_values],
+            )
+
+        upper_leg_area_list = [float(v) if v not in (None, "") else float("nan") for v in upper_leg_values]
+        lower_leg_area_list = [float(v) if v not in (None, "") else float("nan") for v in lower_leg_values]
+        upper_leg_cut_area_list = [float(v) if v not in (None, "") else float("nan") for v in upper_leg_cut_values]
+        upper_leg_fill_area_list = [float(v) if v not in (None, "") else float("nan") for v in upper_leg_fill_values]
+        lower_leg_cut_area_list = [float(v) if v not in (None, "") else float("nan") for v in lower_leg_cut_values]
+        lower_leg_fill_area_list = [float(v) if v not in (None, "") else float("nan") for v in lower_leg_fill_values]
+
+        cumulative_net_m3 = self._cumulative_profile_volumes(stations_list, area_net_list)
+        cumulative_cut_m3 = self._cumulative_profile_volumes(stations_list, area_cut_list)
+        cumulative_fill_m3 = self._cumulative_profile_volumes(stations_list, area_fill_list)
+        cumulative_upper_leg_m3 = self._cumulative_profile_volumes(stations_list, upper_leg_area_list)
+        cumulative_lower_leg_m3 = self._cumulative_profile_volumes(stations_list, lower_leg_area_list)
+        cumulative_upper_leg_cut_m3 = self._cumulative_profile_volumes(stations_list, upper_leg_cut_area_list)
+        cumulative_upper_leg_fill_m3 = self._cumulative_profile_volumes(stations_list, upper_leg_fill_area_list)
+        cumulative_lower_leg_cut_m3 = self._cumulative_profile_volumes(stations_list, lower_leg_cut_area_list)
+        cumulative_lower_leg_fill_m3 = self._cumulative_profile_volumes(stations_list, lower_leg_fill_area_list)
+
+        for i, row in enumerate(profile_rows):
+            row["volume_net_m3"] = cumulative_net_m3[i] if i < len(cumulative_net_m3) else float("nan")
+            row["volume_cut_m3"] = cumulative_cut_m3[i] if i < len(cumulative_cut_m3) else float("nan")
+            row["volume_fill_m3"] = cumulative_fill_m3[i] if i < len(cumulative_fill_m3) else float("nan")
+            row["volume_upper_leg_m3"] = cumulative_upper_leg_m3[i] if i < len(cumulative_upper_leg_m3) else float("nan")
+            row["volume_upper_leg_cut_m3"] = cumulative_upper_leg_cut_m3[i] if i < len(cumulative_upper_leg_cut_m3) else float("nan")
+            row["volume_upper_leg_fill_m3"] = cumulative_upper_leg_fill_m3[i] if i < len(cumulative_upper_leg_fill_m3) else float("nan")
+            row["volume_lower_leg_m3"] = cumulative_lower_leg_m3[i] if i < len(cumulative_lower_leg_m3) else float("nan")
+            row["volume_lower_leg_cut_m3"] = cumulative_lower_leg_cut_m3[i] if i < len(cumulative_lower_leg_cut_m3) else float("nan")
+            row["volume_lower_leg_fill_m3"] = cumulative_lower_leg_fill_m3[i] if i < len(cumulative_lower_leg_fill_m3) else float("nan")
 
         plan_image_rel = "plan_view.png"
         plan_image_path = os.path.join(run_dir, plan_image_rel)
@@ -1882,9 +1989,17 @@ class KOFViewer(tk.Tk):
         if np.isfinite(upper_leg_volume_m3):
             upper_name = section_intermediate.name if section_intermediate is not None else "Intermediate"
             metadata[f"Volume {top.name} - {upper_name} (m3)"] = f"{upper_leg_volume_m3:+,.2f}"
+            if np.isfinite(upper_leg_cut_volume_m3):
+                metadata[f"Volume {top.name} - {upper_name} cut (m3)"] = f"{upper_leg_cut_volume_m3:,.2f}"
+            if np.isfinite(upper_leg_fill_volume_m3):
+                metadata[f"Volume {top.name} - {upper_name} fill (m3)"] = f"{upper_leg_fill_volume_m3:,.2f}"
         if np.isfinite(lower_leg_volume_m3):
             lower_name = section_intermediate.name if section_intermediate is not None else "Intermediate"
             metadata[f"Volume {lower_name} - {bot.name} (m3)"] = f"{lower_leg_volume_m3:+,.2f}"
+            if np.isfinite(lower_leg_cut_volume_m3):
+                metadata[f"Volume {lower_name} - {bot.name} cut (m3)"] = f"{lower_leg_cut_volume_m3:,.2f}"
+            if np.isfinite(lower_leg_fill_volume_m3):
+                metadata[f"Volume {lower_name} - {bot.name} fill (m3)"] = f"{lower_leg_fill_volume_m3:,.2f}"
 
         write_html_report(
             report_path,
@@ -3008,6 +3123,12 @@ class KOFViewer(tk.Tk):
                                 "net_m3": "",
                                 "cut_m3": "",
                                 "fill_m3": "",
+                                "top_to_intermediate_m3": "",
+                                "top_to_intermediate_cut_m3": "",
+                                "top_to_intermediate_fill_m3": "",
+                                "intermediate_to_bottom_m3": "",
+                                "intermediate_to_bottom_cut_m3": "",
+                                "intermediate_to_bottom_fill_m3": "",
                                 "status": "no overlap",
                             }
                         )
@@ -3017,9 +3138,17 @@ class KOFViewer(tk.Tk):
                         net_m3 = float(mask_result.net)
                         cut_m3 = float(mask_result.cut)
                         fill_m3 = float(mask_result.fill)
+                        upper_net_m3 = float(mask_result.upper.net)
+                        upper_cut_m3 = float(mask_result.upper.cut)
+                        upper_fill_m3 = float(mask_result.upper.fill)
+                        lower_net_m3 = float(mask_result.lower.net)
+                        lower_cut_m3 = float(mask_result.lower.cut)
+                        lower_fill_m3 = float(mask_result.lower.fill)
                         per_mask_rows.append(
                             f"- {mask.name}: area {area_m2:,.1f} m2 | "
-                            f"net {net_m3:+,.2f} m3"
+                            f"net {net_m3:+,.2f} m3 | "
+                            f"top-intermediate {upper_net_m3:+,.2f} | "
+                            f"intermediate-bottom {lower_net_m3:+,.2f}"
                         )
                         per_mask_result_rows.append(
                             {
@@ -3028,6 +3157,12 @@ class KOFViewer(tk.Tk):
                                 "net_m3": f"{net_m3:.6f}",
                                 "cut_m3": f"{cut_m3:.6f}",
                                 "fill_m3": f"{fill_m3:.6f}",
+                                "top_to_intermediate_m3": f"{upper_net_m3:.6f}",
+                                "top_to_intermediate_cut_m3": f"{upper_cut_m3:.6f}",
+                                "top_to_intermediate_fill_m3": f"{upper_fill_m3:.6f}",
+                                "intermediate_to_bottom_m3": f"{lower_net_m3:.6f}",
+                                "intermediate_to_bottom_cut_m3": f"{lower_cut_m3:.6f}",
+                                "intermediate_to_bottom_fill_m3": f"{lower_fill_m3:.6f}",
                                 "status": "ok",
                             }
                         )
@@ -3047,6 +3182,12 @@ class KOFViewer(tk.Tk):
                                 "net_m3": f"{net_m3:.6f}",
                                 "cut_m3": f"{cut_m3:.6f}",
                                 "fill_m3": f"{fill_m3:.6f}",
+                                "top_to_intermediate_m3": "",
+                                "top_to_intermediate_cut_m3": "",
+                                "top_to_intermediate_fill_m3": "",
+                                "intermediate_to_bottom_m3": "",
+                                "intermediate_to_bottom_cut_m3": "",
+                                "intermediate_to_bottom_fill_m3": "",
                                 "status": "ok",
                             }
                         )
@@ -3071,6 +3212,12 @@ class KOFViewer(tk.Tk):
                         "net_m3": f"{float(result.net):.6f}",
                         "cut_m3": f"{float(result.cut):.6f}",
                         "fill_m3": f"{float(result.fill):.6f}",
+                        "top_to_intermediate_m3": f"{float(result.upper.net):.6f}",
+                        "top_to_intermediate_cut_m3": f"{float(result.upper.cut):.6f}",
+                        "top_to_intermediate_fill_m3": f"{float(result.upper.fill):.6f}",
+                        "intermediate_to_bottom_m3": f"{float(result.lower.net):.6f}",
+                        "intermediate_to_bottom_cut_m3": f"{float(result.lower.cut):.6f}",
+                        "intermediate_to_bottom_fill_m3": f"{float(result.lower.fill):.6f}",
                         "status": "overall",
                     }
                 )
@@ -3082,6 +3229,12 @@ class KOFViewer(tk.Tk):
                         "net_m3": f"{float(result.net):.6f}",
                         "cut_m3": f"{float(result.cut):.6f}",
                         "fill_m3": f"{float(result.fill):.6f}",
+                        "top_to_intermediate_m3": "",
+                        "top_to_intermediate_cut_m3": "",
+                        "top_to_intermediate_fill_m3": "",
+                        "intermediate_to_bottom_m3": "",
+                        "intermediate_to_bottom_cut_m3": "",
+                        "intermediate_to_bottom_fill_m3": "",
                         "status": "overall",
                     }
                 )
@@ -4443,18 +4596,37 @@ class MaskVolumeResultsWindow(tk.Toplevel):
     def __init__(self, master: tk.Misc, rows: list[dict[str, Any]]) -> None:
         super().__init__(master)
         self.title("Per-mask volume summary")
-        self.geometry("860x420")
+        self.geometry("1560x420")
 
         frame = ttk.Frame(self, padding=8)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        columns = ("mask", "area", "net", "cut", "fill", "status")
+        columns = (
+            "mask",
+            "area",
+            "net",
+            "cut",
+            "fill",
+            "top_intermediate",
+            "top_intermediate_cut",
+            "top_intermediate_fill",
+            "intermediate_bottom",
+            "intermediate_bottom_cut",
+            "intermediate_bottom_fill",
+            "status",
+        )
         tree = ttk.Treeview(frame, columns=columns, show="headings", height=14)
         tree.heading("mask", text="Mask")
         tree.heading("area", text="Area (m2)")
         tree.heading("net", text="Net (m3)")
         tree.heading("cut", text="Cut (m3)")
         tree.heading("fill", text="Fill (m3)")
+        tree.heading("top_intermediate", text="Top-Intermediate (m3)")
+        tree.heading("top_intermediate_cut", text="Top-Intermediate Cut (m3)")
+        tree.heading("top_intermediate_fill", text="Top-Intermediate Fill (m3)")
+        tree.heading("intermediate_bottom", text="Intermediate-Bottom (m3)")
+        tree.heading("intermediate_bottom_cut", text="Intermediate-Bottom Cut (m3)")
+        tree.heading("intermediate_bottom_fill", text="Intermediate-Bottom Fill (m3)")
         tree.heading("status", text="Status")
 
         tree.column("mask", width=220, anchor=tk.W)
@@ -4462,6 +4634,12 @@ class MaskVolumeResultsWindow(tk.Toplevel):
         tree.column("net", width=110, anchor=tk.E)
         tree.column("cut", width=110, anchor=tk.E)
         tree.column("fill", width=110, anchor=tk.E)
+        tree.column("top_intermediate", width=160, anchor=tk.E)
+        tree.column("top_intermediate_cut", width=180, anchor=tk.E)
+        tree.column("top_intermediate_fill", width=180, anchor=tk.E)
+        tree.column("intermediate_bottom", width=180, anchor=tk.E)
+        tree.column("intermediate_bottom_cut", width=200, anchor=tk.E)
+        tree.column("intermediate_bottom_fill", width=200, anchor=tk.E)
         tree.column("status", width=120, anchor=tk.W)
 
         y_scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
@@ -4475,6 +4653,12 @@ class MaskVolumeResultsWindow(tk.Toplevel):
             "net_m3": 0.0,
             "cut_m3": 0.0,
             "fill_m3": 0.0,
+            "top_to_intermediate_m3": 0.0,
+            "top_to_intermediate_cut_m3": 0.0,
+            "top_to_intermediate_fill_m3": 0.0,
+            "intermediate_to_bottom_m3": 0.0,
+            "intermediate_to_bottom_cut_m3": 0.0,
+            "intermediate_to_bottom_fill_m3": 0.0,
         }
         has_numeric_values = False
 
@@ -4487,11 +4671,23 @@ class MaskVolumeResultsWindow(tk.Toplevel):
             net_raw = row.get("net_m3", "")
             cut_raw = row.get("cut_m3", "")
             fill_raw = row.get("fill_m3", "")
+            upper_raw = row.get("top_to_intermediate_m3", "")
+            upper_cut_raw = row.get("top_to_intermediate_cut_m3", "")
+            upper_fill_raw = row.get("top_to_intermediate_fill_m3", "")
+            lower_raw = row.get("intermediate_to_bottom_m3", "")
+            lower_cut_raw = row.get("intermediate_to_bottom_cut_m3", "")
+            lower_fill_raw = row.get("intermediate_to_bottom_fill_m3", "")
 
             area_val = self._as_float(area_raw)
             net_val = self._as_float(net_raw)
             cut_val = self._as_float(cut_raw)
             fill_val = self._as_float(fill_raw)
+            upper_val = self._as_float(upper_raw)
+            upper_cut_val = self._as_float(upper_cut_raw)
+            upper_fill_val = self._as_float(upper_fill_raw)
+            lower_val = self._as_float(lower_raw)
+            lower_cut_val = self._as_float(lower_cut_raw)
+            lower_fill_val = self._as_float(lower_fill_raw)
 
             if area_val is not None:
                 totals["area_m2"] += area_val
@@ -4505,6 +4701,24 @@ class MaskVolumeResultsWindow(tk.Toplevel):
             if fill_val is not None:
                 totals["fill_m3"] += fill_val
                 has_numeric_values = True
+            if upper_val is not None:
+                totals["top_to_intermediate_m3"] += upper_val
+                has_numeric_values = True
+            if upper_cut_val is not None:
+                totals["top_to_intermediate_cut_m3"] += upper_cut_val
+                has_numeric_values = True
+            if upper_fill_val is not None:
+                totals["top_to_intermediate_fill_m3"] += upper_fill_val
+                has_numeric_values = True
+            if lower_val is not None:
+                totals["intermediate_to_bottom_m3"] += lower_val
+                has_numeric_values = True
+            if lower_cut_val is not None:
+                totals["intermediate_to_bottom_cut_m3"] += lower_cut_val
+                has_numeric_values = True
+            if lower_fill_val is not None:
+                totals["intermediate_to_bottom_fill_m3"] += lower_fill_val
+                has_numeric_values = True
 
             tree.insert(
                 "",
@@ -4515,6 +4729,12 @@ class MaskVolumeResultsWindow(tk.Toplevel):
                     self._fmt_num(net_raw, signed=True),
                     self._fmt_num(cut_raw),
                     self._fmt_num(fill_raw),
+                    self._fmt_num(upper_raw, signed=True),
+                    self._fmt_num(upper_cut_raw),
+                    self._fmt_num(upper_fill_raw),
+                    self._fmt_num(lower_raw, signed=True),
+                    self._fmt_num(lower_cut_raw),
+                    self._fmt_num(lower_fill_raw),
                     row.get("status", ""),
                 ),
                 tags=(tag_name,),
@@ -4533,6 +4753,12 @@ class MaskVolumeResultsWindow(tk.Toplevel):
                     self._fmt_num(totals["net_m3"], signed=True),
                     self._fmt_num(totals["cut_m3"]),
                     self._fmt_num(totals["fill_m3"]),
+                    self._fmt_num(totals["top_to_intermediate_m3"], signed=True),
+                    self._fmt_num(totals["top_to_intermediate_cut_m3"]),
+                    self._fmt_num(totals["top_to_intermediate_fill_m3"]),
+                    self._fmt_num(totals["intermediate_to_bottom_m3"], signed=True),
+                    self._fmt_num(totals["intermediate_to_bottom_cut_m3"]),
+                    self._fmt_num(totals["intermediate_to_bottom_fill_m3"]),
                     "sum",
                 ),
                 tags=("grand_total",),
