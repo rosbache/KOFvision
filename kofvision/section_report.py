@@ -37,6 +37,8 @@ class ProfileSample:
     area_net_m2: float
     area_cut_m2: float
     area_fill_m2: float
+    area_upper_leg_m2: Optional[float]
+    area_lower_leg_m2: Optional[float]
     valid_fraction: float
 
 
@@ -80,13 +82,15 @@ def profile_segment_from_station(
     cy = y0 + dy * t
     cx = x0 + dx * t
 
-    # Unit normal to baseline direction.
+    # Unit normal to baseline direction (left side when looking toward
+    # increasing station / baseline end).
     ny = -dx / length
     nx = dy / length
 
     half = section_length_m * 0.5
-    start = (cy - ny * half, cx - nx * half)
-    end = (cy + ny * half, cx + nx * half)
+    # Enforce left -> right order in the section profile.
+    start = (cy + ny * half, cx + nx * half)
+    end = (cy - ny * half, cx - nx * half)
     return start, end, (cy, cx)
 
 
@@ -150,6 +154,19 @@ def sample_profile(
         area_fill = float("nan")
         area_net = float("nan")
 
+    area_upper_leg: Optional[float] = None
+    area_lower_leg: Optional[float] = None
+    if z_secondary_ref is not None:
+        upper_diff = z_top - z_secondary_ref
+        upper_valid = np.isfinite(upper_diff)
+        if upper_valid.any():
+            area_upper_leg = float(np.trapezoid(upper_diff[upper_valid], dists[upper_valid]))
+
+        lower_diff = z_secondary_ref - z_bot
+        lower_valid = np.isfinite(lower_diff)
+        if lower_valid.any():
+            area_lower_leg = float(np.trapezoid(lower_diff[lower_valid], dists[lower_valid]))
+
     return ProfileSample(
         profile_id=profile_id,
         station_m=float(station_m),
@@ -171,6 +188,8 @@ def sample_profile(
         area_net_m2=area_net,
         area_cut_m2=area_cut,
         area_fill_m2=area_fill,
+        area_upper_leg_m2=area_upper_leg,
+        area_lower_leg_m2=area_lower_leg,
         valid_fraction=valid_fraction,
     )
 
@@ -271,7 +290,7 @@ def save_profile_plot_png(path: str, sample: ProfileSample, *, top_name: str, bo
         bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.7, "pad": 1.5},
     )
 
-    ax.set_xlabel("Distance along profile (m)")
+    ax.set_xlabel("Distance along profile (m) [Left -> Right, looking toward higher station]")
     ax.set_ylabel("Elevation (m)")
     ax.grid(True, linestyle=":", alpha=0.5)
     ax.legend(loc="best", fontsize=8)
@@ -408,7 +427,16 @@ def write_html_report(
         area_net = float(row["area_net_m2"])
         area_cut = float(row["area_cut_m2"])
         area_fill = float(row["area_fill_m2"])
+        area_upper = row.get("area_upper_leg_m2")
+        area_lower = row.get("area_lower_leg_m2")
         img_rel = html.escape(str(row["image_rel"]))
+
+        upper_text = "-"
+        if area_upper not in (None, ""):
+            upper_text = f"{float(area_upper):+,.2f}"
+        lower_text = "-"
+        if area_lower not in (None, ""):
+            lower_text = f"{float(area_lower):+,.2f}"
 
         table_rows.append(
             "<tr>"
@@ -419,6 +447,8 @@ def write_html_report(
             f"<td>{area_net:+,.2f}</td>"
             f"<td>{area_cut:,.2f}</td>"
             f"<td>{area_fill:,.2f}</td>"
+            f"<td>{upper_text}</td>"
+            f"<td>{lower_text}</td>"
             "</tr>"
         )
 
@@ -469,6 +499,8 @@ def write_html_report(
         <th>Area Net (m2)</th>
         <th>Cut (m2)</th>
         <th>Fill (m2)</th>
+                <th>Top-Intermediate (m2)</th>
+                <th>Intermediate-Bottom (m2)</th>
       </tr>
     </thead>
     <tbody>
