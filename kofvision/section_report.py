@@ -38,7 +38,11 @@ class ProfileSample:
     area_cut_m2: float
     area_fill_m2: float
     area_upper_leg_m2: Optional[float]
+    area_upper_leg_cut_m2: Optional[float]
+    area_upper_leg_fill_m2: Optional[float]
     area_lower_leg_m2: Optional[float]
+    area_lower_leg_cut_m2: Optional[float]
+    area_lower_leg_fill_m2: Optional[float]
     valid_fraction: float
 
 
@@ -155,17 +159,29 @@ def sample_profile(
         area_net = float("nan")
 
     area_upper_leg: Optional[float] = None
+    area_upper_leg_cut: Optional[float] = None
+    area_upper_leg_fill: Optional[float] = None
     area_lower_leg: Optional[float] = None
+    area_lower_leg_cut: Optional[float] = None
+    area_lower_leg_fill: Optional[float] = None
     if z_secondary_ref is not None:
         upper_diff = z_top - z_secondary_ref
         upper_valid = np.isfinite(upper_diff)
         if upper_valid.any():
-            area_upper_leg = float(np.trapezoid(upper_diff[upper_valid], dists[upper_valid]))
+            upper_d = dists[upper_valid]
+            upper_delta = upper_diff[upper_valid]
+            area_upper_leg = float(np.trapezoid(upper_delta, upper_d))
+            area_upper_leg_cut = float(np.trapezoid(np.clip(upper_delta, 0, None), upper_d))
+            area_upper_leg_fill = float(-np.trapezoid(np.clip(upper_delta, None, 0), upper_d))
 
         lower_diff = z_secondary_ref - z_bot
         lower_valid = np.isfinite(lower_diff)
         if lower_valid.any():
-            area_lower_leg = float(np.trapezoid(lower_diff[lower_valid], dists[lower_valid]))
+            lower_d = dists[lower_valid]
+            lower_delta = lower_diff[lower_valid]
+            area_lower_leg = float(np.trapezoid(lower_delta, lower_d))
+            area_lower_leg_cut = float(np.trapezoid(np.clip(lower_delta, 0, None), lower_d))
+            area_lower_leg_fill = float(-np.trapezoid(np.clip(lower_delta, None, 0), lower_d))
 
     return ProfileSample(
         profile_id=profile_id,
@@ -189,7 +205,11 @@ def sample_profile(
         area_cut_m2=area_cut,
         area_fill_m2=area_fill,
         area_upper_leg_m2=area_upper_leg,
+        area_upper_leg_cut_m2=area_upper_leg_cut,
+        area_upper_leg_fill_m2=area_upper_leg_fill,
         area_lower_leg_m2=area_lower_leg,
+        area_lower_leg_cut_m2=area_lower_leg_cut,
+        area_lower_leg_fill_m2=area_lower_leg_fill,
         valid_fraction=valid_fraction,
     )
 
@@ -412,6 +432,20 @@ def write_html_report(
     profile_rows: list[dict[str, Any]],
 ) -> None:
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _format_optional(value: Any, *, signed: bool = False) -> str:
+        if value in (None, ""):
+            return "-"
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "-"
+        if not np.isfinite(number):
+            return "-"
+        if signed:
+            return f"{number:+,.2f}"
+        return f"{number:,.2f}"
+
     meta_items = "\n".join(
         f"<li><strong>{html.escape(str(k))}</strong>: {html.escape(str(v))}</li>"
         for k, v in metadata.items()
@@ -429,14 +463,28 @@ def write_html_report(
         area_fill = float(row["area_fill_m2"])
         area_upper = row.get("area_upper_leg_m2")
         area_lower = row.get("area_lower_leg_m2")
+        volume_net = row.get("volume_net_m3")
+        volume_cut = row.get("volume_cut_m3")
+        volume_fill = row.get("volume_fill_m3")
+        volume_upper = row.get("volume_upper_leg_m3")
+        volume_upper_cut = row.get("volume_upper_leg_cut_m3")
+        volume_upper_fill = row.get("volume_upper_leg_fill_m3")
+        volume_lower = row.get("volume_lower_leg_m3")
+        volume_lower_cut = row.get("volume_lower_leg_cut_m3")
+        volume_lower_fill = row.get("volume_lower_leg_fill_m3")
         img_rel = html.escape(str(row["image_rel"]))
 
-        upper_text = "-"
-        if area_upper not in (None, ""):
-            upper_text = f"{float(area_upper):+,.2f}"
-        lower_text = "-"
-        if area_lower not in (None, ""):
-            lower_text = f"{float(area_lower):+,.2f}"
+        upper_text = _format_optional(area_upper, signed=True)
+        lower_text = _format_optional(area_lower, signed=True)
+        vol_net_text = _format_optional(volume_net, signed=True)
+        vol_cut_text = _format_optional(volume_cut)
+        vol_fill_text = _format_optional(volume_fill)
+        vol_upper_text = _format_optional(volume_upper, signed=True)
+        vol_upper_cut_text = _format_optional(volume_upper_cut)
+        vol_upper_fill_text = _format_optional(volume_upper_fill)
+        vol_lower_text = _format_optional(volume_lower, signed=True)
+        vol_lower_cut_text = _format_optional(volume_lower_cut)
+        vol_lower_fill_text = _format_optional(volume_lower_fill)
 
         table_rows.append(
             "<tr>"
@@ -449,6 +497,15 @@ def write_html_report(
             f"<td>{area_fill:,.2f}</td>"
             f"<td>{upper_text}</td>"
             f"<td>{lower_text}</td>"
+            f"<td>{vol_net_text}</td>"
+            f"<td>{vol_cut_text}</td>"
+            f"<td>{vol_fill_text}</td>"
+            f"<td>{vol_upper_text}</td>"
+            f"<td>{vol_upper_cut_text}</td>"
+            f"<td>{vol_upper_fill_text}</td>"
+            f"<td>{vol_lower_text}</td>"
+            f"<td>{vol_lower_cut_text}</td>"
+            f"<td>{vol_lower_fill_text}</td>"
             "</tr>"
         )
 
@@ -499,8 +556,17 @@ def write_html_report(
         <th>Area Net (m2)</th>
         <th>Cut (m2)</th>
         <th>Fill (m2)</th>
-                <th>Top-Intermediate (m2)</th>
-                <th>Intermediate-Bottom (m2)</th>
+        <th>Top-Intermediate (m2)</th>
+        <th>Intermediate-Bottom (m2)</th>
+        <th>Vol Net (m3)</th>
+        <th>Vol Cut (m3)</th>
+        <th>Vol Fill (m3)</th>
+        <th>Vol Top-Intermediate (m3)</th>
+                <th>Vol Top-Intermediate Cut (m3)</th>
+                <th>Vol Top-Intermediate Fill (m3)</th>
+        <th>Vol Intermediate-Bottom (m3)</th>
+                <th>Vol Intermediate-Bottom Cut (m3)</th>
+                <th>Vol Intermediate-Bottom Fill (m3)</th>
       </tr>
     </thead>
     <tbody>
