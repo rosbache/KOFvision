@@ -33,11 +33,15 @@ Usage
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
+import tempfile
 import sys
 import tkinter as tk
 import tkinter.font as tkfont
+import webbrowser
+from pathlib import Path
 from dataclasses import dataclass
 from tkinter import filedialog, messagebox, ttk
 from tkinter import simpledialog
@@ -59,7 +63,12 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 from kofvision import compute_volume, compute_volume_with_intermediate, parse_kof, parse_landxml
 from kofvision.export import export_kof_files_to_gpkg
 from kofvision.models import KOFFile, LandXMLFile, LandXMLStation, LandXMLSurface
-from kofvision.mask_io import MaskDataError, load_mask_json, save_mask_json
+from kofvision.mask_io import (
+    MaskDataError,
+    MaskDefinition,
+    load_masks_json,
+    save_masks_json,
+)
 from kofvision.section_report import (
     profile_segment_from_station,
     sample_profile,
@@ -103,6 +112,19 @@ INTERMEDIATE_TYPE_LABELS: dict[str, str] = {
     "constant": "Constant Z",
 }
 INTERMEDIATE_LABEL_TO_TYPE: dict[str, str] = {v: k for k, v in INTERMEDIATE_TYPE_LABELS.items()}
+
+MASK_SCOPE_LABELS: dict[str, str] = {
+    "selected": "Selected mask",
+    "visible_union": "Visible masks (union)",
+    "all_union": "All masks (union)",
+}
+MASK_LABEL_TO_SCOPE: dict[str, str] = {v: k for k, v in MASK_SCOPE_LABELS.items()}
+
+MEASURE_MODE_LABELS: dict[str, str] = {
+    "line": "Line distance",
+    "polygon": "Polygon area",
+}
+MEASURE_LABEL_TO_MODE: dict[str, str] = {v: k for k, v in MEASURE_MODE_LABELS.items()}
 
 
 @dataclass
@@ -169,8 +191,10 @@ class KOFViewer(tk.Tk):
         self.landxml_files: list[LandXMLFile] = []
         self.layer_vars: list[tk.BooleanVar] = []
         self._surface_owner_paths: list[Optional[str]] = []
+        self._surface_source_paths: list[Optional[str]] = []
         self._landxml_group_vars: dict[str, tk.BooleanVar] = {}
         self.last_volume: Optional[VolumeResult | SplitVolumeResult] = None
+        self._latest_section_report_path: Optional[str] = None
 
         self.show_labels = tk.BooleanVar(value=False)
         self.show_stations = tk.BooleanVar(value=True)
@@ -202,6 +226,8 @@ class KOFViewer(tk.Tk):
         self.strict_xsd_validation = tk.BooleanVar(value=False)
         self.xsd_allow_network = tk.BooleanVar(value=True)
         self.xsd_local_schema_path = tk.StringVar(value="")
+        self.mask_compute_scope = tk.StringVar(value=MASK_SCOPE_LABELS["selected"])
+        self.measure_mode = tk.StringVar(value=MEASURE_MODE_LABELS["line"])
 
         # Raster background state (2D tab only)
         self._raster_layers: list[_RasterViewLayer] = []
@@ -216,12 +242,33 @@ class KOFViewer(tk.Tk):
         self._section_cid: Optional[int] = None
         self._section_preview = None  # transient Line2D while drawing
         self._sections: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        self._section_windows: list[tk.Toplevel] = []
 
         # Polygon mask state for volume limitation in 2D.
         self._mask_mode = False
         self._mask_click_points: list[tuple[float, float]] = []
-        self._mask_polygon: list[tuple[float, float]] = []
         self._mask_cid: Optional[int] = None
+        self._masks: list[MaskDefinition] = []
+        self._mask_visibility_vars: list[tk.BooleanVar] = []
+        self._active_mask_index: Optional[int] = None
+        self.active_mask_var = tk.StringVar(value="")
+        self._mask_visibility_checks: list[tk.Widget] = []
+        self._last_volume_per_mask_rows: list[str] = []
+        self._last_mask_volume_results: list[dict[str, Any]] = []
+
+        # Mask edit state (drag vertices for selected mask).
+        self._mask_edit_mode = False
+        self._mask_edit_press_cid: Optional[int] = None
+        self._mask_edit_motion_cid: Optional[int] = None
+        self._mask_edit_release_cid: Optional[int] = None
+        self._mask_drag_vertex_index: Optional[int] = None
+        self._mask_changed_since_last_compute = False
+
+        # 2D measurement state.
+        self._measure_mode = False
+        self._measure_click_points: list[tuple[float, float]] = []
+        self._measure_cid: Optional[int] = None
+        self._measure_results: list[dict[str, Any]] = []
 
         self._configure_styles()
 
@@ -259,6 +306,7 @@ class KOFViewer(tk.Tk):
         self.bind_all("<Control-Shift-V>", lambda _e: self._invoke_shortcut(self._on_compute_volume))
         self.bind_all("<Control-Shift-S>", lambda _e: self._invoke_shortcut(self._on_toggle_section))
         self.bind_all("<Control-Shift-M>", lambda _e: self._invoke_shortcut(self._on_toggle_mask))
+        self.bind_all("<Control-Shift-D>", lambda _e: self._invoke_shortcut(self._on_toggle_measure))
 
     @staticmethod
     def _invoke_shortcut(callback) -> str:  # noqa: ANN001
@@ -329,6 +377,10 @@ class KOFViewer(tk.Tk):
         self.mask_btn = self._make_toolbar_button(top, text="Draw mask", command=self._on_toggle_mask)
         self.mask_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.mask_btn, "Shortcut: Ctrl+Shift+M")
+
+        self.measure_btn = self._make_toolbar_button(top, text="Measure", command=self._on_toggle_measure)
+        self.measure_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.measure_btn, "Shortcut: Ctrl+Shift+D")
 
         ttk.Label(
             top,
@@ -639,16 +691,84 @@ class KOFViewer(tk.Tk):
 
         ttk.Button(volume_panel, text="Compute volume", command=self._on_compute_volume).pack(anchor="w", pady=(2, 0))
         ttk.Label(volume_panel, textvariable=self.volume_text, foreground="#204080", wraplength=300, justify=tk.LEFT).pack(fill=tk.X, pady=(4, 0))
+        mask_results_btn_row = ttk.Frame(volume_panel)
+        mask_results_btn_row.pack(fill=tk.X, pady=(4, 0))
+        self.mask_results_popup_btn = ttk.Button(
+            mask_results_btn_row,
+            text="Mask results table...",
+            command=self._on_show_mask_results_table,
+            state="disabled",
+        )
+        self.mask_results_popup_btn.pack(side=tk.LEFT)
+        self.mask_results_export_btn = ttk.Button(
+            mask_results_btn_row,
+            text="Export mask CSV...",
+            command=self._on_export_mask_results_csv,
+            state="disabled",
+        )
+        self.mask_results_export_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         sections_panel = self._add_collapsible_panel(parent, "Sections and mask", expanded=False)
+        ttk.Button(sections_panel, text="Update sections", command=self._on_update_sections).pack(fill=tk.X, pady=(0, 2))
         ttk.Button(sections_panel, text="Clear sections", command=self._on_clear_sections).pack(fill=tk.X, pady=(0, 2))
         ttk.Button(sections_panel, text="Save sections...", command=self._on_save_sections_json).pack(fill=tk.X, pady=2)
         ttk.Button(sections_panel, text="Load sections...", command=self._on_load_sections_json).pack(fill=tk.X, pady=2)
         ttk.Button(sections_panel, text="Export section report...", command=self._on_export_section_report).pack(fill=tk.X, pady=2)
+        ttk.Button(sections_panel, text="Open section report in browser...", command=self._on_open_section_report_browser).pack(fill=tk.X, pady=2)
         ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
-        ttk.Button(sections_panel, text="Save mask...", command=self._on_save_mask_json).pack(fill=tk.X, pady=2)
-        ttk.Button(sections_panel, text="Load mask...", command=self._on_load_mask_json).pack(fill=tk.X, pady=2)
-        ttk.Button(sections_panel, text="Clear mask", command=self._on_clear_mask).pack(fill=tk.X, pady=2)
+        ttk.Button(sections_panel, text="Save project...", command=self._on_save_project).pack(fill=tk.X, pady=2)
+        ttk.Button(sections_panel, text="Load project...", command=self._on_load_project).pack(fill=tk.X, pady=2)
+        ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        ttk.Label(sections_panel, text="Active mask:").pack(anchor="w")
+        self.mask_combo = ttk.Combobox(
+            sections_panel,
+            textvariable=self.active_mask_var,
+            values=[],
+            state="readonly",
+            width=26,
+        )
+        self.mask_combo.pack(fill=tk.X, pady=(2, 4))
+        self.mask_combo.bind("<<ComboboxSelected>>", self._on_mask_select)
+        ttk.Label(sections_panel, text="Compute mask scope:").pack(anchor="w", pady=(2, 0))
+        self.mask_scope_combo = ttk.Combobox(
+            sections_panel,
+            textvariable=self.mask_compute_scope,
+            values=list(MASK_SCOPE_LABELS.values()),
+            state="readonly",
+            width=26,
+        )
+        self.mask_scope_combo.pack(fill=tk.X, pady=(2, 4))
+        ttk.Label(sections_panel, text="Mask visibility:").pack(anchor="w", pady=(2, 0))
+        self.mask_visibility_frame = ttk.Frame(sections_panel)
+        self.mask_visibility_frame.pack(fill=tk.X, pady=(2, 2))
+        vis_btn_row = ttk.Frame(sections_panel)
+        vis_btn_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Button(vis_btn_row, text="Show all", command=lambda: self._set_all_masks_visible(True)).pack(side=tk.LEFT)
+        ttk.Button(vis_btn_row, text="Hide all", command=lambda: self._set_all_masks_visible(False)).pack(side=tk.LEFT, padx=(4, 0))
+        self.mask_edit_btn = ttk.Button(sections_panel, text="Edit selected mask", command=self._on_toggle_mask_edit)
+        self.mask_edit_btn.pack(fill=tk.X, pady=2)
+        self.mask_buffer_btn = ttk.Button(sections_panel, text="Buffer selected mask...", command=self._on_buffer_selected_mask)
+        self.mask_buffer_btn.pack(fill=tk.X, pady=2)
+        self.mask_delete_btn = ttk.Button(sections_panel, text="Delete selected mask", command=self._on_delete_selected_mask)
+        self.mask_delete_btn.pack(fill=tk.X, pady=2)
+        self.mask_clear_btn = ttk.Button(sections_panel, text="Clear all masks", command=self._on_clear_mask)
+        self.mask_clear_btn.pack(fill=tk.X, pady=2)
+        ttk.Button(sections_panel, text="Save masks...", command=self._on_save_mask_json).pack(fill=tk.X, pady=2)
+        ttk.Button(sections_panel, text="Load masks...", command=self._on_load_mask_json).pack(fill=tk.X, pady=2)
+        ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        ttk.Label(sections_panel, text="Measure mode:").pack(anchor="w")
+        self.measure_mode_combo = ttk.Combobox(
+            sections_panel,
+            textvariable=self.measure_mode,
+            values=list(MEASURE_MODE_LABELS.values()),
+            state="readonly",
+            width=26,
+        )
+        self.measure_mode_combo.pack(fill=tk.X, pady=(2, 4))
+        self.measure_toggle_btn = ttk.Button(sections_panel, text="Start measure", command=self._on_toggle_measure)
+        self.measure_toggle_btn.pack(fill=tk.X, pady=2)
+        self.measure_clear_btn = ttk.Button(sections_panel, text="Clear measurements", command=self._on_clear_measurements)
+        self.measure_clear_btn.pack(fill=tk.X, pady=2)
 
         schema_panel = self._add_collapsible_panel(parent, "LandXML schema", expanded=False)
         ttk.Checkbutton(schema_panel, text="Strict XSD", variable=self.strict_xsd_validation).pack(anchor="w")
@@ -656,6 +776,7 @@ class KOFViewer(tk.Tk):
         ttk.Button(schema_panel, text="XSD file...", command=self._on_pick_local_xsd).pack(anchor="w", pady=(4, 0))
 
         self._on_intermediate_type_change()
+        self._refresh_mask_controls()
 
     def _build_body(self) -> None:
         body = ttk.Frame(self)
@@ -914,34 +1035,244 @@ class KOFViewer(tk.Tk):
         )
 
     def _on_clear(self) -> None:
+        self._close_section_windows()
         self.files.clear()
         self.landxml_files.clear()
         self.layer_vars.clear()
         self._surface_owner_paths.clear()
+        self._surface_source_paths.clear()
         self._landxml_group_vars.clear()
         self._view_extent_2d = None
+        self._latest_section_report_path = None
         self.last_volume = None
         self.volume_text.set("Volume: (not computed)")
+        self._measure_results.clear()
+        self._measure_click_points.clear()
         self._sections.clear()
-        self._mask_polygon.clear()
+        self._masks.clear()
+        self._mask_visibility_vars.clear()
+        self._last_volume_per_mask_rows.clear()
+        self._last_mask_volume_results.clear()
+        self._active_mask_index = None
+        self.active_mask_var.set("")
         self._mask_click_points.clear()
         if self._mask_mode:
             self._end_mask_mode()
+        if self._mask_edit_mode:
+            self._end_mask_edit_mode()
+        if self._measure_mode:
+            self._end_measure_mode()
+        self._refresh_mask_controls()
+        self._refresh_mask_result_actions()
         self._refresh_file_selectors()
         self._refresh_layer_controls()
         self._redraw()
 
+    def _clear_cached_mask_volume_results(self) -> None:
+        self._last_volume_per_mask_rows.clear()
+        self._last_mask_volume_results.clear()
+        self._refresh_mask_result_actions()
+
+    def _refresh_mask_result_actions(self) -> None:
+        has_results = bool(self._last_mask_volume_results)
+        state = "normal" if has_results else "disabled"
+        if hasattr(self, "mask_results_popup_btn"):
+            self.mask_results_popup_btn.configure(state=state)
+        if hasattr(self, "mask_results_export_btn"):
+            self.mask_results_export_btn.configure(state=state)
+
+    def _on_show_mask_results_table(self) -> None:
+        if not self._last_mask_volume_results:
+            messagebox.showinfo("KOF Viewer", "No per-mask volume results available. Run Compute volume first.")
+            return
+        MaskVolumeResultsWindow(self, self._last_mask_volume_results)
+
+    def _on_export_mask_results_csv(self) -> None:
+        rows = self._last_mask_volume_results
+        if not rows:
+            messagebox.showinfo("KOF Viewer", "No per-mask volume results available. Run Compute volume first.")
+            return
+
+        out_path = filedialog.asksaveasfilename(
+            title="Export mask volume summary CSV",
+            defaultextension=".csv",
+            initialfile="mask_volume_summary.csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not out_path:
+            return
+
+        fieldnames = ["mask_name", "area_m2", "net_m3", "cut_m3", "fill_m3", "status"]
+        try:
+            with open(out_path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.DictWriter(fh, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(
+                        {
+                            "mask_name": row.get("mask_name", ""),
+                            "area_m2": row.get("area_m2", ""),
+                            "net_m3": row.get("net_m3", ""),
+                            "cut_m3": row.get("cut_m3", ""),
+                            "fill_m3": row.get("fill_m3", ""),
+                            "status": row.get("status", ""),
+                        }
+                    )
+        except OSError as exc:
+            messagebox.showerror("KOF Viewer", f"Failed to export CSV:\n{exc}")
+            return
+
+        messagebox.showinfo("KOF Viewer", f"Exported {len(rows)} row(s) to:\n{out_path}")
+
+    @staticmethod
+    def _mask_base_name(index: int) -> str:
+        return f"Mask {KOFViewer._section_label(index)}"
+
+    def _next_mask_name(self) -> str:
+        used = {m.name for m in self._masks}
+        idx = 0
+        while True:
+            candidate = self._mask_base_name(idx)
+            if candidate not in used:
+                return candidate
+            idx += 1
+
+    def _dedupe_mask_name(self, name: str) -> str:
+        candidate = (name or "").strip() or self._next_mask_name()
+        used = {m.name for m in self._masks}
+        if candidate not in used:
+            return candidate
+        suffix = 2
+        while f"{candidate} ({suffix})" in used:
+            suffix += 1
+        return f"{candidate} ({suffix})"
+
+    def _set_active_mask_index(self, index: Optional[int]) -> None:
+        if index is None or index < 0 or index >= len(self._masks):
+            self._active_mask_index = None
+            self.active_mask_var.set("")
+            return
+        self._active_mask_index = index
+        self.active_mask_var.set(self._masks[index].name)
+
+    def _active_mask(self) -> Optional[MaskDefinition]:
+        idx = self._active_mask_index
+        if idx is None or idx < 0 or idx >= len(self._masks):
+            return None
+        return self._masks[idx]
+
+    def _mask_is_visible(self, index: int) -> bool:
+        if index < 0 or index >= len(self._masks):
+            return False
+        if index >= len(self._mask_visibility_vars):
+            return bool(self._masks[index].visible)
+        return bool(self._mask_visibility_vars[index].get())
+
+    def _sync_mask_visible_flag(self, index: int) -> None:
+        if index < 0 or index >= len(self._masks):
+            return
+        self._masks[index].visible = self._mask_is_visible(index)
+
+    def _on_toggle_mask_visibility(self, index: int) -> None:
+        self._sync_mask_visible_flag(index)
+        self._clear_cached_mask_volume_results()
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._redraw_2d()
+
+    def _set_all_masks_visible(self, visible: bool) -> None:
+        if not self._masks:
+            return
+        for idx, var in enumerate(self._mask_visibility_vars):
+            var.set(bool(visible))
+            if idx < len(self._masks):
+                self._masks[idx].visible = bool(visible)
+        self._clear_cached_mask_volume_results()
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._redraw_2d()
+
+    def _active_mask_polygon(self) -> Optional[list[tuple[float, float]]]:
+        mask = self._active_mask()
+        if mask is None or len(mask.vertices) < 3:
+            return None
+        return list(mask.vertices)
+
+    def _append_mask(
+        self,
+        vertices: list[tuple[float, float]],
+        name: Optional[str] = None,
+        *,
+        visible: bool = True,
+    ) -> None:
+        if len(vertices) < 3:
+            return
+        mask_name = self._dedupe_mask_name(name or self._next_mask_name())
+        self._masks.append(MaskDefinition(name=mask_name, vertices=list(vertices), visible=bool(visible)))
+        self._mask_visibility_vars.append(tk.BooleanVar(value=bool(visible)))
+        self._clear_cached_mask_volume_results()
+        self._set_active_mask_index(len(self._masks) - 1)
+
+    def _refresh_mask_controls(self) -> None:
+        if hasattr(self, "mask_combo"):
+            names = [m.name for m in self._masks]
+            self.mask_combo.configure(values=names)
+            if names and self._active_mask_index is not None and 0 <= self._active_mask_index < len(names):
+                self.active_mask_var.set(names[self._active_mask_index])
+            else:
+                self.active_mask_var.set("")
+        while len(self._mask_visibility_vars) > len(self._masks):
+            self._mask_visibility_vars.pop()
+        while len(self._mask_visibility_vars) < len(self._masks):
+            idx = len(self._mask_visibility_vars)
+            self._mask_visibility_vars.append(tk.BooleanVar(value=bool(self._masks[idx].visible)))
+        for idx, mask in enumerate(self._masks):
+            self._mask_visibility_vars[idx].set(bool(mask.visible))
+        if hasattr(self, "mask_visibility_frame"):
+            for widget in getattr(self, "_mask_visibility_checks", []):
+                widget.destroy()
+            self._mask_visibility_checks = []
+            for idx, mask in enumerate(self._masks):
+                chk = ttk.Checkbutton(
+                    self.mask_visibility_frame,
+                    text=mask.name,
+                    variable=self._mask_visibility_vars[idx],
+                    command=lambda i=idx: self._on_toggle_mask_visibility(i),
+                )
+                chk.pack(anchor="w")
+                self._mask_visibility_checks.append(chk)
+        has_active = self._active_mask() is not None
+        has_any = bool(self._masks)
+        edit_state = "normal" if has_active else "disabled"
+        any_state = "normal" if has_any else "disabled"
+        if hasattr(self, "mask_edit_btn"):
+            self.mask_edit_btn.configure(state=edit_state)
+        if hasattr(self, "mask_buffer_btn"):
+            self.mask_buffer_btn.configure(state=edit_state)
+        if hasattr(self, "mask_delete_btn"):
+            self.mask_delete_btn.configure(state=edit_state)
+        if hasattr(self, "mask_clear_btn"):
+            self.mask_clear_btn.configure(state=any_state)
+
+    def _on_mask_select(self, _event=None) -> None:  # noqa: ANN001
+        selected = self.active_mask_var.get().strip()
+        for idx, mask in enumerate(self._masks):
+            if mask.name == selected:
+                self._set_active_mask_index(idx)
+                self._redraw_2d()
+                return
+
     def _on_save_mask_json(self) -> None:
-        if len(self._mask_polygon) < 3:
+        if not self._masks:
             messagebox.showinfo(
                 "KOF Viewer",
-                "No closed mask polygon to save. Draw and close a mask first.",
+                "No mask polygons to save. Draw at least one mask first.",
             )
             return
 
-        default_name = "mask_polygon.json"
+        default_name = "masks.json"
         out_path = filedialog.asksaveasfilename(
-            title="Save mask polygon",
+            title="Save masks",
             defaultextension=".json",
             initialfile=default_name,
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
@@ -950,12 +1281,12 @@ class KOFViewer(tk.Tk):
             return
 
         try:
-            save_mask_json(
+            save_masks_json(
                 out_path,
-                self._mask_polygon,
+                self._masks,
                 metadata={
                     "saved_at": datetime.now().isoformat(timespec="seconds"),
-                    "vertex_count": len(self._mask_polygon),
+                    "mask_count": len(self._masks),
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -964,33 +1295,63 @@ class KOFViewer(tk.Tk):
 
         messagebox.showinfo(
             "KOF Viewer",
-            f"Saved mask with {len(self._mask_polygon)} vertices to:\n{out_path}",
+            f"Saved {len(self._masks)} mask(s) to:\n{out_path}",
         )
 
     def _on_load_mask_json(self) -> None:
         in_path = filedialog.askopenfilename(
-            title="Load mask polygon",
+            title="Load masks",
             filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
         if not in_path:
             return
 
         try:
-            vertices = load_mask_json(in_path)
+            masks = load_masks_json(in_path)
         except (MaskDataError, OSError, ValueError) as exc:
             messagebox.showerror("KOF Viewer", f"Failed to load mask JSON:\n{exc}")
             return
 
+        if not masks:
+            messagebox.showinfo("KOF Viewer", "Mask file did not contain any valid closed polygons.")
+            return
+
+        replace = messagebox.askyesnocancel(
+            "KOF Viewer",
+            "Replace existing masks?\n\nYes: replace\nNo: append",
+        )
+        if replace is None:
+            return
+
+        if replace:
+            self._masks.clear()
+            self._mask_visibility_vars.clear()
+            self._active_mask_index = None
+
+        loaded_names: list[str] = []
+        for mask in masks:
+            name = self._dedupe_mask_name(mask.name)
+            self._append_mask(mask.vertices, name=name, visible=mask.visible)
+            loaded_names.append(name)
+
         self._mask_click_points.clear()
-        self._mask_polygon = list(vertices)
         if self._mask_mode:
             self._end_mask_mode()
+        if self._mask_edit_mode:
+            self._end_mask_edit_mode()
         if self.last_volume is not None:
             self.volume_text.set("Volume: (stale – recompute)")
         self.notebook.select(0)
-        if len(self._mask_polygon) >= 3:
-            self._zoom_to_bounds(self._polygon_bounds(self._mask_polygon))
+        active_poly = self._active_mask_polygon()
+        if active_poly is not None:
+            self._zoom_to_bounds(self._polygon_bounds(active_poly))
+        self._refresh_mask_controls()
         self._redraw()
+
+        messagebox.showinfo(
+            "KOF Viewer",
+            f"Loaded {len(loaded_names)} mask(s). Active: {self.active_mask_var.get() or 'none'}",
+        )
 
     def _on_save_sections_json(self) -> None:
         if not self._sections:
@@ -1031,25 +1392,306 @@ class KOFViewer(tk.Tk):
             messagebox.showerror("KOF Viewer", f"Failed to load sections JSON:\n{exc}")
             return
 
+        self._close_section_windows()
         self._sections = list(sections)
         self._redraw()
 
-    def _on_export_section_report(self) -> None:
-        top = self._find_file(self.top_var.get())
-        bot = self._find_file(self.bottom_var.get())
-        if top is None or bot is None:
-            messagebox.showwarning("KOF Viewer", "Select both top and bottom surfaces first.")
-            return
-        if top is bot:
-            messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
-            return
-        if not self._sections:
-            messagebox.showinfo(
-                "KOF Viewer",
-                "Draw at least one section line first. The latest line is used as baseline.",
-            )
+    def _on_save_project(self) -> None:
+        out_path = filedialog.asksaveasfilename(
+            title="Save project",
+            defaultextension=".json",
+            initialfile="kofvision_project.json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not out_path:
             return
 
+        source_files: list[str] = []
+        seen_sources: set[str] = set()
+        for path in self._surface_source_paths:
+            if not path or path in seen_sources:
+                continue
+            seen_sources.add(path)
+            source_files.append(path)
+
+        payload = {
+            "type": "kofvision.project",
+            "version": 1,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "source_files": source_files,
+            "surface_layers": [
+                {
+                    "name": surface.name,
+                    "source_path": self._surface_source_paths[idx] if idx < len(self._surface_source_paths) else None,
+                    "owner_path": self._surface_owner_paths[idx] if idx < len(self._surface_owner_paths) else None,
+                    "visible": bool(self.layer_vars[idx].get()) if idx < len(self.layer_vars) else True,
+                }
+                for idx, surface in enumerate(self.files)
+            ],
+            "landxml_groups": {
+                path: bool(var.get())
+                for path, var in self._landxml_group_vars.items()
+            },
+            "raster_layers": [
+                {
+                    "path": layer.path,
+                    "visible": bool(layer.visible.get()),
+                    "alpha": float(layer.alpha.get()),
+                    "is_elevation": (idx == self._elevation_raster_index),
+                }
+                for idx, layer in enumerate(self._raster_layers)
+            ],
+            "show_raster": bool(self.show_raster.get()),
+            "top_surface": self.top_var.get(),
+            "bottom_surface": self.bottom_var.get(),
+            "volume_source_mode": self.volume_source_mode.get(),
+            "volume_method": self.volume_method.get(),
+            "intermediate_type": self.intermediate_type.get(),
+            "intermediate_kof": self.intermediate_kof_var.get(),
+            "intermediate_raster": self.intermediate_raster_var.get(),
+            "intermediate_constant_z": float(self.intermediate_constant_z.get()),
+            "mask_compute_scope": self.mask_compute_scope.get(),
+            "sections": [
+                {
+                    "start": [float(start[0]), float(start[1])],
+                    "end": [float(end[0]), float(end[1])],
+                }
+                for start, end in self._sections
+            ],
+            "masks": [
+                {
+                    "name": mask.name,
+                    "visible": bool(mask.visible),
+                    "vertices": [[float(y), float(x)] for y, x in mask.vertices],
+                }
+                for mask in self._masks
+                if len(mask.vertices) >= 3
+            ],
+            "active_mask": self.active_mask_var.get(),
+        }
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("KOF Viewer", f"Failed to save project:\n{exc}")
+            return
+
+        messagebox.showinfo("KOF Viewer", f"Project saved:\n{out_path}")
+
+    def _on_load_project(self) -> None:
+        in_path = filedialog.askopenfilename(
+            title="Load project",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not in_path:
+            return
+
+        try:
+            with open(in_path, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("KOF Viewer", f"Failed to read project file:\n{exc}")
+            return
+
+        if not isinstance(payload, dict) or payload.get("type") != "kofvision.project":
+            messagebox.showerror("KOF Viewer", "Invalid project file type.")
+            return
+        if int(payload.get("version", 0)) != 1:
+            messagebox.showerror("KOF Viewer", f"Unsupported project version: {payload.get('version')}")
+            return
+
+        self._close_section_windows()
+        self.files.clear()
+        self.landxml_files.clear()
+        self.layer_vars.clear()
+        self._surface_owner_paths.clear()
+        self._surface_source_paths.clear()
+        self._landxml_group_vars.clear()
+        self._sections.clear()
+        self._measure_results.clear()
+        self._measure_click_points.clear()
+        self._masks.clear()
+        self._mask_visibility_vars.clear()
+        self._active_mask_index = None
+        self.active_mask_var.set("")
+        self._raster_layers.clear()
+        self._active_raster_index = None
+        self._elevation_raster_index = None
+        self._latest_section_report_path = None
+        if self._measure_mode:
+            self._end_measure_mode()
+        self._clear_cached_mask_volume_results()
+
+        source_files = payload.get("source_files")
+        if not isinstance(source_files, list):
+            source_files = []
+
+        missing_sources: list[str] = []
+        for raw_path in source_files:
+            path = str(raw_path)
+            if not os.path.exists(path):
+                missing_sources.append(path)
+                continue
+            self._load_file(path, redraw=False)
+
+        surface_layers_raw = payload.get("surface_layers")
+        if isinstance(surface_layers_raw, list) and self.files:
+            index_by_key: dict[tuple[str, Optional[str]], list[int]] = {}
+            for idx, surface in enumerate(self.files):
+                src = self._surface_source_paths[idx] if idx < len(self._surface_source_paths) else None
+                key = (surface.name, src)
+                index_by_key.setdefault(key, []).append(idx)
+            for entry in surface_layers_raw:
+                if not isinstance(entry, dict):
+                    continue
+                key = (str(entry.get("name", "")), entry.get("source_path"))
+                candidates = index_by_key.get(key)
+                if not candidates:
+                    continue
+                idx = candidates.pop(0)
+                if idx < len(self.layer_vars):
+                    self.layer_vars[idx].set(bool(entry.get("visible", True)))
+
+        landxml_groups_raw = payload.get("landxml_groups")
+        if isinstance(landxml_groups_raw, dict):
+            for path, value in landxml_groups_raw.items():
+                var = self._landxml_group_vars.get(str(path))
+                if var is not None:
+                    var.set(bool(value))
+
+        raster_layers_raw = payload.get("raster_layers")
+        if isinstance(raster_layers_raw, list):
+            for entry in raster_layers_raw:
+                if not isinstance(entry, dict):
+                    continue
+                path = str(entry.get("path", ""))
+                if not path or not os.path.exists(path):
+                    continue
+                self._load_raster(path)
+                idx = len(self._raster_layers) - 1
+                if idx < 0:
+                    continue
+                layer = self._raster_layers[idx]
+                layer.visible.set(bool(entry.get("visible", True)))
+                try:
+                    layer.alpha.set(float(entry.get("alpha", layer.alpha.get())))
+                except (TypeError, ValueError, tk.TclError):
+                    pass
+                if bool(entry.get("is_elevation", False)) and layer.elevation_surface is not None:
+                    self._elevation_raster_index = idx
+
+        self.show_raster.set(bool(payload.get("show_raster", bool(self._raster_layers))))
+
+        sections_raw = payload.get("sections")
+        if isinstance(sections_raw, list):
+            for item in sections_raw:
+                if not isinstance(item, dict):
+                    continue
+                start = item.get("start")
+                end = item.get("end")
+                if not isinstance(start, (list, tuple)) or not isinstance(end, (list, tuple)):
+                    continue
+                if len(start) != 2 or len(end) != 2:
+                    continue
+                try:
+                    p0 = (float(start[0]), float(start[1]))
+                    p1 = (float(end[0]), float(end[1]))
+                except (TypeError, ValueError):
+                    continue
+                self._sections.append((p0, p1))
+
+        masks_raw = payload.get("masks")
+        if isinstance(masks_raw, list):
+            for item in masks_raw:
+                if not isinstance(item, dict):
+                    continue
+                vertices_raw = item.get("vertices")
+                if not isinstance(vertices_raw, list):
+                    continue
+                vertices: list[tuple[float, float]] = []
+                for v in vertices_raw:
+                    if not isinstance(v, (list, tuple)) or len(v) != 2:
+                        continue
+                    try:
+                        vertices.append((float(v[0]), float(v[1])))
+                    except (TypeError, ValueError):
+                        continue
+                if len(vertices) < 3:
+                    continue
+                name = str(item.get("name", "")).strip() or None
+                visible = bool(item.get("visible", True))
+                self._append_mask(vertices, name=name, visible=visible)
+
+        active_mask = str(payload.get("active_mask", "")).strip()
+        if active_mask:
+            for idx, mask in enumerate(self._masks):
+                if mask.name == active_mask:
+                    self._set_active_mask_index(idx)
+                    break
+
+        names = [k.name for k in self.files]
+        top_name = str(payload.get("top_surface", ""))
+        bottom_name = str(payload.get("bottom_surface", ""))
+        if top_name in names:
+            self.top_var.set(top_name)
+        if bottom_name in names:
+            self.bottom_var.set(bottom_name)
+
+        volume_mode = str(payload.get("volume_source_mode", ""))
+        if volume_mode in VOLUME_LABEL_TO_MODE or volume_mode in VOLUME_MODE_LABELS.values():
+            self.volume_source_mode.set(volume_mode)
+        volume_method = str(payload.get("volume_method", "")).strip()
+        if volume_method in {"raster", "triangles"}:
+            self.volume_method.set(volume_method)
+        intermediate_type = str(payload.get("intermediate_type", ""))
+        if intermediate_type in INTERMEDIATE_LABEL_TO_TYPE or intermediate_type in INTERMEDIATE_TYPE_LABELS.values():
+            self.intermediate_type.set(intermediate_type)
+        self.intermediate_kof_var.set(str(payload.get("intermediate_kof", "")))
+        self.intermediate_raster_var.set(str(payload.get("intermediate_raster", "")))
+        try:
+            self.intermediate_constant_z.set(float(payload.get("intermediate_constant_z", self.intermediate_constant_z.get())))
+        except (TypeError, ValueError, tk.TclError):
+            pass
+        scope = str(payload.get("mask_compute_scope", ""))
+        if scope in MASK_LABEL_TO_SCOPE or scope in MASK_SCOPE_LABELS.values():
+            self.mask_compute_scope.set(scope)
+
+        self._refresh_file_selectors()
+        self._refresh_intermediate_raster_selector()
+        self._refresh_raster_selector()
+        self._refresh_mask_controls()
+        self._refresh_layer_controls()
+        self._on_intermediate_type_change()
+        self._redraw()
+
+        msg = f"Project loaded:\n{in_path}"
+        if missing_sources:
+            msg += "\n\nMissing source files:\n" + "\n".join(missing_sources)
+        messagebox.showinfo("KOF Viewer", msg)
+
+    @staticmethod
+    def _integrate_profile_areas_to_volume(stations_m: list[float], areas_m2: list[float]) -> float:
+        if len(stations_m) < 2 or len(areas_m2) < 2:
+            return float("nan")
+        s = np.asarray(stations_m, dtype=float)
+        a = np.asarray(areas_m2, dtype=float)
+        valid = np.isfinite(s) & np.isfinite(a)
+        if np.count_nonzero(valid) < 2:
+            return float("nan")
+        s_valid = s[valid]
+        a_valid = a[valid]
+        order = np.argsort(s_valid)
+        return float(np.trapezoid(a_valid[order], s_valid[order]))
+
+    @staticmethod
+    def _open_path_in_browser(path: str) -> bool:
+        try:
+            return bool(webbrowser.open_new_tab(Path(path).resolve().as_uri()))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _ask_section_report_parameters(self) -> Optional[tuple[float, float, int]]:
         spacing_m = simpledialog.askfloat(
             "Section report",
             "Profile spacing along baseline (m):",
@@ -1057,7 +1699,7 @@ class KOFViewer(tk.Tk):
             minvalue=0.01,
         )
         if spacing_m is None:
-            return
+            return None
 
         section_length_m = simpledialog.askfloat(
             "Section report",
@@ -1066,7 +1708,7 @@ class KOFViewer(tk.Tk):
             minvalue=0.1,
         )
         if section_length_m is None:
-            return
+            return None
 
         n_samples = simpledialog.askinteger(
             "Section report",
@@ -1076,20 +1718,38 @@ class KOFViewer(tk.Tk):
             maxvalue=2000,
         )
         if n_samples is None:
-            return
+            return None
+        return float(spacing_m), float(section_length_m), int(n_samples)
 
-        out_root = filedialog.askdirectory(title="Choose report output folder")
-        if not out_root:
-            return
+    def _generate_section_report(self, out_root: str, *, open_in_browser: bool) -> Optional[str]:
+        top = self._find_file(self.top_var.get())
+        bot = self._find_file(self.bottom_var.get())
+        if top is None or bot is None:
+            messagebox.showwarning("KOF Viewer", "Select both top and bottom surfaces first.")
+            return None
+        if top is bot:
+            messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
+            return None
+        if not self._sections:
+            messagebox.showinfo(
+                "KOF Viewer",
+                "Draw at least one section line first. The latest line is used as baseline.",
+            )
+            return None
+
+        params = self._ask_section_report_parameters()
+        if params is None:
+            return None
+        spacing_m, section_length_m, n_samples = params
 
         baseline = self._sections[-1]
         (b0, b1) = baseline
         baseline_len = float(np.hypot(b1[0] - b0[0], b1[1] - b0[1]))
         if baseline_len <= 0:
             messagebox.showerror("KOF Viewer", "Baseline section has zero length.")
-            return
+            return None
 
-        stations = station_values(baseline_len, float(spacing_m))
+        stations = station_values(baseline_len, spacing_m)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = os.path.join(out_root, f"section_report_{timestamp}")
         profiles_dir = os.path.join(run_dir, "profiles")
@@ -1147,10 +1807,35 @@ class KOFViewer(tk.Tk):
                     "area_net_m2": sample.area_net_m2,
                     "area_cut_m2": sample.area_cut_m2,
                     "area_fill_m2": sample.area_fill_m2,
+                    "area_upper_leg_m2": sample.area_upper_leg_m2,
+                    "area_lower_leg_m2": sample.area_lower_leg_m2,
                     "image_rel": image_rel.replace("\\", "/"),
                 }
             )
             plan_points.append((profile_id, center))
+
+        stations_list = [float(r["station_m"]) for r in profile_rows]
+        area_net_list = [float(r["area_net_m2"]) for r in profile_rows]
+        area_cut_list = [float(r["area_cut_m2"]) for r in profile_rows]
+        area_fill_list = [float(r["area_fill_m2"]) for r in profile_rows]
+        net_volume_m3 = self._integrate_profile_areas_to_volume(stations_list, area_net_list)
+        cut_volume_m3 = self._integrate_profile_areas_to_volume(stations_list, area_cut_list)
+        fill_volume_m3 = self._integrate_profile_areas_to_volume(stations_list, area_fill_list)
+
+        upper_leg_values = [r.get("area_upper_leg_m2") for r in profile_rows]
+        lower_leg_values = [r.get("area_lower_leg_m2") for r in profile_rows]
+        upper_leg_volume_m3 = float("nan")
+        lower_leg_volume_m3 = float("nan")
+        if any(v not in (None, "") for v in upper_leg_values):
+            upper_leg_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in upper_leg_values],
+            )
+        if any(v not in (None, "") for v in lower_leg_values):
+            lower_leg_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in lower_leg_values],
+            )
 
         plan_image_rel = "plan_view.png"
         plan_image_path = os.path.join(run_dir, plan_image_rel)
@@ -1172,20 +1857,34 @@ class KOFViewer(tk.Tk):
         )
 
         report_path = os.path.join(run_dir, "report.html")
+        mask_report_text = " | ".join(self._last_volume_per_mask_rows) if self._last_volume_per_mask_rows else "(not computed)"
+        metadata = {
+            "Top surface": top.name,
+            "Bottom surface": bot.name,
+            "Section area pair": f"{area_top_name} - {area_bottom_name}",
+            "Input files": ", ".join(k.name for k in self.files),
+            "Spacing (m)": f"{spacing_m:.2f}",
+            "Cross-section length (m)": f"{section_length_m:.2f}",
+            "Samples per profile": n_samples,
+            "Profile count": len(profile_rows),
+            "Baseline length (m)": f"{baseline_len:.2f}",
+            "Section orientation": "Left -> Right (looking toward higher station)",
+            "Volume net (m3)": f"{net_volume_m3:+,.2f}",
+            "Volume cut (m3)": f"{cut_volume_m3:,.2f}",
+            "Volume fill (m3)": f"{fill_volume_m3:,.2f}",
+            "Latest volume per-mask": mask_report_text,
+        }
+        if np.isfinite(upper_leg_volume_m3):
+            upper_name = section_intermediate.name if section_intermediate is not None else "Intermediate"
+            metadata[f"Volume {top.name} - {upper_name} (m3)"] = f"{upper_leg_volume_m3:+,.2f}"
+        if np.isfinite(lower_leg_volume_m3):
+            lower_name = section_intermediate.name if section_intermediate is not None else "Intermediate"
+            metadata[f"Volume {lower_name} - {bot.name} (m3)"] = f"{lower_leg_volume_m3:+,.2f}"
+
         write_html_report(
             report_path,
             title="KOF Section Report",
-            metadata={
-                "Top surface": top.name,
-                "Bottom surface": bot.name,
-                "Section area pair": f"{area_top_name} - {area_bottom_name}",
-                "Input files": ", ".join(k.name for k in self.files),
-                "Spacing (m)": f"{float(spacing_m):.2f}",
-                "Cross-section length (m)": f"{float(section_length_m):.2f}",
-                "Samples per profile": int(n_samples),
-                "Profile count": len(profile_rows),
-                "Baseline length (m)": f"{baseline_len:.2f}",
-            },
+            metadata=metadata,
             plan_image_rel=plan_image_rel,
             profile_rows=profile_rows,
         )
@@ -1203,14 +1902,26 @@ class KOFViewer(tk.Tk):
                         "top": area_top_name,
                         "bottom": area_bottom_name,
                     },
+                    "latest_volume_per_mask": self._last_volume_per_mask_rows,
                     "input_files": [k.name for k in self.files],
-                    "spacing_m": float(spacing_m),
-                    "section_length_m": float(section_length_m),
-                    "samples_per_profile": int(n_samples),
+                    "spacing_m": spacing_m,
+                    "section_length_m": section_length_m,
+                    "samples_per_profile": n_samples,
                     "baseline": {
                         "start": [float(b0[0]), float(b0[1])],
                         "end": [float(b1[0]), float(b1[1])],
                         "length_m": baseline_len,
+                    },
+                    "orientation": {
+                        "section_axis": "left_to_right",
+                        "view_direction": "toward_higher_station",
+                    },
+                    "volume_summary_m3": {
+                        "net": net_volume_m3,
+                        "cut": cut_volume_m3,
+                        "fill": fill_volume_m3,
+                        "top_to_intermediate": upper_leg_volume_m3,
+                        "intermediate_to_bottom": lower_leg_volume_m3,
                     },
                     "profiles": profile_rows,
                 },
@@ -1218,12 +1929,44 @@ class KOFViewer(tk.Tk):
                 indent=2,
             )
 
+        self._latest_section_report_path = report_path
+        if open_in_browser:
+            opened = self._open_path_in_browser(report_path)
+            if not opened:
+                messagebox.showwarning(
+                    "KOF Viewer",
+                    "Report exported, but failed to open web browser automatically.",
+                )
+
+        return run_dir
+
+    def _on_export_section_report(self) -> None:
+        out_root = filedialog.askdirectory(title="Choose report output folder")
+        if not out_root:
+            return
+        run_dir = self._generate_section_report(out_root, open_in_browser=True)
+        if run_dir is None:
+            return
+
         messagebox.showinfo(
             "KOF Viewer",
             "Section report export completed.\n\n"
             f"Output folder:\n{run_dir}\n\n"
-            f"Profiles exported: {len(profile_rows)}\n"
-            "Baseline: latest drawn section line",
+            f"Report opened in browser: {'yes' if self._latest_section_report_path else 'no'}\n"
+            "Baseline: latest drawn section line\n"
+            "Orientation: left -> right looking toward higher station",
+        )
+
+    def _on_open_section_report_browser(self) -> None:
+        out_root = tempfile.mkdtemp(prefix="kofvision_section_report_")
+        run_dir = self._generate_section_report(out_root, open_in_browser=True)
+        if run_dir is None:
+            return
+        messagebox.showinfo(
+            "KOF Viewer",
+            "Section report generated and opened in browser.\n\n"
+            f"Temporary folder:\n{run_dir}\n\n"
+            "Tip: use Export section report... to choose a permanent output folder.",
         )
 
     def _on_open_raster(self) -> None:
@@ -1545,6 +2288,7 @@ class KOFViewer(tk.Tk):
     def _on_clear_sections(self) -> None:
         if not self._sections:
             return
+        self._close_section_windows()
         self._sections.clear()
         self._redraw()
 
@@ -1566,6 +2310,7 @@ class KOFViewer(tk.Tk):
                     self.files.append(surface)
                     self.layer_vars.append(tk.BooleanVar(value=True))
                     self._surface_owner_paths.append(path)
+                    self._surface_source_paths.append(path)
                 self._on_toggle_landxml_child(path)
                 self._rebuild_alignment_stations()
                 if not landxml.surfaces and not landxml.alignments:
@@ -1592,6 +2337,7 @@ class KOFViewer(tk.Tk):
                 self.files.append(kof)
                 self.layer_vars.append(tk.BooleanVar(value=True))
                 self._surface_owner_paths.append(None)
+                self._surface_source_paths.append(path)
         except Exception as exc:  # noqa: BLE001
             messagebox.showerror("KOF Viewer", f"Failed to read '{path}':\n{exc}")
             return
@@ -1947,10 +2693,11 @@ class KOFViewer(tk.Tk):
         layer = self._raster_layers[self._elevation_raster_index]
         if layer.elevation_surface is None:
             return None
-        mode = self._current_volume_mode_key()
-        if mode in {"top_minus_raster", "raster_minus_bottom", "raster_minus_top"}:
-            return layer.elevation_surface
-        return None
+        # Keep section raster previews aligned with raster-based sampling mode,
+        # including KOF-KOF where the raster is shown as reference only.
+        if self.volume_method.get().strip().lower() != "raster":
+            return None
+        return layer.elevation_surface
 
     def _section_area_pair(
         self,
@@ -1969,6 +2716,94 @@ class KOFViewer(tk.Tk):
             return raster, top, raster.name, top.name
 
         return top, bottom, top.name, bottom.name
+
+    def _current_mask_scope_key(self) -> str:
+        label = self.mask_compute_scope.get().strip()
+        return MASK_LABEL_TO_SCOPE.get(label, "selected")
+
+    def _mask_indices_for_compute(self, scope: str) -> list[int]:
+        if not self._masks:
+            return []
+        if scope == "selected":
+            idx = self._active_mask_index
+            if idx is None or idx < 0 or idx >= len(self._masks):
+                return []
+            return [idx]
+        if scope == "visible_union":
+            return [idx for idx in range(len(self._masks)) if self._mask_is_visible(idx)]
+        if scope == "all_union":
+            return list(range(len(self._masks)))
+        return []
+
+    @staticmethod
+    def _polygon_from_geom(geom) -> list[list[tuple[float, float]]]:  # noqa: ANN001
+        if geom.is_empty:
+            return []
+        out: list[list[tuple[float, float]]] = []
+        if geom.geom_type == "Polygon":
+            out.append([(float(y), float(x)) for y, x in geom.exterior.coords[:-1]])
+            return out
+        if geom.geom_type == "MultiPolygon":
+            for part in geom.geoms:
+                out.extend(KOFViewer._polygon_from_geom(part))
+            return out
+        return []
+
+    @staticmethod
+    def _combine_volume_results(
+        results: list[VolumeResult | SplitVolumeResult],
+    ) -> Optional[VolumeResult | SplitVolumeResult]:
+        if not results:
+            return None
+
+        def _combine_simple(items: list[VolumeResult]) -> VolumeResult:
+            first = items[0]
+            return VolumeResult(
+                top_name=first.top_name,
+                bottom_name=first.bottom_name,
+                cell_size=first.cell_size,
+                n_valid=int(sum(it.n_valid for it in items)),
+                net=float(sum(it.net for it in items)),
+                cut=float(sum(it.cut for it in items)),
+                fill=float(sum(it.fill for it in items)),
+                area=float(sum(it.area for it in items)),
+                y_min=min(it.y_min for it in items),
+                x_min=min(it.x_min for it in items),
+                y_max=max(it.y_max for it in items),
+                x_max=max(it.x_max for it in items),
+            )
+
+        if isinstance(results[0], SplitVolumeResult):
+            split_items = [r for r in results if isinstance(r, SplitVolumeResult)]
+            if len(split_items) != len(results):
+                return None
+            upper = _combine_simple([it.upper for it in split_items])
+            lower = _combine_simple([it.lower for it in split_items])
+            return SplitVolumeResult(upper=upper, lower=lower)
+
+        simple_items = [r for r in results if isinstance(r, VolumeResult)]
+        if len(simple_items) != len(results):
+            return None
+        return _combine_simple(simple_items)
+
+    def _compute_volume_for_mask(
+        self,
+        top_surface: SurfaceLike,
+        bottom_surface: SurfaceLike,
+        intermediate_surface: Optional[SurfaceLike],
+        *,
+        mask_polygon: Optional[list[tuple[float, float]]],
+        method: str,
+    ) -> Optional[VolumeResult | SplitVolumeResult]:
+        if intermediate_surface is None:
+            return compute_volume(top_surface, bottom_surface, mask_polygon=mask_polygon, method=method)
+        return compute_volume_with_intermediate(
+            top_surface,
+            intermediate_surface,
+            bottom_surface,
+            mask_polygon=mask_polygon,
+            method=method,
+        )
 
     def _on_compute_volume(self) -> None:
         top = self._find_file(self.top_var.get())
@@ -2028,8 +2863,9 @@ class KOFViewer(tk.Tk):
             messagebox.showwarning("KOF Viewer", f"Unknown volume mode: {mode}")
             return
 
-        mask_poly = self._mask_polygon if len(self._mask_polygon) >= 3 else None
         method = self.volume_method.get().strip().lower()
+        scope = self._current_mask_scope_key()
+        scope_label = MASK_SCOPE_LABELS.get(scope, MASK_SCOPE_LABELS["selected"])
 
         if method == "triangles" and intermediate_type != "none":
             messagebox.showwarning(
@@ -2052,17 +2888,137 @@ class KOFViewer(tk.Tk):
             )
             return
 
-        try:
-            if intermediate_surface is None:
-                result = compute_volume(top_surface, bottom_surface, mask_polygon=mask_poly, method=method)
-            else:
-                result = compute_volume_with_intermediate(
-                    top_surface,
-                    intermediate_surface,
-                    bottom_surface,
-                    mask_polygon=mask_poly,
-                    method=method,
+        mask_indices = self._mask_indices_for_compute(scope)
+        per_mask_rows: list[str] = []
+        per_mask_result_rows: list[dict[str, Any]] = []
+        effective_method = method
+
+        union_polygons: list[list[tuple[float, float]]] = []
+        if scope == "selected":
+            union_polygons = [self._active_mask_polygon()] if self._active_mask_polygon() is not None else []
+        elif mask_indices:
+            try:
+                from shapely.geometry import Polygon
+                from shapely.ops import unary_union
+            except Exception:  # noqa: BLE001
+                messagebox.showerror(
+                    "KOF Viewer",
+                    "Union mask scope requires shapely. Install it with:\n  pip install shapely",
                 )
+                return
+
+            geoms = []
+            for idx in mask_indices:
+                vertices = self._masks[idx].vertices
+                if len(vertices) < 3:
+                    continue
+                poly = Polygon(vertices)
+                if not poly.is_valid:
+                    poly = poly.buffer(0)
+                if not poly.is_empty:
+                    geoms.append(poly)
+            if geoms:
+                union_geom = unary_union(geoms)
+                union_polygons = self._polygon_from_geom(union_geom)
+            if method == "triangles" and union_polygons:
+                effective_method = "raster"
+                messagebox.showwarning(
+                    "KOF Viewer",
+                    "Mask union currently runs with raster method; switched from triangles for this computation.",
+                )
+
+        mask_compute_polygons = [p for p in union_polygons if p is not None and len(p) >= 3]
+        if scope != "selected" and mask_indices and not mask_compute_polygons:
+            messagebox.showerror(
+                "KOF Viewer",
+                "Could not build a valid union polygon from selected masks.",
+            )
+            return
+
+        try:
+            if not mask_compute_polygons:
+                result = self._compute_volume_for_mask(
+                    top_surface,
+                    bottom_surface,
+                    intermediate_surface,
+                    mask_polygon=None,
+                    method=effective_method,
+                )
+            else:
+                partial_results: list[VolumeResult | SplitVolumeResult] = []
+                for poly in mask_compute_polygons:
+                    partial = self._compute_volume_for_mask(
+                        top_surface,
+                        bottom_surface,
+                        intermediate_surface,
+                        mask_polygon=poly,
+                        method=effective_method,
+                    )
+                    if partial is not None:
+                        partial_results.append(partial)
+                result = self._combine_volume_results(partial_results)
+
+            if mask_indices:
+                for idx in mask_indices:
+                    mask = self._masks[idx]
+                    mask_result = self._compute_volume_for_mask(
+                        top_surface,
+                        bottom_surface,
+                        intermediate_surface,
+                        mask_polygon=list(mask.vertices),
+                        method=effective_method,
+                    )
+                    if mask_result is None:
+                        per_mask_rows.append(f"- {mask.name}: no overlap")
+                        per_mask_result_rows.append(
+                            {
+                                "mask_name": mask.name,
+                                "area_m2": "",
+                                "net_m3": "",
+                                "cut_m3": "",
+                                "fill_m3": "",
+                                "status": "no overlap",
+                            }
+                        )
+                        continue
+                    if isinstance(mask_result, SplitVolumeResult):
+                        area_m2 = float(mask_result.upper.area)
+                        net_m3 = float(mask_result.net)
+                        cut_m3 = float(mask_result.cut)
+                        fill_m3 = float(mask_result.fill)
+                        per_mask_rows.append(
+                            f"- {mask.name}: area {area_m2:,.1f} m2 | "
+                            f"net {net_m3:+,.2f} m3"
+                        )
+                        per_mask_result_rows.append(
+                            {
+                                "mask_name": mask.name,
+                                "area_m2": f"{area_m2:.6f}",
+                                "net_m3": f"{net_m3:.6f}",
+                                "cut_m3": f"{cut_m3:.6f}",
+                                "fill_m3": f"{fill_m3:.6f}",
+                                "status": "ok",
+                            }
+                        )
+                    else:
+                        area_m2 = float(mask_result.area)
+                        net_m3 = float(mask_result.net)
+                        cut_m3 = float(mask_result.cut)
+                        fill_m3 = float(mask_result.fill)
+                        per_mask_rows.append(
+                            f"- {mask.name}: area {area_m2:,.1f} m2 | "
+                            f"net {net_m3:+,.2f} m3 | cut {cut_m3:,.2f} | fill {fill_m3:,.2f}"
+                        )
+                        per_mask_result_rows.append(
+                            {
+                                "mask_name": mask.name,
+                                "area_m2": f"{area_m2:.6f}",
+                                "net_m3": f"{net_m3:.6f}",
+                                "cut_m3": f"{cut_m3:.6f}",
+                                "fill_m3": f"{fill_m3:.6f}",
+                                "status": "ok",
+                            }
+                        )
         except ValueError as exc:
             messagebox.showerror("KOF Viewer", str(exc))
             return
@@ -2074,20 +3030,55 @@ class KOFViewer(tk.Tk):
             )
             return
         self.last_volume = result
-        mask_suffix = " (masked)" if mask_poly is not None else ""
+        self._last_volume_per_mask_rows = list(per_mask_rows)
+        if not per_mask_result_rows:
+            if isinstance(result, SplitVolumeResult):
+                per_mask_result_rows.append(
+                    {
+                        "mask_name": "(no mask)",
+                        "area_m2": f"{float(result.upper.area):.6f}",
+                        "net_m3": f"{float(result.net):.6f}",
+                        "cut_m3": f"{float(result.cut):.6f}",
+                        "fill_m3": f"{float(result.fill):.6f}",
+                        "status": "overall",
+                    }
+                )
+            else:
+                per_mask_result_rows.append(
+                    {
+                        "mask_name": "(no mask)",
+                        "area_m2": f"{float(result.area):.6f}",
+                        "net_m3": f"{float(result.net):.6f}",
+                        "cut_m3": f"{float(result.cut):.6f}",
+                        "fill_m3": f"{float(result.fill):.6f}",
+                        "status": "overall",
+                    }
+                )
+        self._last_mask_volume_results = list(per_mask_result_rows)
+        self._refresh_mask_result_actions()
+        mask_suffix = ""
+        if scope == "selected":
+            active = self._active_mask()
+            if active is not None:
+                mask_suffix = f" (mask: {active.name})"
+        elif mask_indices:
+            mask_suffix = f" (scope: {scope_label}, masks: {len(mask_indices)})"
         if isinstance(result, SplitVolumeResult):
             upper = result.upper
             lower = result.lower
-            self.volume_text.set(
-                f"{mode}/{method} split: {upper.top_name}-{upper.bottom_name} "
+            summary = (
+                f"{mode}/{effective_method} split: {upper.top_name}-{upper.bottom_name} "
                 f"Net {upper.net:+,.2f} m³; {lower.top_name}-{lower.bottom_name} "
                 f"Net {lower.net:+,.2f} m³; Total {result.net:+,.2f} m³{mask_suffix}"
             )
         else:
-            self.volume_text.set(
-                f"{mode}/{method}: Net {result.net:+,.2f} m³   (Cut {result.cut:,.2f} / "
+            summary = (
+                f"{mode}/{effective_method}: Net {result.net:+,.2f} m³   (Cut {result.cut:,.2f} / "
                 f"Fill {result.fill:,.2f})   over {result.area:,.1f} m²{mask_suffix}"
             )
+        if per_mask_rows:
+            summary = summary + "\n" + "\n".join(per_mask_rows)
+        self.volume_text.set(summary)
         if self.show_triangulation.get():
             self._redraw()
 
@@ -2103,10 +3094,75 @@ class KOFViewer(tk.Tk):
             self.volume_text.set("Volume: (stale – recompute)")
         self._redraw()
 
+    def _cleanup_section_windows(self) -> None:
+        self._section_windows = [w for w in self._section_windows if w.winfo_exists()]
+
+    def _close_section_windows(self) -> None:
+        self._cleanup_section_windows()
+        for win in self._section_windows:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        self._section_windows.clear()
+
+    def _open_section_window_at_index(
+        self,
+        index: int,
+        *,
+        top: SurfaceLike,
+        bottom: SurfaceLike,
+    ) -> None:
+        if index < 0 or index >= len(self._sections):
+            return
+        (y0, x0), (y1, x1) = self._sections[index]
+        section_intermediate = self._section_intermediate_surface()
+        area_top_surface, area_bottom_surface, area_top_name, area_bottom_name = self._section_area_pair(top, bottom)
+        window = SectionWindow(
+            self,
+            top,
+            bottom,
+            (y0, x0),
+            (y1, x1),
+            raster_surface=self._section_reference_raster(),
+            intermediate_surface=section_intermediate,
+            area_top_surface=area_top_surface,
+            area_bottom_surface=area_bottom_surface,
+            area_top_name=area_top_name,
+            area_bottom_name=area_bottom_name,
+            label=self._section_label(index),
+        )
+        self._section_windows.append(window)
+
+    def _on_update_sections(self) -> None:
+        if not self._sections:
+            messagebox.showinfo("KOF Viewer", "No section lines available to update.")
+            return
+
+        top = self._find_file(self.top_var.get())
+        bot = self._find_file(self.bottom_var.get())
+        if top is None or bot is None:
+            messagebox.showwarning("KOF Viewer", "Select both top and bottom surfaces first.")
+            return
+        if top is bot:
+            messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
+            return
+
+        self._close_section_windows()
+        for idx in range(len(self._sections)):
+            self._open_section_window_at_index(idx, top=top, bottom=bot)
+
+        messagebox.showinfo(
+            "KOF Viewer",
+            f"Updated {len(self._sections)} section window(s) with current settings.",
+        )
+
     # --------------------------------------------------------- Section tool
     def _on_toggle_section(self) -> None:
         if self._mask_mode:
             self._end_mask_mode()
+        if self._measure_mode:
+            self._end_measure_mode()
         if self._section_mode:
             self._end_section_mode()
             return
@@ -2170,27 +3226,181 @@ class KOFViewer(tk.Tk):
         self._end_section_mode()
         self._redraw_2d()  # draw the persisted section (and clear preview)
         if top is not None and bot is not None:
-            section_intermediate = self._section_intermediate_surface()
-            area_top_surface, area_bottom_surface, area_top_name, area_bottom_name = self._section_area_pair(top, bot)
-            SectionWindow(
-                self,
-                top,
-                bot,
-                (y0, x0),
-                (y1, x1),
-                raster_surface=self._section_reference_raster(),
-                intermediate_surface=section_intermediate,
-                area_top_surface=area_top_surface,
-                area_bottom_surface=area_bottom_surface,
-                area_top_name=area_top_name,
-                area_bottom_name=area_bottom_name,
-                label=self._section_label(len(self._sections) - 1),
+            self._open_section_window_at_index(len(self._sections) - 1, top=top, bottom=bot)
+
+    # ------------------------------------------------------------ Measure tool
+    def _current_measure_mode_key(self) -> str:
+        raw = self.measure_mode.get().strip()
+        if raw in MEASURE_LABEL_TO_MODE:
+            return MEASURE_LABEL_TO_MODE[raw]
+        key = raw.lower()
+        if key in MEASURE_MODE_LABELS:
+            return key
+        return "line"
+
+    @staticmethod
+    def _measure_line_length(p0: tuple[float, float], p1: tuple[float, float]) -> float:
+        return float(np.hypot(p1[0] - p0[0], p1[1] - p0[1]))
+
+    @staticmethod
+    def _measure_polygon_perimeter(points: list[tuple[float, float]]) -> float:
+        if len(points) < 2:
+            return 0.0
+        arr = np.asarray(points, dtype=float)
+        closed = np.vstack([arr, arr[0]])
+        seg = closed[1:] - closed[:-1]
+        return float(np.hypot(seg[:, 0], seg[:, 1]).sum())
+
+    @staticmethod
+    def _measure_polygon_area(points: list[tuple[float, float]]) -> float:
+        if len(points) < 3:
+            return 0.0
+        arr = np.asarray(points, dtype=float)
+        ys = arr[:, 0]
+        xs = arr[:, 1]
+        return float(abs(np.dot(ys, np.roll(xs, -1)) - np.dot(xs, np.roll(ys, -1))) * 0.5)
+
+    @staticmethod
+    def _measurement_label(index: int) -> str:
+        return f"Meas {index + 1}"
+
+    def _on_toggle_measure(self) -> None:
+        if self._section_mode:
+            self._end_section_mode()
+        if self._mask_mode:
+            self._end_mask_mode()
+        if self._mask_edit_mode:
+            self._end_mask_edit_mode()
+        if self._measure_mode:
+            self._end_measure_mode()
+            self._redraw_2d()
+            return
+
+        self._measure_mode = True
+        self._measure_click_points = []
+        self.measure_btn.configure(text="Cancel measure")
+        if hasattr(self, "measure_toggle_btn"):
+            self.measure_toggle_btn.configure(text="Cancel measure")
+        self.notebook.select(0)
+        mode = self._current_measure_mode_key()
+        if mode == "polygon":
+            self.status.set(
+                "Measure polygon: left-click vertices, then right-click or double-click to close. Esc to cancel."
             )
+        else:
+            self.status.set(
+                "Measure line: click two points on the 2D plot. Right-click or Esc to cancel."
+            )
+        self._measure_cid = self.canvas2d.mpl_connect("button_press_event", self._on_measure_click)
+        self.bind("<Escape>", lambda _e: self._cancel_measure_mode())
+
+    def _cancel_measure_mode(self) -> None:
+        self._measure_click_points = []
+        self._end_measure_mode()
+        self._redraw_2d()
+
+    def _end_measure_mode(self) -> None:
+        self._measure_mode = False
+        if self._measure_cid is not None:
+            self.canvas2d.mpl_disconnect(self._measure_cid)
+            self._measure_cid = None
+        self.measure_btn.configure(text="Measure")
+        if hasattr(self, "measure_toggle_btn"):
+            self.measure_toggle_btn.configure(text="Start measure")
+        self.unbind("<Escape>")
+        self._measure_click_points = []
+        self._update_status()
+
+    def _finalize_line_measure(self, points: list[tuple[float, float]]) -> None:
+        if len(points) != 2:
+            return
+        length_m = self._measure_line_length(points[0], points[1])
+        self._measure_results.append(
+            {
+                "kind": "line",
+                "points": [points[0], points[1]],
+                "length_m": length_m,
+            }
+        )
+        label = self._measurement_label(len(self._measure_results) - 1)
+        self._end_measure_mode()
+        self._redraw_2d()
+        self.status.set(f"{label}: distance {length_m:,.2f} m")
+
+    def _finalize_polygon_measure(self, points: list[tuple[float, float]]) -> None:
+        if len(points) < 3:
+            return
+        area_m2 = self._measure_polygon_area(points)
+        perimeter_m = self._measure_polygon_perimeter(points)
+        self._measure_results.append(
+            {
+                "kind": "polygon",
+                "points": list(points),
+                "area_m2": area_m2,
+                "perimeter_m": perimeter_m,
+            }
+        )
+        label = self._measurement_label(len(self._measure_results) - 1)
+        self._end_measure_mode()
+        self._redraw_2d()
+        self.status.set(f"{label}: area {area_m2:,.2f} m2, perimeter {perimeter_m:,.2f} m")
+
+    def _on_measure_click(self, event) -> None:  # noqa: ANN001
+        if event.inaxes is not self.ax2d:
+            return
+        mode = self._current_measure_mode_key()
+
+        if event.button == 3:
+            if mode == "polygon" and len(self._measure_click_points) >= 3:
+                self._finalize_polygon_measure(self._measure_click_points)
+            else:
+                self._cancel_measure_mode()
+            return
+
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        self._measure_click_points.append((float(event.xdata), float(event.ydata)))
+
+        if mode == "line":
+            if len(self._measure_click_points) == 1:
+                self.status.set("Measure line: click second point.")
+                self._redraw_2d()
+                return
+            self._finalize_line_measure(self._measure_click_points[:2])
+            return
+
+        if event.dblclick and len(self._measure_click_points) >= 3:
+            self._finalize_polygon_measure(self._measure_click_points)
+            return
+
+        self.status.set(
+            f"Measure polygon: {len(self._measure_click_points)} vertex/vertices. "
+            "Left-click to add more, right-click or double-click to close."
+        )
+        self._redraw_2d()
+
+    def _on_clear_measurements(self) -> None:
+        had_data = bool(self._measure_results)
+        self._measure_results.clear()
+        self._measure_click_points.clear()
+        if self._measure_mode:
+            self._end_measure_mode()
+        if had_data:
+            self._redraw_2d()
+        else:
+            self._update_status()
 
     # ----------------------------------------------------------- Polygon mask
     def _on_toggle_mask(self) -> None:
         if self._section_mode:
             self._end_section_mode()
+        if self._measure_mode:
+            self._end_measure_mode()
+        if self._mask_edit_mode:
+            self._end_mask_edit_mode()
         if self._mask_mode:
             self._end_mask_mode()
             self._redraw_2d()
@@ -2223,13 +3433,20 @@ class KOFViewer(tk.Tk):
         self._update_status()
 
     def _on_clear_mask(self) -> None:
-        had_mask = len(self._mask_polygon) >= 3
-        self._mask_polygon.clear()
+        had_mask = bool(self._masks)
+        self._masks.clear()
+        self._mask_visibility_vars.clear()
+        self._clear_cached_mask_volume_results()
+        self._active_mask_index = None
+        self.active_mask_var.set("")
         self._mask_click_points.clear()
         if self._mask_mode:
             self._end_mask_mode()
+        if self._mask_edit_mode:
+            self._end_mask_edit_mode()
         if had_mask and self.last_volume is not None:
             self.volume_text.set("Volume: (stale – recompute)")
+        self._refresh_mask_controls()
         self._redraw()
 
     def _on_mask_click(self, event) -> None:  # noqa: ANN001
@@ -2237,11 +3454,12 @@ class KOFViewer(tk.Tk):
             return
         if event.button == 3:  # right-click finalizes, if possible
             if len(self._mask_click_points) >= 3:
-                self._mask_polygon = list(self._mask_click_points)
+                self._append_mask(self._mask_click_points)
                 self._mask_click_points = []
                 self._end_mask_mode()
                 if self.last_volume is not None:
                     self.volume_text.set("Volume: (stale – recompute)")
+                self._refresh_mask_controls()
                 self._redraw()
             else:
                 self._cancel_mask_mode()
@@ -2253,11 +3471,12 @@ class KOFViewer(tk.Tk):
 
         self._mask_click_points.append((event.xdata, event.ydata))
         if event.dblclick and len(self._mask_click_points) >= 3:
-            self._mask_polygon = list(self._mask_click_points)
+            self._append_mask(self._mask_click_points)
             self._mask_click_points = []
             self._end_mask_mode()
             if self.last_volume is not None:
                 self.volume_text.set("Volume: (stale – recompute)")
+            self._refresh_mask_controls()
             self._redraw()
             return
 
@@ -2266,6 +3485,190 @@ class KOFViewer(tk.Tk):
             "Left-click to add more, right-click or double-click to close."
         )
         self._redraw_2d()
+
+    def _mask_pick_tolerance(self) -> float:
+        xmin, xmax = self.ax2d.get_xlim()
+        ymin, ymax = self.ax2d.get_ylim()
+        span = max(abs(xmax - xmin), abs(ymax - ymin), 1e-9)
+        return span * 0.015
+
+    def _pick_vertex_index(
+        self,
+        vertices: list[tuple[float, float]],
+        point: tuple[float, float],
+    ) -> Optional[int]:
+        if not vertices:
+            return None
+        py, px = point
+        arr = np.asarray(vertices, dtype=float)
+        d2 = (arr[:, 0] - py) ** 2 + (arr[:, 1] - px) ** 2
+        idx = int(np.argmin(d2))
+        tol = self._mask_pick_tolerance()
+        if float(d2[idx]) <= tol * tol:
+            return idx
+        return None
+
+    def _on_toggle_mask_edit(self) -> None:
+        if self._section_mode:
+            self._end_section_mode()
+        if self._measure_mode:
+            self._end_measure_mode()
+        if self._mask_mode:
+            self._end_mask_mode()
+        if self._mask_edit_mode:
+            self._end_mask_edit_mode()
+            self._redraw_2d()
+            return
+
+        active = self._active_mask()
+        if active is None or len(active.vertices) < 3:
+            messagebox.showinfo("KOF Viewer", "Select a closed mask before editing.")
+            return
+
+        self._mask_edit_mode = True
+        self._mask_drag_vertex_index = None
+        self._mask_changed_since_last_compute = False
+        self.mask_edit_btn.configure(text="Finish mask edit")
+        self.notebook.select(0)
+        self.status.set(
+            "Mask edit: drag vertices on selected mask. Right-click or Esc to finish."
+        )
+        self._mask_edit_press_cid = self.canvas2d.mpl_connect("button_press_event", self._on_mask_edit_press)
+        self._mask_edit_motion_cid = self.canvas2d.mpl_connect("motion_notify_event", self._on_mask_edit_motion)
+        self._mask_edit_release_cid = self.canvas2d.mpl_connect("button_release_event", self._on_mask_edit_release)
+        self.bind("<Escape>", lambda _e: self._end_mask_edit_mode())
+
+    def _end_mask_edit_mode(self) -> None:
+        self._mask_edit_mode = False
+        if self._mask_edit_press_cid is not None:
+            self.canvas2d.mpl_disconnect(self._mask_edit_press_cid)
+            self._mask_edit_press_cid = None
+        if self._mask_edit_motion_cid is not None:
+            self.canvas2d.mpl_disconnect(self._mask_edit_motion_cid)
+            self._mask_edit_motion_cid = None
+        if self._mask_edit_release_cid is not None:
+            self.canvas2d.mpl_disconnect(self._mask_edit_release_cid)
+            self._mask_edit_release_cid = None
+        self._mask_drag_vertex_index = None
+        self.mask_edit_btn.configure(text="Edit selected mask")
+        self.unbind("<Escape>")
+        if self._mask_changed_since_last_compute and self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._mask_changed_since_last_compute = False
+        self._update_status()
+
+    def _on_mask_edit_press(self, event) -> None:  # noqa: ANN001
+        if not self._mask_edit_mode or event.inaxes is not self.ax2d:
+            return
+        if event.button == 3:
+            self._end_mask_edit_mode()
+            self._redraw_2d()
+            return
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        active = self._active_mask()
+        if active is None:
+            return
+        idx = self._pick_vertex_index(active.vertices, (event.xdata, event.ydata))
+        if idx is not None:
+            self._mask_drag_vertex_index = idx
+
+    def _on_mask_edit_motion(self, event) -> None:  # noqa: ANN001
+        if not self._mask_edit_mode:
+            return
+        idx = self._mask_drag_vertex_index
+        if idx is None:
+            return
+        if event.inaxes is not self.ax2d or event.xdata is None or event.ydata is None:
+            return
+        active = self._active_mask()
+        if active is None or idx < 0 or idx >= len(active.vertices):
+            return
+        active.vertices[idx] = (float(event.xdata), float(event.ydata))
+        self._clear_cached_mask_volume_results()
+        self._mask_changed_since_last_compute = True
+        self._redraw_2d()
+
+    def _on_mask_edit_release(self, event) -> None:  # noqa: ANN001
+        if not self._mask_edit_mode:
+            return
+        if event.button == 1:
+            self._mask_drag_vertex_index = None
+
+    def _on_delete_selected_mask(self) -> None:
+        idx = self._active_mask_index
+        if idx is None or idx < 0 or idx >= len(self._masks):
+            return
+        if self._mask_mode:
+            self._end_mask_mode()
+        del self._masks[idx]
+        if idx < len(self._mask_visibility_vars):
+            del self._mask_visibility_vars[idx]
+        self._clear_cached_mask_volume_results()
+        if self._mask_edit_mode:
+            self._end_mask_edit_mode()
+        if not self._masks:
+            self._set_active_mask_index(None)
+        else:
+            self._set_active_mask_index(min(idx, len(self._masks) - 1))
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._refresh_mask_controls()
+        self._redraw()
+
+    def _on_buffer_selected_mask(self) -> None:
+        active = self._active_mask()
+        if active is None or len(active.vertices) < 3:
+            messagebox.showinfo("KOF Viewer", "Select a closed mask first.")
+            return
+
+        distance = simpledialog.askfloat(
+            "Buffer mask",
+            "Buffer distance in meters (positive expands, negative shrinks):",
+            initialvalue=1.0,
+        )
+        if distance is None:
+            return
+        if not np.isfinite(distance) or abs(distance) < 1e-12:
+            messagebox.showwarning("KOF Viewer", "Enter a non-zero finite buffer distance.")
+            return
+
+        try:
+            from shapely.geometry import Polygon
+        except Exception:  # noqa: BLE001
+            messagebox.showerror(
+                "KOF Viewer",
+                "Mask buffering requires shapely. Install it with:\n  pip install shapely",
+            )
+            return
+
+        polygon = Polygon(active.vertices)
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+        if polygon.is_empty:
+            messagebox.showerror("KOF Viewer", "Selected mask polygon is invalid and could not be fixed.")
+            return
+
+        buffered = polygon.buffer(float(distance))
+        if buffered.is_empty:
+            messagebox.showerror("KOF Viewer", "Buffer distance removed the mask entirely.")
+            return
+
+        if buffered.geom_type == "MultiPolygon":
+            buffered = max(buffered.geoms, key=lambda g: g.area)
+
+        coords = [(float(y), float(x)) for y, x in buffered.exterior.coords[:-1]]
+        if len(coords) < 3:
+            messagebox.showerror("KOF Viewer", "Buffered mask is not a valid polygon.")
+            return
+
+        self._append_mask(coords, name=f"{active.name} (buffer {distance:+.2f} m)")
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._refresh_mask_controls()
+        self._redraw()
 
     @staticmethod
     def _section_label(index: int) -> str:
@@ -2422,16 +3825,31 @@ class KOFViewer(tk.Tk):
                 xytext=(6, 6), textcoords="offset points", zorder=7,
             )
 
-        # Active polygon mask.
-        if len(self._mask_polygon) >= 3:
-            arr = np.asarray(self._mask_polygon, dtype=float)
+        # Persisted masks (active one highlighted).
+        for idx, mask in enumerate(self._masks):
+            if not self._mask_is_visible(idx):
+                continue
+            if len(mask.vertices) < 3:
+                continue
+            arr = np.asarray(mask.vertices, dtype=float)
             closed = np.vstack([arr, arr[0]])
-            self.ax2d.fill(closed[:, 0], closed[:, 1],
-                           color="#ffbf00", alpha=0.15, zorder=8)
-            self.ax2d.plot(closed[:, 0], closed[:, 1], "-", color="#cc8a00",
-                           linewidth=1.8, zorder=9)
-            self.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#cc8a00",
-                           markersize=4, zorder=10)
+            is_active = idx == self._active_mask_index
+            fill_alpha = 0.20 if is_active else 0.10
+            edge_width = 2.4 if is_active else 1.2
+            color = FILE_COLORS[idx % len(FILE_COLORS)]
+            self.ax2d.fill(closed[:, 0], closed[:, 1], color=color, alpha=fill_alpha, zorder=8)
+            self.ax2d.plot(closed[:, 0], closed[:, 1], "-", color=color, linewidth=edge_width, zorder=9)
+            self.ax2d.plot(arr[:, 0], arr[:, 1], "o", color=color, markersize=4, zorder=10)
+            self.ax2d.annotate(
+                mask.name,
+                (arr[0, 0], arr[0, 1]),
+                fontsize=8,
+                color=color,
+                xytext=(6, 6),
+                textcoords="offset points",
+                fontweight="bold" if is_active else "normal",
+                zorder=11,
+            )
 
         # In-progress polygon while mask mode is active.
         if self._mask_mode and self._mask_click_points:
@@ -2443,6 +3861,59 @@ class KOFViewer(tk.Tk):
             if len(arr) >= 2:
                 self.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]],
                                ":", color="#cc8a00", linewidth=1.0, zorder=11)
+
+        # Persisted measurement overlays.
+        for idx, item in enumerate(self._measure_results):
+            kind = item.get("kind", "")
+            points = item.get("points", [])
+            if not isinstance(points, list) or len(points) < 2:
+                continue
+            arr = np.asarray(points, dtype=float)
+            label = self._measurement_label(idx)
+            color = "#0b7285"
+
+            if kind == "line" and len(arr) >= 2:
+                p0 = arr[0]
+                p1 = arr[1]
+                self.ax2d.plot([p0[0], p1[0]], [p0[1], p1[1]], "-", color=color, linewidth=1.8, zorder=12)
+                self.ax2d.plot([p0[0], p1[0]], [p0[1], p1[1]], "o", color=color, markersize=4, zorder=13)
+                mid = (0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1]))
+                dist = float(item.get("length_m", self._measure_line_length((p0[0], p0[1]), (p1[0], p1[1]))))
+                self.ax2d.annotate(
+                    f"{label}: {dist:,.2f} m",
+                    mid,
+                    fontsize=8,
+                    color=color,
+                    xytext=(6, 6),
+                    textcoords="offset points",
+                    zorder=14,
+                )
+            elif kind == "polygon" and len(arr) >= 3:
+                closed = np.vstack([arr, arr[0]])
+                self.ax2d.fill(closed[:, 0], closed[:, 1], color=color, alpha=0.10, zorder=11)
+                self.ax2d.plot(closed[:, 0], closed[:, 1], "-", color=color, linewidth=1.6, zorder=12)
+                self.ax2d.plot(arr[:, 0], arr[:, 1], "o", color=color, markersize=3.5, zorder=13)
+                area = float(item.get("area_m2", self._measure_polygon_area([(float(p[0]), float(p[1])) for p in arr])))
+                peri = float(item.get("perimeter_m", self._measure_polygon_perimeter([(float(p[0]), float(p[1])) for p in arr])))
+                center = (float(np.mean(arr[:, 0])), float(np.mean(arr[:, 1])))
+                self.ax2d.annotate(
+                    f"{label}: {area:,.2f} m2 | {peri:,.2f} m",
+                    center,
+                    fontsize=8,
+                    color=color,
+                    xytext=(6, 6),
+                    textcoords="offset points",
+                    zorder=14,
+                )
+
+        # In-progress measurement while measure mode is active.
+        if self._measure_mode and self._measure_click_points:
+            arr = np.asarray(self._measure_click_points, dtype=float)
+            kind = self._current_measure_mode_key()
+            self.ax2d.plot(arr[:, 0], arr[:, 1], "--", color="#0b7285", linewidth=1.4, zorder=14)
+            self.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#0b7285", markersize=4, zorder=15)
+            if kind == "polygon" and len(arr) >= 2:
+                self.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]], ":", color="#0b7285", linewidth=1.0, zorder=14)
 
         if self.files or self.landxml_files:
             self.ax2d.legend(loc="best", fontsize=8)
@@ -2548,6 +4019,10 @@ class KOFViewer(tk.Tk):
             return
         if self._mask_mode:
             return
+        if self._mask_edit_mode:
+            return
+        if self._measure_mode:
+            return
         if not self.files and not self.landxml_files:
             self.status.set("No file loaded.")
             return
@@ -2575,8 +4050,16 @@ class KOFViewer(tk.Tk):
             f"{len(self.files)} surface layer(s), {total_points} points, "
             f"{total_blocks} primitives   |   " + "  ·  ".join(parts)
         )
-        if len(self._mask_polygon) >= 3:
-            base += f"   |   mask: {len(self._mask_polygon)} vertices"
+        if self._masks:
+            active = self._active_mask()
+            n_visible_masks = sum(1 for i in range(len(self._masks)) if self._mask_is_visible(i))
+            if active is not None:
+                base += (
+                    f"   |   masks: {len(self._masks)} ({n_visible_masks} visible, "
+                    f"active: {active.name}, {len(active.vertices)} vertices)"
+                )
+            else:
+                base += f"   |   masks: {len(self._masks)} ({n_visible_masks} visible)"
         if self._raster_layers:
             state = "on" if self.show_raster.get() else "off"
             n_visible = sum(1 for r in self._raster_layers if r.visible.get())
@@ -2587,6 +4070,10 @@ class KOFViewer(tk.Tk):
                 f"   |   rasters: {len(self._raster_layers)} ({n_visible} visible, {state})"
                 f"   |   elevation raster: {elev_name}"
             )
+        if self._measure_results:
+            n_line = sum(1 for m in self._measure_results if m.get("kind") == "line")
+            n_poly = sum(1 for m in self._measure_results if m.get("kind") == "polygon")
+            base += f"   |   measurements: {len(self._measure_results)} ({n_line} line, {n_poly} polygon)"
         self.status.set(base)
 
 
@@ -2733,7 +4220,17 @@ class SectionWindow(tk.Toplevel):
                                     color="#d62728", alpha=0.25,
                                     label=f"Fill ({area_top_label} < {area_bottom_label})")
 
-        ax.set_xlabel("Distance along section (m)")
+        center_dist = 0.5 * total_len
+        ax.axvline(
+            center_dist,
+            color="#444444",
+            linestyle="--",
+            linewidth=1.1,
+            alpha=0.85,
+            label="Centerline",
+        )
+
+        ax.set_xlabel("Distance along section (m) [Left -> Right, looking toward higher station]")
         ax.set_ylabel("Elevation (m)")
         ax.grid(True, linestyle=":", alpha=0.5)
         ax.legend(loc="best", fontsize=8)
@@ -2753,11 +4250,162 @@ class SectionWindow(tk.Toplevel):
             text=(
                 f"From ({x0:,.2f} N, {y0:,.2f} E) "
                 f"to ({x1:,.2f} N, {y1:,.2f} E)   "
-                f"length={total_len:,.2f} m, {n_samples} samples"
+                f"length={total_len:,.2f} m, {n_samples} samples   "
+                "(axis: left -> right when facing higher station)"
             ),
             anchor=tk.W, padding=(8, 2),
         )
         info.pack(side=tk.BOTTOM, fill=tk.X)
+
+
+class MaskVolumeResultsWindow(tk.Toplevel):
+    """Toplevel table view for per-mask volume summary rows."""
+
+    @staticmethod
+    def _fmt_num(raw: Any, *, signed: bool = False) -> str:
+        if raw in (None, ""):
+            return ""
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return str(raw)
+        if signed:
+            return f"{val:+,.2f}"
+        return f"{val:,.2f}"
+
+    @staticmethod
+    def _as_float(raw: Any) -> Optional[float]:
+        if raw in (None, ""):
+            return None
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _soften_hex_color(hex_color: str, *, strength: float = 0.88) -> str:
+        """Blend a hex color toward white so it works as a table row background."""
+        h = (hex_color or "").strip().lstrip("#")
+        if len(h) != 6:
+            return "#f5f5f5"
+        try:
+            r = int(h[0:2], 16)
+            g = int(h[2:4], 16)
+            b = int(h[4:6], 16)
+        except ValueError:
+            return "#f5f5f5"
+
+        t = min(max(float(strength), 0.0), 1.0)
+        rr = int(round(r + (255 - r) * t))
+        gg = int(round(g + (255 - g) * t))
+        bb = int(round(b + (255 - b) * t))
+        return f"#{rr:02x}{gg:02x}{bb:02x}"
+
+    def __init__(self, master: tk.Misc, rows: list[dict[str, Any]]) -> None:
+        super().__init__(master)
+        self.title("Per-mask volume summary")
+        self.geometry("860x420")
+
+        frame = ttk.Frame(self, padding=8)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = ("mask", "area", "net", "cut", "fill", "status")
+        tree = ttk.Treeview(frame, columns=columns, show="headings", height=14)
+        tree.heading("mask", text="Mask")
+        tree.heading("area", text="Area (m2)")
+        tree.heading("net", text="Net (m3)")
+        tree.heading("cut", text="Cut (m3)")
+        tree.heading("fill", text="Fill (m3)")
+        tree.heading("status", text="Status")
+
+        tree.column("mask", width=220, anchor=tk.W)
+        tree.column("area", width=110, anchor=tk.E)
+        tree.column("net", width=110, anchor=tk.E)
+        tree.column("cut", width=110, anchor=tk.E)
+        tree.column("fill", width=110, anchor=tk.E)
+        tree.column("status", width=120, anchor=tk.W)
+
+        y_scroll = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=y_scroll.set)
+
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        y_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+
+        totals = {
+            "area_m2": 0.0,
+            "net_m3": 0.0,
+            "cut_m3": 0.0,
+            "fill_m3": 0.0,
+        }
+        has_numeric_values = False
+
+        for idx, row in enumerate(rows):
+            base_color = FILE_COLORS[idx % len(FILE_COLORS)]
+            tag_name = f"mask_row_{idx}"
+            tree.tag_configure(tag_name, background=self._soften_hex_color(base_color), foreground="#202020")
+
+            area_raw = row.get("area_m2", "")
+            net_raw = row.get("net_m3", "")
+            cut_raw = row.get("cut_m3", "")
+            fill_raw = row.get("fill_m3", "")
+
+            area_val = self._as_float(area_raw)
+            net_val = self._as_float(net_raw)
+            cut_val = self._as_float(cut_raw)
+            fill_val = self._as_float(fill_raw)
+
+            if area_val is not None:
+                totals["area_m2"] += area_val
+                has_numeric_values = True
+            if net_val is not None:
+                totals["net_m3"] += net_val
+                has_numeric_values = True
+            if cut_val is not None:
+                totals["cut_m3"] += cut_val
+                has_numeric_values = True
+            if fill_val is not None:
+                totals["fill_m3"] += fill_val
+                has_numeric_values = True
+
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    row.get("mask_name", ""),
+                    self._fmt_num(area_raw),
+                    self._fmt_num(net_raw, signed=True),
+                    self._fmt_num(cut_raw),
+                    self._fmt_num(fill_raw),
+                    row.get("status", ""),
+                ),
+                tags=(tag_name,),
+            )
+
+        if has_numeric_values:
+            total_font = tkfont.nametofont("TkDefaultFont").copy()
+            total_font.configure(weight="bold")
+            tree.tag_configure("grand_total", background="#dfeaf5", foreground="#102030", font=total_font)
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    "Grand total",
+                    self._fmt_num(totals["area_m2"]),
+                    self._fmt_num(totals["net_m3"], signed=True),
+                    self._fmt_num(totals["cut_m3"]),
+                    self._fmt_num(totals["fill_m3"]),
+                    "sum",
+                ),
+                tags=("grand_total",),
+            )
+
+        footer = ttk.Label(
+            self,
+            text=f"Rows: {len(rows)} (+ total)",
+            anchor=tk.W,
+            padding=(8, 2),
+        )
+        footer.pack(side=tk.BOTTOM, fill=tk.X)
 
 
 # ---------------------------------------------------------------------------
