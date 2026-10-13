@@ -243,6 +243,8 @@ class KOFViewer(tk.Tk):
         self._section_preview = None  # transient Line2D while drawing
         self._sections: list[tuple[tuple[float, float], tuple[float, float]]] = []
         self._section_windows: list[tk.Toplevel] = []
+        self._active_section_marker_index: Optional[int] = None
+        self._active_section_marker_chainage_m: Optional[float] = None
 
         # Polygon mask state for volume limitation in 2D.
         self._mask_mode = False
@@ -1049,6 +1051,7 @@ class KOFViewer(tk.Tk):
         self._measure_results.clear()
         self._measure_click_points.clear()
         self._sections.clear()
+        self._clear_active_section_marker(redraw=False)
         self._masks.clear()
         self._mask_visibility_vars.clear()
         self._last_volume_per_mask_rows.clear()
@@ -1394,6 +1397,7 @@ class KOFViewer(tk.Tk):
 
         self._close_section_windows()
         self._sections = list(sections)
+        self._clear_active_section_marker(redraw=False)
         self._redraw()
 
     def _on_save_project(self) -> None:
@@ -1509,6 +1513,7 @@ class KOFViewer(tk.Tk):
         self._surface_source_paths.clear()
         self._landxml_group_vars.clear()
         self._sections.clear()
+        self._clear_active_section_marker(redraw=False)
         self._measure_results.clear()
         self._measure_click_points.clear()
         self._masks.clear()
@@ -2290,7 +2295,33 @@ class KOFViewer(tk.Tk):
             return
         self._close_section_windows()
         self._sections.clear()
+        self._clear_active_section_marker(redraw=False)
         self._redraw()
+
+    def _clear_active_section_marker(self, *, redraw: bool = True) -> None:
+        self._active_section_marker_index = None
+        self._active_section_marker_chainage_m = None
+        if redraw:
+            self._redraw_2d()
+
+    def _set_active_section_marker(self, section_index: int, chainage_m: float) -> None:
+        if section_index < 0 or section_index >= len(self._sections):
+            self._clear_active_section_marker(redraw=True)
+            return
+
+        (y0, x0), (y1, x1) = self._sections[section_index]
+        length = float(np.hypot(y1 - y0, x1 - x0))
+        if length <= 0:
+            self._clear_active_section_marker(redraw=True)
+            return
+
+        chainage = min(max(float(chainage_m), 0.0), length)
+        self._active_section_marker_index = section_index
+        self._active_section_marker_chainage_m = chainage
+        self._redraw_2d()
+
+    def _on_section_window_chainage(self, section_index: int, chainage_m: float) -> None:
+        self._set_active_section_marker(section_index, chainage_m)
 
     def _load_file(self, path: str, *, redraw: bool = True) -> None:
         ext = os.path.splitext(path)[1].lower()
@@ -3131,6 +3162,8 @@ class KOFViewer(tk.Tk):
             area_top_name=area_top_name,
             area_bottom_name=area_bottom_name,
             label=self._section_label(index),
+            section_index=index,
+            on_chainage_change=self._on_section_window_chainage,
         )
         self._section_windows.append(window)
 
@@ -3825,6 +3858,58 @@ class KOFViewer(tk.Tk):
                 xytext=(6, 6), textcoords="offset points", zorder=7,
             )
 
+        if (
+            self._active_section_marker_index is not None
+            and self._active_section_marker_chainage_m is not None
+            and 0 <= self._active_section_marker_index < len(self._sections)
+        ):
+            (y0, x0), (y1, x1) = self._sections[self._active_section_marker_index]
+            dy = y1 - y0
+            dx = x1 - x0
+            length = float(np.hypot(dy, dx))
+            if length > 0:
+                chainage = min(max(self._active_section_marker_chainage_m, 0.0), length)
+                t = chainage / length
+                py = y0 + (dy * t)
+                px = x0 + (dx * t)
+
+                xmin, xmax = self.ax2d.get_xlim()
+                ymin, ymax = self.ax2d.get_ylim()
+                span = max(abs(xmax - xmin), abs(ymax - ymin), 1e-9)
+                tick_half_len = max(0.5, span * 0.012)
+                perp_y = -dx / length
+                perp_x = dy / length
+                y_tick0 = py - (perp_y * tick_half_len)
+                x_tick0 = px - (perp_x * tick_half_len)
+                y_tick1 = py + (perp_y * tick_half_len)
+                x_tick1 = px + (perp_x * tick_half_len)
+
+                self.ax2d.plot(
+                    [y_tick0, y_tick1],
+                    [x_tick0, x_tick1],
+                    "-",
+                    color="#b00020",
+                    linewidth=2.0,
+                    zorder=16,
+                )
+                self.ax2d.plot(
+                    [py],
+                    [px],
+                    "o",
+                    color="#b00020",
+                    markersize=6,
+                    zorder=17,
+                )
+                self.ax2d.annotate(
+                    f"s={chainage:,.2f} m",
+                    (py, px),
+                    fontsize=8,
+                    color="#b00020",
+                    xytext=(8, -12),
+                    textcoords="offset points",
+                    zorder=18,
+                )
+
         # Persisted masks (active one highlighted).
         for idx, mask in enumerate(self._masks):
             if not self._mask_is_visible(idx):
@@ -4100,6 +4185,8 @@ class SectionWindow(tk.Toplevel):
         area_bottom_name: Optional[str] = None,
         n_samples: int = 200,
         label: str = "",
+        section_index: Optional[int] = None,
+        on_chainage_change: Optional[Any] = None,
     ) -> None:
         super().__init__(master)
         title_label = f" ({label}–{label}')" if label else ""
@@ -4134,6 +4221,10 @@ class SectionWindow(tk.Toplevel):
         z_area_bottom = area_bottom_surface.interpolate(ys, xs) if area_bottom_surface is not None else z_bot
         area_top_label = area_top_name or top.name
         area_bottom_label = area_bottom_name or bottom.name
+        self._section_index = section_index
+        self._on_chainage_change = on_chainage_change
+        self._section_total_len = total_len
+        self._chainage_updating = False
 
         # Area between curves (m² of cross-section); split into cut (top above
         # bottom) and fill (top below bottom).
@@ -4153,6 +4244,7 @@ class SectionWindow(tk.Toplevel):
 
         fig = Figure(figsize=(8, 4.5), dpi=100)
         ax = fig.add_subplot(111)
+        self._section_ax = ax
 
         if np.any(np.isfinite(z_top)):
             ax.plot(dists, z_top, color="#1f77b4", linewidth=1.6,
@@ -4221,7 +4313,7 @@ class SectionWindow(tk.Toplevel):
                                     label=f"Fill ({area_top_label} < {area_bottom_label})")
 
         center_dist = 0.5 * total_len
-        ax.axvline(
+        self._chainage_indicator = ax.axvline(
             center_dist,
             color="#444444",
             linestyle="--",
@@ -4241,9 +4333,26 @@ class SectionWindow(tk.Toplevel):
         )
 
         canvas = FigureCanvasTkAgg(fig, master=self)
+        self._section_canvas = canvas
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         toolbar = NavigationToolbar2Tk(canvas, self)
         toolbar.update()
+
+        slider_row = ttk.Frame(self, padding=(8, 4, 8, 0))
+        slider_row.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Label(slider_row, text="Chainage").pack(side=tk.LEFT)
+        self._chainage_var = tk.DoubleVar(value=center_dist)
+        self._chainage_value_text = tk.StringVar()
+        self._chainage_scale = ttk.Scale(
+            slider_row,
+            from_=0.0,
+            to=total_len,
+            orient=tk.HORIZONTAL,
+            variable=self._chainage_var,
+            command=self._on_chainage_slider,
+        )
+        self._chainage_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
+        ttk.Label(slider_row, textvariable=self._chainage_value_text, width=20, anchor=tk.E).pack(side=tk.LEFT)
 
         info = ttk.Label(
             self,
@@ -4256,6 +4365,36 @@ class SectionWindow(tk.Toplevel):
             anchor=tk.W, padding=(8, 2),
         )
         info.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self._set_chainage(center_dist, notify=True, update_slider=False)
+
+    def _set_chainage(self, chainage_m: float, *, notify: bool, update_slider: bool) -> None:
+        if self._section_total_len <= 0:
+            return
+
+        chainage = min(max(float(chainage_m), 0.0), self._section_total_len)
+        if update_slider:
+            self._chainage_updating = True
+            try:
+                self._chainage_var.set(chainage)
+            finally:
+                self._chainage_updating = False
+
+        self._chainage_indicator.set_xdata([chainage, chainage])
+        self._chainage_value_text.set(f"{chainage:,.2f} / {self._section_total_len:,.2f} m")
+        self._section_canvas.draw_idle()
+
+        if notify and self._section_index is not None and callable(self._on_chainage_change):
+            self._on_chainage_change(self._section_index, chainage)
+
+    def _on_chainage_slider(self, _value: str) -> None:
+        if self._chainage_updating:
+            return
+        try:
+            chainage = float(self._chainage_var.get())
+        except (TypeError, ValueError, tk.TclError):
+            return
+        self._set_chainage(chainage, notify=True, update_slider=False)
 
 
 class MaskVolumeResultsWindow(tk.Toplevel):
