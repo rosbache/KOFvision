@@ -384,6 +384,29 @@ class KOFViewer(tk.Tk):
         self.measure_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.measure_btn, "Shortcut: Ctrl+Shift+D")
 
+        self.measure_mode_btn = ttk.Menubutton(top, text="Measure mode")
+        measure_mode_menu = tk.Menu(self.measure_mode_btn, tearoff=False)
+        for _mode_key, mode_label in MEASURE_MODE_LABELS.items():
+            measure_mode_menu.add_radiobutton(
+                label=mode_label,
+                value=mode_label,
+                variable=self.measure_mode,
+                command=self._on_measure_mode_changed,
+            )
+        self.measure_mode_btn.configure(menu=measure_mode_menu)
+        self.measure_mode_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.measure_mode_btn, "Choose how Measure behaves (line distance or polygon area).")
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
+        save_project_btn = self._make_toolbar_button(top, text="Save project", command=self._on_save_project)
+        save_project_btn.pack(side=tk.LEFT, padx=3)
+
+        load_project_btn = self._make_toolbar_button(top, text="Load project", command=self._on_load_project)
+        load_project_btn.pack(side=tk.LEFT, padx=3)
+
+        self._on_measure_mode_changed()
+
         ttk.Label(
             top,
             text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute",
@@ -718,9 +741,6 @@ class KOFViewer(tk.Tk):
         ttk.Button(sections_panel, text="Export section report...", command=self._on_export_section_report).pack(fill=tk.X, pady=2)
         ttk.Button(sections_panel, text="Open section report in browser...", command=self._on_open_section_report_browser).pack(fill=tk.X, pady=2)
         ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
-        ttk.Button(sections_panel, text="Save project...", command=self._on_save_project).pack(fill=tk.X, pady=2)
-        ttk.Button(sections_panel, text="Load project...", command=self._on_load_project).pack(fill=tk.X, pady=2)
-        ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
         ttk.Label(sections_panel, text="Active mask:").pack(anchor="w")
         self.mask_combo = ttk.Combobox(
             sections_panel,
@@ -758,15 +778,6 @@ class KOFViewer(tk.Tk):
         ttk.Button(sections_panel, text="Save masks...", command=self._on_save_mask_json).pack(fill=tk.X, pady=2)
         ttk.Button(sections_panel, text="Load masks...", command=self._on_load_mask_json).pack(fill=tk.X, pady=2)
         ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
-        ttk.Label(sections_panel, text="Measure mode:").pack(anchor="w")
-        self.measure_mode_combo = ttk.Combobox(
-            sections_panel,
-            textvariable=self.measure_mode,
-            values=list(MEASURE_MODE_LABELS.values()),
-            state="readonly",
-            width=26,
-        )
-        self.measure_mode_combo.pack(fill=tk.X, pady=(2, 4))
         self.measure_toggle_btn = ttk.Button(sections_panel, text="Start measure", command=self._on_toggle_measure)
         self.measure_toggle_btn.pack(fill=tk.X, pady=2)
         self.measure_clear_btn = ttk.Button(sections_panel, text="Clear measurements", command=self._on_clear_measurements)
@@ -3423,6 +3434,24 @@ class KOFViewer(tk.Tk):
         if key in MEASURE_MODE_LABELS:
             return key
         return "line"
+
+    def _on_measure_mode_changed(self) -> None:
+        mode = self._current_measure_mode_key()
+        mode_label = MEASURE_MODE_LABELS.get(mode, MEASURE_MODE_LABELS["line"])
+        if hasattr(self, "measure_mode_btn"):
+            self.measure_mode_btn.configure(text=f"Measure mode: {mode_label}")
+        if not self._measure_mode:
+            return
+        self._measure_click_points = []
+        if mode == "polygon":
+            self.status.set(
+                "Measure polygon: left-click vertices, then right-click or double-click to close. Esc to cancel."
+            )
+        else:
+            self.status.set(
+                "Measure line: click two points on the 2D plot. Right-click or Esc to cancel."
+            )
+        self._redraw_2d()
 
     @staticmethod
     def _measure_line_length(p0: tuple[float, float], p1: tuple[float, float]) -> float:
