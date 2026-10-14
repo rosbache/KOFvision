@@ -254,6 +254,8 @@ class KOFViewer(tk.Tk):
         self._section_windows: list[tk.Toplevel] = []
         self._active_section_marker_index: Optional[int] = None
         self._active_section_marker_chainage_m: Optional[float] = None
+        self._active_section_index: Optional[int] = None
+        self.active_section_var = tk.StringVar(value="")
 
         # Polygon mask state for volume limitation in 2D.
         self._mask_mode = False
@@ -759,6 +761,22 @@ class KOFViewer(tk.Tk):
 
         sections_panel = self._add_collapsible_panel(parent, "Sections and mask", expanded=False)
         ttk.Button(sections_panel, text="Update sections", command=self._on_update_sections).pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(sections_panel, text="Selected section:").pack(anchor="w", pady=(2, 0))
+        self.section_combo = ttk.Combobox(
+            sections_panel,
+            textvariable=self.active_section_var,
+            values=[],
+            state="readonly",
+            width=26,
+        )
+        self.section_combo.pack(fill=tk.X, pady=(2, 2))
+        self.section_combo.bind("<<ComboboxSelected>>", self._on_section_select)
+        section_btn_row = ttk.Frame(sections_panel)
+        section_btn_row.pack(fill=tk.X, pady=(0, 2))
+        self.section_zoom_btn = ttk.Button(section_btn_row, text="Zoom selected", command=self._on_zoom_selected_section)
+        self.section_zoom_btn.pack(side=tk.LEFT)
+        self.section_delete_btn = ttk.Button(section_btn_row, text="Delete selected", command=self._on_delete_selected_section)
+        self.section_delete_btn.pack(side=tk.LEFT, padx=(4, 0))
         ttk.Button(sections_panel, text="Clear sections", command=self._on_clear_sections).pack(fill=tk.X, pady=(0, 2))
         ttk.Button(sections_panel, text="Save sections...", command=self._on_save_sections_json).pack(fill=tk.X, pady=2)
         ttk.Button(sections_panel, text="Load sections...", command=self._on_load_sections_json).pack(fill=tk.X, pady=2)
@@ -814,6 +832,7 @@ class KOFViewer(tk.Tk):
 
         self._on_intermediate_type_change()
         self._refresh_mask_controls()
+        self._refresh_section_controls()
 
     def _build_body(self) -> None:
         body = ttk.Frame(self)
@@ -1088,6 +1107,7 @@ class KOFViewer(tk.Tk):
         self._measure_click_points.clear()
         self._sections.clear()
         self._clear_active_section_marker(redraw=False)
+        self._active_section_index = None
         self._masks.clear()
         self._mask_visibility_vars.clear()
         self._last_volume_per_mask_rows.clear()
@@ -1108,6 +1128,7 @@ class KOFViewer(tk.Tk):
         if self._note_mode:
             self._end_note_mode()
         self._refresh_mask_controls()
+        self._refresh_section_controls()
         self._refresh_mask_result_actions()
         self._refresh_file_selectors()
         self._refresh_layer_controls()
@@ -1460,6 +1481,8 @@ class KOFViewer(tk.Tk):
         self._close_section_windows()
         self._sections = list(sections)
         self._clear_active_section_marker(redraw=False)
+        self._active_section_index = 0 if self._sections else None
+        self._refresh_section_controls()
         self._redraw()
 
     def _on_save_project(self) -> None:
@@ -1586,6 +1609,7 @@ class KOFViewer(tk.Tk):
         self._landxml_group_vars.clear()
         self._sections.clear()
         self._clear_active_section_marker(redraw=False)
+        self._active_section_index = None
         self._measure_results.clear()
         self._measure_click_points.clear()
         self._masks.clear()
@@ -1683,6 +1707,7 @@ class KOFViewer(tk.Tk):
                 except (TypeError, ValueError):
                     continue
                 self._sections.append((p0, p1))
+        self._active_section_index = 0 if self._sections else None
 
         masks_raw = payload.get("masks")
         if isinstance(masks_raw, list):
@@ -1761,6 +1786,7 @@ class KOFViewer(tk.Tk):
         self._refresh_intermediate_raster_selector()
         self._refresh_raster_selector()
         self._refresh_mask_controls()
+        self._refresh_section_controls()
         self._refresh_layer_controls()
         self._on_intermediate_type_change()
         self._redraw()
@@ -2433,6 +2459,37 @@ class KOFViewer(tk.Tk):
             ymax + pad_y,
         )
 
+    def _zoom_to_point(self, y: float, x: float) -> None:
+        bounds = self._selected_layers_2d_bounds()
+        if bounds is None:
+            pad = 10.0
+        else:
+            xmin, xmax, ymin, ymax = bounds
+            span = max(xmax - xmin, ymax - ymin)
+            pad = max(3.0, span * 0.05)
+        self._zoom_to_bounds((y - pad, y + pad, x - pad, x + pad))
+
+    def _on_layer_mask_item_click(self, index: int) -> None:
+        if index < 0 or index >= len(self._masks):
+            return
+        self._set_active_mask_index(index)
+        poly = list(self._masks[index].vertices)
+        if len(poly) >= 3:
+            self._zoom_to_bounds(self._polygon_bounds(poly))
+        self.notebook.select(0)
+        self._refresh_mask_controls()
+        self._redraw_2d()
+
+    def _on_layer_note_item_click(self, index: int) -> None:
+        if index < 0 or index >= len(self._notes):
+            return
+        self._active_note_index = index
+        note = self._notes[index]
+        self._zoom_to_point(note.y, note.x)
+        self.notebook.select(0)
+        self._refresh_layer_controls()
+        self._redraw_2d()
+
     def _selected_layers_2d_bounds(self) -> Optional[tuple[float, float, float, float]]:
         xmin: Optional[float] = None
         xmax: Optional[float] = None
@@ -2487,6 +2544,8 @@ class KOFViewer(tk.Tk):
         self._close_section_windows()
         self._sections.clear()
         self._clear_active_section_marker(redraw=False)
+        self._active_section_index = None
+        self._refresh_section_controls()
         self._redraw()
 
     def _clear_active_section_marker(self, *, redraw: bool = True) -> None:
@@ -2507,6 +2566,8 @@ class KOFViewer(tk.Tk):
             return
 
         chainage = min(max(float(chainage_m), 0.0), length)
+        self._active_section_index = section_index
+        self._refresh_section_controls()
         self._active_section_marker_index = section_index
         self._active_section_marker_chainage_m = chainage
         self._redraw_2d()
@@ -2606,7 +2667,7 @@ class KOFViewer(tk.Tk):
 
         has_raster_layer = bool(self._raster_layers)
 
-        if not self.files and not has_raster_layer and not self.landxml_files:
+        if not self.files and not has_raster_layer and not self.landxml_files and not self._masks and not self._notes:
             ttk.Label(self.layers_inner, text="No layers loaded.").pack(anchor="w")
             return
 
@@ -2697,12 +2758,23 @@ class KOFViewer(tk.Tk):
                 self._mask_visibility_vars.append(tk.BooleanVar(value=bool(self._masks[idx].visible)))
             for idx, mask in enumerate(self._masks):
                 self._mask_visibility_vars[idx].set(bool(mask.visible))
+                row = ttk.Frame(self.layers_inner)
+                row.pack(fill=tk.X, pady=1)
                 ttk.Checkbutton(
-                    self.layers_inner,
-                    text=f"  {mask.name}",
+                    row,
                     variable=self._mask_visibility_vars[idx],
                     command=lambda i=idx: self._on_toggle_mask_visibility(i),
-                ).pack(anchor="w", pady=1)
+                ).pack(side=tk.LEFT)
+                is_active = idx == self._active_mask_index
+                mask_label = ttk.Label(
+                    row,
+                    text=mask.name,
+                    foreground="#204080" if is_active else "",
+                    font=("TkDefaultFont", 9, "bold" if is_active else "normal"),
+                    cursor="hand2",
+                )
+                mask_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                mask_label.bind("<Button-1>", lambda _e, i=idx: self._on_layer_mask_item_click(i))
 
         if self._notes:
             ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(2, 4))
@@ -2715,12 +2787,23 @@ class KOFViewer(tk.Tk):
             for idx, note in enumerate(self._notes):
                 self._note_visibility_vars[idx].set(bool(note.visible))
                 label = note.title if note.title else self._note_default_title(idx)
+                row = ttk.Frame(self.layers_inner)
+                row.pack(fill=tk.X, pady=1)
                 ttk.Checkbutton(
-                    self.layers_inner,
-                    text=f"  {label}",
+                    row,
                     variable=self._note_visibility_vars[idx],
                     command=lambda i=idx: self._on_toggle_note_visibility(i),
-                ).pack(anchor="w", pady=1)
+                ).pack(side=tk.LEFT)
+                is_active = idx == self._active_note_index
+                note_label = ttk.Label(
+                    row,
+                    text=label,
+                    foreground="#204080" if is_active else "",
+                    font=("TkDefaultFont", 9, "bold" if is_active else "normal"),
+                    cursor="hand2",
+                )
+                note_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                note_label.bind("<Button-1>", lambda _e, i=idx: self._on_layer_note_item_click(i))
 
     def _is_layer_visible(self, idx: int) -> bool:
         if idx < 0 or idx >= len(self.layer_vars):
@@ -3517,6 +3600,8 @@ class KOFViewer(tk.Tk):
 
         (y0, x0), (y1, x1) = self._section_click_points
         self._sections.append(((y0, x0), (y1, x1)))
+        self._active_section_index = len(self._sections) - 1
+        self._refresh_section_controls()
 
         top = self._find_file(self.top_var.get())
         bot = self._find_file(self.bottom_var.get())
@@ -4271,6 +4356,62 @@ class KOFViewer(tk.Tk):
             if n < 0:
                 break
         return letters
+
+    def _refresh_section_controls(self) -> None:
+        if hasattr(self, "section_combo"):
+            names = [f"{self._section_label(i)}" for i in range(len(self._sections))]
+            self.section_combo.configure(values=names)
+            if (
+                self._active_section_index is not None
+                and 0 <= self._active_section_index < len(names)
+            ):
+                self.active_section_var.set(names[self._active_section_index])
+            else:
+                self.active_section_var.set("")
+        has_active = (
+            self._active_section_index is not None
+            and 0 <= self._active_section_index < len(self._sections)
+        )
+        if hasattr(self, "section_zoom_btn"):
+            self.section_zoom_btn.configure(state="normal" if has_active else "disabled")
+        if hasattr(self, "section_delete_btn"):
+            self.section_delete_btn.configure(state="normal" if has_active else "disabled")
+
+    def _on_section_select(self, _event=None) -> None:  # noqa: ANN001
+        selected = self.active_section_var.get().strip()
+        for idx in range(len(self._sections)):
+            if self._section_label(idx) == selected:
+                self._active_section_index = idx
+                self._clear_active_section_marker(redraw=False)
+                self._redraw_2d()
+                self._refresh_section_controls()
+                return
+
+    def _on_zoom_selected_section(self) -> None:
+        idx = self._active_section_index
+        if idx is None or idx < 0 or idx >= len(self._sections):
+            return
+        (y0, x0), (y1, x1) = self._sections[idx]
+        self._zoom_to_bounds((min(y0, y1), max(y0, y1), min(x0, x1), max(x0, x1)))
+        self.notebook.select(0)
+        self._redraw_2d()
+
+    def _on_delete_selected_section(self) -> None:
+        idx = self._active_section_index
+        if idx is None or idx < 0 or idx >= len(self._sections):
+            return
+        label = self._section_label(idx)
+        if not messagebox.askyesno("Delete section", f"Delete section {label}?"):
+            return
+        self._close_section_windows()
+        del self._sections[idx]
+        self._clear_active_section_marker(redraw=False)
+        if not self._sections:
+            self._active_section_index = None
+        else:
+            self._active_section_index = min(idx, len(self._sections) - 1)
+        self._refresh_section_controls()
+        self._redraw_2d()
 
     # --------------------------------------------------------------- Render
     def _redraw(self) -> None:
