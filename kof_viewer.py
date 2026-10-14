@@ -138,6 +138,15 @@ class _RasterViewLayer:
     elevation_surface: Optional[ElevationRasterSurface]
 
 
+@dataclass
+class NoteDefinition:
+    title: str
+    text: str
+    y: float
+    x: float
+    visible: bool = True
+
+
 class _HoverTooltip:
     """Small tooltip that appears when hovering over a widget."""
 
@@ -272,6 +281,16 @@ class KOFViewer(tk.Tk):
         self._measure_cid: Optional[int] = None
         self._measure_results: list[dict[str, Any]] = []
 
+        # 2D map notes state.
+        self._note_mode = False
+        self._note_cid: Optional[int] = None
+        self._note_pick_cid: Optional[int] = None
+        self._notes: list[NoteDefinition] = []
+        self._active_note_index: Optional[int] = None
+        self._note_visibility_vars: list[tk.BooleanVar] = []
+        self._pending_note_click_after_id: Optional[str] = None
+        self._pending_note_click_index: Optional[int] = None
+
         self._configure_styles()
 
         self._build_toolbar()
@@ -309,6 +328,7 @@ class KOFViewer(tk.Tk):
         self.bind_all("<Control-Shift-S>", lambda _e: self._invoke_shortcut(self._on_toggle_section))
         self.bind_all("<Control-Shift-M>", lambda _e: self._invoke_shortcut(self._on_toggle_mask))
         self.bind_all("<Control-Shift-D>", lambda _e: self._invoke_shortcut(self._on_toggle_measure))
+        self.bind_all("<Control-Shift-N>", lambda _e: self._invoke_shortcut(self._on_toggle_note_mode))
 
     @staticmethod
     def _invoke_shortcut(callback) -> str:  # noqa: ANN001
@@ -384,6 +404,10 @@ class KOFViewer(tk.Tk):
         self.measure_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.measure_btn, "Shortcut: Ctrl+Shift+D")
 
+        self.note_btn = self._make_toolbar_button(top, text="Add note", command=self._on_toggle_note_mode)
+        self.note_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.note_btn, "Shortcut: Ctrl+Shift+N")
+
         self.measure_mode_btn = ttk.Menubutton(top, text="Measure mode")
         measure_mode_menu = tk.Menu(self.measure_mode_btn, tearoff=False)
         for _mode_key, mode_label in MEASURE_MODE_LABELS.items():
@@ -409,7 +433,7 @@ class KOFViewer(tk.Tk):
 
         ttk.Label(
             top,
-            text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute",
+            text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute, Ctrl+Shift+N note",
             foreground="#4a5a70",
         ).pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -813,6 +837,7 @@ class KOFViewer(tk.Tk):
         self.ax2d = self.fig2d.add_subplot(111)
         self.canvas2d = FigureCanvasTkAgg(self.fig2d, master=frame2d)
         self.canvas2d.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._note_pick_cid = self.canvas2d.mpl_connect("button_press_event", self._on_note_map_click)
         self.toolbar2d = NavigationToolbar2Tk(self.canvas2d, frame2d)
         self.toolbar2d.update()
         self.notebook.add(frame2d, text="2D (plan)")
@@ -1070,12 +1095,18 @@ class KOFViewer(tk.Tk):
         self._active_mask_index = None
         self.active_mask_var.set("")
         self._mask_click_points.clear()
+        self._notes.clear()
+        self._note_visibility_vars.clear()
+        self._active_note_index = None
+        self._cancel_pending_note_single_click()
         if self._mask_mode:
             self._end_mask_mode()
         if self._mask_edit_mode:
             self._end_mask_edit_mode()
         if self._measure_mode:
             self._end_measure_mode()
+        if self._note_mode:
+            self._end_note_mode()
         self._refresh_mask_controls()
         self._refresh_mask_result_actions()
         self._refresh_file_selectors()
@@ -1286,6 +1317,7 @@ class KOFViewer(tk.Tk):
             self.mask_delete_btn.configure(state=edit_state)
         if hasattr(self, "mask_clear_btn"):
             self.mask_clear_btn.configure(state=any_state)
+        self._refresh_layer_controls()
 
     def _on_mask_select(self, _event=None) -> None:  # noqa: ANN001
         selected = self.active_mask_var.get().strip()
@@ -1502,6 +1534,16 @@ class KOFViewer(tk.Tk):
                 if len(mask.vertices) >= 3
             ],
             "active_mask": self.active_mask_var.get(),
+            "notes": [
+                {
+                    "title": note.title,
+                    "text": note.text,
+                    "y": float(note.y),
+                    "x": float(note.x),
+                    "visible": bool(note.visible),
+                }
+                for note in self._notes
+            ],
         }
 
         try:
@@ -1550,12 +1592,18 @@ class KOFViewer(tk.Tk):
         self._mask_visibility_vars.clear()
         self._active_mask_index = None
         self.active_mask_var.set("")
+        self._notes.clear()
+        self._note_visibility_vars.clear()
+        self._active_note_index = None
+        self._cancel_pending_note_single_click()
         self._raster_layers.clear()
         self._active_raster_index = None
         self._elevation_raster_index = None
         self._latest_section_report_path = None
         if self._measure_mode:
             self._end_measure_mode()
+        if self._note_mode:
+            self._end_note_mode()
         self._clear_cached_mask_volume_results()
 
         source_files = payload.get("source_files")
@@ -1664,6 +1712,23 @@ class KOFViewer(tk.Tk):
                 if mask.name == active_mask:
                     self._set_active_mask_index(idx)
                     break
+
+        notes_raw = payload.get("notes")
+        if isinstance(notes_raw, list):
+            for item in notes_raw:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    y = float(item.get("y"))
+                    x = float(item.get("x"))
+                except (TypeError, ValueError):
+                    continue
+                title = str(item.get("title", "")).strip()
+                text = str(item.get("text", "")).strip()
+                if not title and not text:
+                    continue
+                visible = bool(item.get("visible", True))
+                self._append_note(title=title, text=text, y=y, x=x, visible=visible)
 
         names = [k.name for k in self.files]
         top_name = str(payload.get("top_surface", ""))
@@ -2624,6 +2689,39 @@ class KOFViewer(tk.Tk):
                         command=lambda p=lx.path: self._on_toggle_landxml_child(p),
                     ).pack(anchor="w", pady=1)
 
+        if self._masks:
+            ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(2, 4))
+            ttk.Label(self.layers_inner, text="Masks").pack(anchor="w")
+            while len(self._mask_visibility_vars) < len(self._masks):
+                idx = len(self._mask_visibility_vars)
+                self._mask_visibility_vars.append(tk.BooleanVar(value=bool(self._masks[idx].visible)))
+            for idx, mask in enumerate(self._masks):
+                self._mask_visibility_vars[idx].set(bool(mask.visible))
+                ttk.Checkbutton(
+                    self.layers_inner,
+                    text=f"  {mask.name}",
+                    variable=self._mask_visibility_vars[idx],
+                    command=lambda i=idx: self._on_toggle_mask_visibility(i),
+                ).pack(anchor="w", pady=1)
+
+        if self._notes:
+            ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(2, 4))
+            ttk.Label(self.layers_inner, text="Notes").pack(anchor="w")
+            while len(self._note_visibility_vars) > len(self._notes):
+                self._note_visibility_vars.pop()
+            while len(self._note_visibility_vars) < len(self._notes):
+                idx = len(self._note_visibility_vars)
+                self._note_visibility_vars.append(tk.BooleanVar(value=bool(self._notes[idx].visible)))
+            for idx, note in enumerate(self._notes):
+                self._note_visibility_vars[idx].set(bool(note.visible))
+                label = note.title if note.title else self._note_default_title(idx)
+                ttk.Checkbutton(
+                    self.layers_inner,
+                    text=f"  {label}",
+                    variable=self._note_visibility_vars[idx],
+                    command=lambda i=idx: self._on_toggle_note_visibility(i),
+                ).pack(anchor="w", pady=1)
+
     def _is_layer_visible(self, idx: int) -> bool:
         if idx < 0 or idx >= len(self.layer_vars):
             return True
@@ -3360,6 +3458,8 @@ class KOFViewer(tk.Tk):
             self._end_mask_mode()
         if self._measure_mode:
             self._end_measure_mode()
+        if self._note_mode:
+            self._end_note_mode()
         if self._section_mode:
             self._end_section_mode()
             return
@@ -3425,6 +3525,275 @@ class KOFViewer(tk.Tk):
         if top is not None and bot is not None:
             self._open_section_window_at_index(len(self._sections) - 1, top=top, bottom=bot)
 
+    # -------------------------------------------------------------- Map notes
+    def _on_toggle_note_mode(self) -> None:
+        if self._section_mode:
+            self._end_section_mode()
+        if self._mask_mode:
+            self._end_mask_mode()
+        if self._mask_edit_mode:
+            self._end_mask_edit_mode()
+        if self._measure_mode:
+            self._end_measure_mode()
+        if self._note_mode:
+            self._end_note_mode()
+            self._redraw_2d()
+            return
+
+        self._note_mode = True
+        self.note_btn.configure(text="Cancel note")
+        self.notebook.select(0)
+        self.status.set("Note mode: click a point on the 2D map to place a note. Right-click or Esc to cancel.")
+        self._note_cid = self.canvas2d.mpl_connect("button_press_event", self._on_note_place_click)
+        self.bind("<Escape>", lambda _e: self._cancel_note_mode())
+
+    def _cancel_note_mode(self) -> None:
+        self._end_note_mode()
+        self._redraw_2d()
+
+    def _end_note_mode(self) -> None:
+        self._note_mode = False
+        self._cancel_pending_note_single_click()
+        if self._note_cid is not None:
+            self.canvas2d.mpl_disconnect(self._note_cid)
+            self._note_cid = None
+        if hasattr(self, "note_btn"):
+            self.note_btn.configure(text="Add note")
+        self.unbind("<Escape>")
+        self._update_status()
+
+    def _note_pick_tolerance(self) -> float:
+        xmin, xmax = self.ax2d.get_xlim()
+        ymin, ymax = self.ax2d.get_ylim()
+        span = max(abs(xmax - xmin), abs(ymax - ymin), 1e-9)
+        return span * 0.02
+
+    def _pick_note_index(self, y: float, x: float) -> Optional[int]:
+        if not self._notes:
+            return None
+        tol = self._note_pick_tolerance()
+        best_idx: Optional[int] = None
+        best_dist2 = float("inf")
+        for idx, note in enumerate(self._notes):
+            if not note.visible:
+                continue
+            dy = note.y - y
+            dx = note.x - x
+            dist2 = (dy * dy) + (dx * dx)
+            if dist2 <= (tol * tol) and dist2 < best_dist2:
+                best_dist2 = dist2
+                best_idx = idx
+        return best_idx
+
+    @staticmethod
+    def _note_default_title(index: int) -> str:
+        return f"Note {index + 1}"
+
+    def _append_note(self, title: str, text: str, y: float, x: float, visible: bool = True) -> None:
+        clean_title = title.strip()
+        clean_text = text.strip()
+        if not clean_title and not clean_text:
+            return
+        if not clean_title:
+            clean_title = self._note_default_title(len(self._notes))
+        self._notes.append(NoteDefinition(title=clean_title, text=clean_text, y=float(y), x=float(x), visible=visible))
+        self._note_visibility_vars.append(tk.BooleanVar(value=bool(visible)))
+        self._active_note_index = len(self._notes) - 1
+        self._refresh_layer_controls()
+
+    def _delete_note_at_index(self, idx: int, *, ask_confirm: bool = True) -> bool:
+        if idx < 0 or idx >= len(self._notes):
+            return False
+        note = self._notes[idx]
+        if ask_confirm:
+            if not messagebox.askyesno("Delete note", f"Delete note '{note.title}'?"):
+                return False
+        del self._notes[idx]
+        if idx < len(self._note_visibility_vars):
+            del self._note_visibility_vars[idx]
+        if not self._notes:
+            self._active_note_index = None
+        elif self._active_note_index is None:
+            self._active_note_index = min(idx, len(self._notes) - 1)
+        elif self._active_note_index == idx:
+            self._active_note_index = min(idx, len(self._notes) - 1)
+        elif self._active_note_index > idx:
+            self._active_note_index -= 1
+        self._refresh_layer_controls()
+        return True
+
+    def _note_is_visible(self, index: int) -> bool:
+        if index < 0 or index >= len(self._notes):
+            return False
+        if index >= len(self._note_visibility_vars):
+            return bool(self._notes[index].visible)
+        return bool(self._note_visibility_vars[index].get())
+
+    def _sync_note_visible_flag(self, index: int) -> None:
+        if index < 0 or index >= len(self._notes):
+            return
+        self._notes[index].visible = self._note_is_visible(index)
+
+    def _on_toggle_note_visibility(self, index: int) -> None:
+        self._sync_note_visible_flag(index)
+        self._redraw_2d()
+
+    def _cancel_pending_note_single_click(self) -> None:
+        after_id = self._pending_note_click_after_id
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self._pending_note_click_after_id = None
+        self._pending_note_click_index = None
+
+    def _run_pending_note_single_click(self) -> None:
+        idx = self._pending_note_click_index
+        self._pending_note_click_after_id = None
+        self._pending_note_click_index = None
+        if idx is None:
+            return
+        self._show_note_at_index(idx)
+
+    def _edit_note_dialog(
+        self,
+        *,
+        title_value: str,
+        text_value: str,
+        allow_delete: bool,
+    ) -> tuple[str, str, str]:
+        dialog = tk.Toplevel(self)
+        dialog.title("Map note")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(True, True)
+
+        container = ttk.Frame(dialog, padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(container, text="Title:").pack(anchor="w")
+        title_var = tk.StringVar(value=title_value)
+        title_entry = ttk.Entry(container, textvariable=title_var, width=48)
+        title_entry.pack(fill=tk.X, pady=(2, 8))
+
+        ttk.Label(container, text="Comment:").pack(anchor="w")
+        text_widget = tk.Text(container, width=52, height=10, wrap="word")
+        text_widget.pack(fill=tk.BOTH, expand=True, pady=(2, 8))
+        text_widget.insert("1.0", text_value)
+
+        result: dict[str, str] = {
+            "action": "cancel",
+            "title": title_value,
+            "text": text_value,
+        }
+
+        def _save() -> None:
+            result["action"] = "save"
+            result["title"] = title_var.get().strip()
+            result["text"] = text_widget.get("1.0", "end-1c").strip()
+            dialog.destroy()
+
+        def _delete() -> None:
+            result["action"] = "delete"
+            result["title"] = title_var.get().strip()
+            result["text"] = text_widget.get("1.0", "end-1c").strip()
+            dialog.destroy()
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill=tk.X)
+        if allow_delete:
+            ttk.Button(buttons, text="Delete", command=_delete).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Save", command=_save).pack(side=tk.RIGHT, padx=(0, 6))
+
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+        title_entry.focus_set()
+        self.wait_window(dialog)
+        return result["action"], result["title"], result["text"]
+
+    def _on_note_place_click(self, event) -> None:  # noqa: ANN001
+        if event.inaxes is not self.ax2d:
+            return
+        if event.button == 3:
+            self._cancel_note_mode()
+            return
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        action, title, text = self._edit_note_dialog(title_value="", text_value="", allow_delete=False)
+        if action != "save":
+            return
+        if not title and not text:
+            messagebox.showinfo("Map note", "Note was empty and was not created.")
+            return
+        self._append_note(title=title, text=text, y=float(event.xdata), x=float(event.ydata), visible=True)
+        self._end_note_mode()
+        self._redraw_2d()
+        note = self._notes[-1]
+        self.status.set(f"Added note '{note.title}'.")
+
+    def _show_note_at_index(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self._notes):
+            return
+        self._active_note_index = idx
+        note = self._notes[idx]
+        body = note.text if note.text else "(no comment)"
+        messagebox.showinfo(note.title, body)
+        self._redraw_2d()
+
+    def _edit_note_at_index(self, idx: int) -> None:
+        if idx < 0 or idx >= len(self._notes):
+            return
+        note = self._notes[idx]
+        action, title, text = self._edit_note_dialog(
+            title_value=note.title,
+            text_value=note.text,
+            allow_delete=True,
+        )
+        if action == "delete":
+            if self._delete_note_at_index(idx, ask_confirm=True):
+                self._redraw_2d()
+                self.status.set("Note deleted.")
+            return
+        if action != "save":
+            return
+        if not title and not text:
+            if messagebox.askyesno("Delete empty note", "The note is empty. Delete it?"):
+                if self._delete_note_at_index(idx, ask_confirm=False):
+                    self._redraw_2d()
+                    self.status.set("Note deleted.")
+            return
+        note.title = title or self._note_default_title(idx)
+        note.text = text
+        self._active_note_index = idx
+        self._refresh_layer_controls()
+        self._redraw_2d()
+        self.status.set(f"Updated note '{note.title}'.")
+
+    def _on_note_map_click(self, event) -> None:  # noqa: ANN001
+        if event.inaxes is not self.ax2d:
+            return
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        if self._section_mode or self._mask_mode or self._mask_edit_mode or self._measure_mode or self._note_mode:
+            return
+        idx = self._pick_note_index(float(event.xdata), float(event.ydata))
+        if idx is None:
+            self._cancel_pending_note_single_click()
+            return
+        if event.dblclick:
+            self._cancel_pending_note_single_click()
+            self._edit_note_at_index(idx)
+            return
+        self._cancel_pending_note_single_click()
+        self._pending_note_click_index = idx
+        self._pending_note_click_after_id = self.after(250, self._run_pending_note_single_click)
+
     # ------------------------------------------------------------ Measure tool
     def _current_measure_mode_key(self) -> str:
         raw = self.measure_mode.get().strip()
@@ -3486,6 +3855,8 @@ class KOFViewer(tk.Tk):
             self._end_mask_mode()
         if self._mask_edit_mode:
             self._end_mask_edit_mode()
+        if self._note_mode:
+            self._end_note_mode()
         if self._measure_mode:
             self._end_measure_mode()
             self._redraw_2d()
@@ -3616,6 +3987,8 @@ class KOFViewer(tk.Tk):
             self._end_measure_mode()
         if self._mask_edit_mode:
             self._end_mask_edit_mode()
+        if self._note_mode:
+            self._end_note_mode()
         if self._mask_mode:
             self._end_mask_mode()
             self._redraw_2d()
@@ -3730,6 +4103,8 @@ class KOFViewer(tk.Tk):
             self._end_measure_mode()
         if self._mask_mode:
             self._end_mask_mode()
+        if self._note_mode:
+            self._end_note_mode()
         if self._mask_edit_mode:
             self._end_mask_edit_mode()
             self._redraw_2d()
@@ -4182,6 +4557,45 @@ class KOFViewer(tk.Tk):
             if kind == "polygon" and len(arr) >= 2:
                 self.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]], ":", color="#0b7285", linewidth=1.0, zorder=14)
 
+        # Persisted note markers.
+        for idx, note in enumerate(self._notes):
+            if not note.visible:
+                continue
+            is_active = idx == self._active_note_index
+            color = "#b23a48" if is_active else "#495057"
+            edge_width = 2.0 if is_active else 1.2
+            marker_size = 11 if is_active else 9
+            self.ax2d.plot(
+                [note.y],
+                [note.x],
+                "o",
+                markerfacecolor="#fff9db",
+                markeredgecolor=color,
+                markeredgewidth=edge_width,
+                markersize=marker_size,
+                zorder=19,
+            )
+            self.ax2d.annotate(
+                "N",
+                (note.y, note.x),
+                ha="center",
+                va="center",
+                fontsize=7,
+                fontweight="bold",
+                color=color,
+                zorder=20,
+            )
+            self.ax2d.annotate(
+                note.title,
+                (note.y, note.x),
+                fontsize=8,
+                color=color,
+                xytext=(8, 8),
+                textcoords="offset points",
+                fontweight="bold" if is_active else "normal",
+                zorder=21,
+            )
+
         if self.files or self.landxml_files:
             self.ax2d.legend(loc="best", fontsize=8)
         else:
@@ -4290,8 +4704,13 @@ class KOFViewer(tk.Tk):
             return
         if self._measure_mode:
             return
+        if self._note_mode:
+            return
         if not self.files and not self.landxml_files:
-            self.status.set("No file loaded.")
+            if self._notes:
+                self.status.set(f"No file loaded.   |   notes: {len(self._notes)}")
+            else:
+                self.status.set("No file loaded.")
             return
         parts = []
         total_points = 0
@@ -4341,6 +4760,9 @@ class KOFViewer(tk.Tk):
             n_line = sum(1 for m in self._measure_results if m.get("kind") == "line")
             n_poly = sum(1 for m in self._measure_results if m.get("kind") == "polygon")
             base += f"   |   measurements: {len(self._measure_results)} ({n_line} line, {n_poly} polygon)"
+        if self._notes:
+            n_with_text = sum(1 for n in self._notes if bool(n.text.strip()))
+            base += f"   |   notes: {len(self._notes)} ({n_with_text} with comment)"
         self.status.set(base)
 
 
