@@ -1,0 +1,279 @@
+from __future__ import annotations
+
+import os
+from datetime import datetime
+from typing import Any, Callable
+
+from kofvision.viewer_state import reset_for_project_load
+
+PROJECT_TYPE = "kofvision.project"
+PROJECT_VERSION = 1
+
+
+class ProjectPayloadError(ValueError):
+    """Raised when project payload metadata is invalid."""
+
+
+def build_project_payload(viewer: Any) -> dict[str, Any]:
+    source_files: list[str] = []
+    seen_sources: set[str] = set()
+    for path in viewer._surface_source_paths:
+        if not path or path in seen_sources:
+            continue
+        seen_sources.add(path)
+        source_files.append(path)
+
+    return {
+        "type": PROJECT_TYPE,
+        "version": PROJECT_VERSION,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "source_files": source_files,
+        "surface_layers": [
+            {
+                "name": surface.name,
+                "source_path": viewer._surface_source_paths[idx] if idx < len(viewer._surface_source_paths) else None,
+                "owner_path": viewer._surface_owner_paths[idx] if idx < len(viewer._surface_owner_paths) else None,
+                "visible": bool(viewer.layer_vars[idx].get()) if idx < len(viewer.layer_vars) else True,
+            }
+            for idx, surface in enumerate(viewer.files)
+        ],
+        "landxml_groups": {
+            path: bool(var.get())
+            for path, var in viewer._landxml_group_vars.items()
+        },
+        "raster_layers": [
+            {
+                "path": layer.path,
+                "visible": bool(layer.visible.get()),
+                "alpha": float(layer.alpha.get()),
+                "is_elevation": (idx == viewer._elevation_raster_index),
+            }
+            for idx, layer in enumerate(viewer._raster_layers)
+        ],
+        "show_raster": bool(viewer.show_raster.get()),
+        "top_surface": viewer.top_var.get(),
+        "bottom_surface": viewer.bottom_var.get(),
+        "volume_source_mode": viewer.volume_source_mode.get(),
+        "volume_method": viewer.volume_method.get(),
+        "intermediate_type": viewer.intermediate_type.get(),
+        "intermediate_kof": viewer.intermediate_kof_var.get(),
+        "intermediate_raster": viewer.intermediate_raster_var.get(),
+        "intermediate_constant_z": float(viewer.intermediate_constant_z.get()),
+        "mask_compute_scope": viewer.mask_compute_scope.get(),
+        "sections": [
+            {
+                "start": [float(start[0]), float(start[1])],
+                "end": [float(end[0]), float(end[1])],
+            }
+            for start, end in viewer._sections
+        ],
+        "masks": [
+            {
+                "name": mask.name,
+                "visible": bool(mask.visible),
+                "vertices": [[float(y), float(x)] for y, x in mask.vertices],
+            }
+            for mask in viewer._masks
+            if len(mask.vertices) >= 3
+        ],
+        "active_mask": viewer.active_mask_var.get(),
+        "notes": [
+            {
+                "title": note.title,
+                "text": note.text,
+                "y": float(note.y),
+                "x": float(note.x),
+                "visible": bool(note.visible),
+            }
+            for note in viewer._notes
+        ],
+    }
+
+
+def validate_project_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ProjectPayloadError("Invalid project file type.")
+    if payload.get("type") != PROJECT_TYPE:
+        raise ProjectPayloadError("Invalid project file type.")
+    if int(payload.get("version", 0)) != PROJECT_VERSION:
+        raise ProjectPayloadError(f"Unsupported project version: {payload.get('version')}")
+    return payload
+
+
+def apply_project_payload(
+    viewer: Any,
+    payload: dict[str, Any],
+    *,
+    path_exists: Callable[[str], bool] = os.path.exists,
+    allowed_volume_modes: set[str],
+    allowed_intermediate_types: set[str],
+    allowed_mask_scopes: set[str],
+) -> list[str]:
+    reset_for_project_load(viewer)
+
+    source_files = payload.get("source_files")
+    if not isinstance(source_files, list):
+        source_files = []
+
+    missing_sources: list[str] = []
+    for raw_path in source_files:
+        path = str(raw_path)
+        if not path_exists(path):
+            missing_sources.append(path)
+            continue
+        viewer._load_file(path, redraw=False)
+
+    surface_layers_raw = payload.get("surface_layers")
+    if isinstance(surface_layers_raw, list) and viewer.files:
+        index_by_key: dict[tuple[str, str | None], list[int]] = {}
+        for idx, surface in enumerate(viewer.files):
+            src = viewer._surface_source_paths[idx] if idx < len(viewer._surface_source_paths) else None
+            key = (surface.name, src)
+            index_by_key.setdefault(key, []).append(idx)
+        for entry in surface_layers_raw:
+            if not isinstance(entry, dict):
+                continue
+            key = (str(entry.get("name", "")), entry.get("source_path"))
+            candidates = index_by_key.get(key)
+            if not candidates:
+                continue
+            idx = candidates.pop(0)
+            if idx < len(viewer.layer_vars):
+                viewer.layer_vars[idx].set(bool(entry.get("visible", True)))
+
+    landxml_groups_raw = payload.get("landxml_groups")
+    if isinstance(landxml_groups_raw, dict):
+        for path, value in landxml_groups_raw.items():
+            var = viewer._landxml_group_vars.get(str(path))
+            if var is not None:
+                var.set(bool(value))
+
+    raster_layers_raw = payload.get("raster_layers")
+    if isinstance(raster_layers_raw, list):
+        for entry in raster_layers_raw:
+            if not isinstance(entry, dict):
+                continue
+            path = str(entry.get("path", ""))
+            if not path or not path_exists(path):
+                continue
+            viewer._load_raster(path)
+            idx = len(viewer._raster_layers) - 1
+            if idx < 0:
+                continue
+            layer = viewer._raster_layers[idx]
+            layer.visible.set(bool(entry.get("visible", True)))
+            try:
+                layer.alpha.set(float(entry.get("alpha", layer.alpha.get())))
+            except (TypeError, ValueError):
+                pass
+            if bool(entry.get("is_elevation", False)) and layer.elevation_surface is not None:
+                viewer._elevation_raster_index = idx
+
+    viewer.show_raster.set(bool(payload.get("show_raster", bool(viewer._raster_layers))))
+
+    sections_raw = payload.get("sections")
+    if isinstance(sections_raw, list):
+        for item in sections_raw:
+            if not isinstance(item, dict):
+                continue
+            start = item.get("start")
+            end = item.get("end")
+            if not isinstance(start, (list, tuple)) or not isinstance(end, (list, tuple)):
+                continue
+            if len(start) != 2 or len(end) != 2:
+                continue
+            try:
+                p0 = (float(start[0]), float(start[1]))
+                p1 = (float(end[0]), float(end[1]))
+            except (TypeError, ValueError):
+                continue
+            viewer._sections.append((p0, p1))
+    viewer._active_section_index = 0 if viewer._sections else None
+
+    masks_raw = payload.get("masks")
+    if isinstance(masks_raw, list):
+        for item in masks_raw:
+            if not isinstance(item, dict):
+                continue
+            vertices_raw = item.get("vertices")
+            if not isinstance(vertices_raw, list):
+                continue
+            vertices: list[tuple[float, float]] = []
+            for vertex in vertices_raw:
+                if not isinstance(vertex, (list, tuple)) or len(vertex) != 2:
+                    continue
+                try:
+                    vertices.append((float(vertex[0]), float(vertex[1])))
+                except (TypeError, ValueError):
+                    continue
+            if len(vertices) < 3:
+                continue
+            name = str(item.get("name", "")).strip() or None
+            visible = bool(item.get("visible", True))
+            viewer._append_mask(vertices, name=name, visible=visible)
+
+    active_mask = str(payload.get("active_mask", "")).strip()
+    if active_mask:
+        for idx, mask in enumerate(viewer._masks):
+            if mask.name == active_mask:
+                viewer._set_active_mask_index(idx)
+                break
+
+    notes_raw = payload.get("notes")
+    if isinstance(notes_raw, list):
+        for item in notes_raw:
+            if not isinstance(item, dict):
+                continue
+            try:
+                y = float(item.get("y"))
+                x = float(item.get("x"))
+            except (TypeError, ValueError):
+                continue
+            title = str(item.get("title", "")).strip()
+            text = str(item.get("text", "")).strip()
+            if not title and not text:
+                continue
+            visible = bool(item.get("visible", True))
+            viewer._append_note(title=title, text=text, y=y, x=x, visible=visible)
+
+    names = [surface.name for surface in viewer.files]
+    top_name = str(payload.get("top_surface", ""))
+    bottom_name = str(payload.get("bottom_surface", ""))
+    if top_name in names:
+        viewer.top_var.set(top_name)
+    if bottom_name in names:
+        viewer.bottom_var.set(bottom_name)
+
+    volume_mode = str(payload.get("volume_source_mode", ""))
+    if volume_mode in allowed_volume_modes:
+        viewer.volume_source_mode.set(volume_mode)
+    volume_method = str(payload.get("volume_method", "")).strip()
+    if volume_method in {"raster", "triangles"}:
+        viewer.volume_method.set(volume_method)
+
+    intermediate_type = str(payload.get("intermediate_type", ""))
+    if intermediate_type in allowed_intermediate_types:
+        viewer.intermediate_type.set(intermediate_type)
+    viewer.intermediate_kof_var.set(str(payload.get("intermediate_kof", "")))
+    viewer.intermediate_raster_var.set(str(payload.get("intermediate_raster", "")))
+    try:
+        viewer.intermediate_constant_z.set(
+            float(payload.get("intermediate_constant_z", viewer.intermediate_constant_z.get()))
+        )
+    except (TypeError, ValueError):
+        pass
+
+    scope = str(payload.get("mask_compute_scope", ""))
+    if scope in allowed_mask_scopes:
+        viewer.mask_compute_scope.set(scope)
+
+    viewer._refresh_file_selectors()
+    viewer._refresh_intermediate_raster_selector()
+    viewer._refresh_raster_selector()
+    viewer._refresh_mask_controls()
+    viewer._refresh_section_controls()
+    viewer._refresh_layer_controls()
+    viewer._on_intermediate_type_change()
+    viewer._redraw()
+
+    return missing_sources
