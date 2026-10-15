@@ -92,7 +92,10 @@ class LandXMLSurface:
         return True
 
     def set_boundary_factor(self, factor: float) -> None:
-        self._max_edge_factor = max(float(factor), 0.1)
+        next_factor = max(float(factor), 0.1)
+        if np.isclose(self._max_edge_factor, next_factor):
+            return
+        self._max_edge_factor = next_factor
         if self._tri is not None:
             self._update_boundary_mask()
 
@@ -239,7 +242,10 @@ class KOFFile:
 
     def set_boundary_factor(self, factor: float) -> None:
         """Set max edge-length factor (relative to median) for filtering."""
-        self._max_edge_factor = max(float(factor), 0.1)
+        next_factor = max(float(factor), 0.1)
+        if np.isclose(self._max_edge_factor, next_factor):
+            return
+        self._max_edge_factor = next_factor
         if self._tri is not None:
             self._update_boundary_mask()
 
