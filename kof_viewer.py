@@ -79,7 +79,25 @@ from kofvision.section_report import (
 )
 from kofvision.sections_io import SectionDataError, load_sections_json, save_sections_json
 from kofvision.volume import ConstantElevationSurface, SplitVolumeResult, SurfaceLike, VolumeResult
-from kofvision.raster import ElevationRasterSurface, load_elevation_surface, load_raster_layer
+from kofvision.raster import ElevationRasterSurface
+from kofvision.viewer_serialization import (
+    ProjectPayloadError,
+    apply_project_payload,
+    build_project_payload,
+    validate_project_payload,
+)
+from kofvision.viewer_state import clear_cached_mask_volume_results, reset_for_clear
+from kofvision.viewer_ui import configure_viewer_styles
+from kofvision.viewer_tools import (
+    MaskEditTool,
+    MaskTool,
+    MeasureTool,
+    NoteTool,
+    SectionTool,
+    ToolDispatcher,
+)
+from kofvision.viewer_rendering import render_2d, render_3d
+from kofvision.raster_management import RasterLayerManager
 
 try:
     import customtkinter as ctk
@@ -292,6 +310,9 @@ class KOFViewer(tk.Tk):
         self._note_visibility_vars: list[tk.BooleanVar] = []
         self._pending_note_click_after_id: Optional[str] = None
         self._pending_note_click_index: Optional[int] = None
+        self._RasterViewLayerClass = _RasterViewLayer
+        self._tool_dispatch = ToolDispatcher()
+        self._raster_manager = RasterLayerManager(self)
 
         self._configure_styles()
 
@@ -307,18 +328,7 @@ class KOFViewer(tk.Tk):
         self._redraw()
 
     def _configure_styles(self) -> None:
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        base_font = tkfont.nametofont("TkDefaultFont")
-        header_font = base_font.copy()
-        header_font.configure(weight="bold", size=max(base_font.cget("size"), 10))
-        style.configure("TopBar.TFrame", padding=4)
-        style.configure("PanelHeader.TLabel", font=header_font)
-        style.configure("PanelBody.TFrame", relief="groove", borderwidth=1)
-        style.configure("Primary.TButton", padding=(10, 6))
+        configure_viewer_styles(self)
 
     def _bind_shortcuts(self) -> None:
         self.bind_all("<Control-o>", lambda _e: self._invoke_shortcut(self._on_open))
@@ -1092,41 +1102,7 @@ class KOFViewer(tk.Tk):
         )
 
     def _on_clear(self) -> None:
-        self._close_section_windows()
-        self.files.clear()
-        self.landxml_files.clear()
-        self.layer_vars.clear()
-        self._surface_owner_paths.clear()
-        self._surface_source_paths.clear()
-        self._landxml_group_vars.clear()
-        self._view_extent_2d = None
-        self._latest_section_report_path = None
-        self.last_volume = None
-        self.volume_text.set("Volume: (not computed)")
-        self._measure_results.clear()
-        self._measure_click_points.clear()
-        self._sections.clear()
-        self._clear_active_section_marker(redraw=False)
-        self._active_section_index = None
-        self._masks.clear()
-        self._mask_visibility_vars.clear()
-        self._last_volume_per_mask_rows.clear()
-        self._last_mask_volume_results.clear()
-        self._active_mask_index = None
-        self.active_mask_var.set("")
-        self._mask_click_points.clear()
-        self._notes.clear()
-        self._note_visibility_vars.clear()
-        self._active_note_index = None
-        self._cancel_pending_note_single_click()
-        if self._mask_mode:
-            self._end_mask_mode()
-        if self._mask_edit_mode:
-            self._end_mask_edit_mode()
-        if self._measure_mode:
-            self._end_measure_mode()
-        if self._note_mode:
-            self._end_note_mode()
+        reset_for_clear(self)
         self._refresh_mask_controls()
         self._refresh_section_controls()
         self._refresh_mask_result_actions()
@@ -1135,9 +1111,7 @@ class KOFViewer(tk.Tk):
         self._redraw()
 
     def _clear_cached_mask_volume_results(self) -> None:
-        self._last_volume_per_mask_rows.clear()
-        self._last_mask_volume_results.clear()
-        self._refresh_mask_result_actions()
+        clear_cached_mask_volume_results(self)
 
     def _refresh_mask_result_actions(self) -> None:
         has_results = bool(self._last_mask_volume_results)
@@ -1495,79 +1469,7 @@ class KOFViewer(tk.Tk):
         if not out_path:
             return
 
-        source_files: list[str] = []
-        seen_sources: set[str] = set()
-        for path in self._surface_source_paths:
-            if not path or path in seen_sources:
-                continue
-            seen_sources.add(path)
-            source_files.append(path)
-
-        payload = {
-            "type": "kofvision.project",
-            "version": 1,
-            "saved_at": datetime.now().isoformat(timespec="seconds"),
-            "source_files": source_files,
-            "surface_layers": [
-                {
-                    "name": surface.name,
-                    "source_path": self._surface_source_paths[idx] if idx < len(self._surface_source_paths) else None,
-                    "owner_path": self._surface_owner_paths[idx] if idx < len(self._surface_owner_paths) else None,
-                    "visible": bool(self.layer_vars[idx].get()) if idx < len(self.layer_vars) else True,
-                }
-                for idx, surface in enumerate(self.files)
-            ],
-            "landxml_groups": {
-                path: bool(var.get())
-                for path, var in self._landxml_group_vars.items()
-            },
-            "raster_layers": [
-                {
-                    "path": layer.path,
-                    "visible": bool(layer.visible.get()),
-                    "alpha": float(layer.alpha.get()),
-                    "is_elevation": (idx == self._elevation_raster_index),
-                }
-                for idx, layer in enumerate(self._raster_layers)
-            ],
-            "show_raster": bool(self.show_raster.get()),
-            "top_surface": self.top_var.get(),
-            "bottom_surface": self.bottom_var.get(),
-            "volume_source_mode": self.volume_source_mode.get(),
-            "volume_method": self.volume_method.get(),
-            "intermediate_type": self.intermediate_type.get(),
-            "intermediate_kof": self.intermediate_kof_var.get(),
-            "intermediate_raster": self.intermediate_raster_var.get(),
-            "intermediate_constant_z": float(self.intermediate_constant_z.get()),
-            "mask_compute_scope": self.mask_compute_scope.get(),
-            "sections": [
-                {
-                    "start": [float(start[0]), float(start[1])],
-                    "end": [float(end[0]), float(end[1])],
-                }
-                for start, end in self._sections
-            ],
-            "masks": [
-                {
-                    "name": mask.name,
-                    "visible": bool(mask.visible),
-                    "vertices": [[float(y), float(x)] for y, x in mask.vertices],
-                }
-                for mask in self._masks
-                if len(mask.vertices) >= 3
-            ],
-            "active_mask": self.active_mask_var.get(),
-            "notes": [
-                {
-                    "title": note.title,
-                    "text": note.text,
-                    "y": float(note.y),
-                    "x": float(note.x),
-                    "visible": bool(note.visible),
-                }
-                for note in self._notes
-            ],
-        }
+        payload = build_project_payload(self)
 
         try:
             with open(out_path, "w", encoding="utf-8") as fh:
@@ -1593,203 +1495,18 @@ class KOFViewer(tk.Tk):
             messagebox.showerror("KOF Viewer", f"Failed to read project file:\n{exc}")
             return
 
-        if not isinstance(payload, dict) or payload.get("type") != "kofvision.project":
-            messagebox.showerror("KOF Viewer", "Invalid project file type.")
-            return
-        if int(payload.get("version", 0)) != 1:
-            messagebox.showerror("KOF Viewer", f"Unsupported project version: {payload.get('version')}")
-            return
-
-        self._close_section_windows()
-        self.files.clear()
-        self.landxml_files.clear()
-        self.layer_vars.clear()
-        self._surface_owner_paths.clear()
-        self._surface_source_paths.clear()
-        self._landxml_group_vars.clear()
-        self._sections.clear()
-        self._clear_active_section_marker(redraw=False)
-        self._active_section_index = None
-        self._measure_results.clear()
-        self._measure_click_points.clear()
-        self._masks.clear()
-        self._mask_visibility_vars.clear()
-        self._active_mask_index = None
-        self.active_mask_var.set("")
-        self._notes.clear()
-        self._note_visibility_vars.clear()
-        self._active_note_index = None
-        self._cancel_pending_note_single_click()
-        self._raster_layers.clear()
-        self._active_raster_index = None
-        self._elevation_raster_index = None
-        self._latest_section_report_path = None
-        if self._measure_mode:
-            self._end_measure_mode()
-        if self._note_mode:
-            self._end_note_mode()
-        self._clear_cached_mask_volume_results()
-
-        source_files = payload.get("source_files")
-        if not isinstance(source_files, list):
-            source_files = []
-
-        missing_sources: list[str] = []
-        for raw_path in source_files:
-            path = str(raw_path)
-            if not os.path.exists(path):
-                missing_sources.append(path)
-                continue
-            self._load_file(path, redraw=False)
-
-        surface_layers_raw = payload.get("surface_layers")
-        if isinstance(surface_layers_raw, list) and self.files:
-            index_by_key: dict[tuple[str, Optional[str]], list[int]] = {}
-            for idx, surface in enumerate(self.files):
-                src = self._surface_source_paths[idx] if idx < len(self._surface_source_paths) else None
-                key = (surface.name, src)
-                index_by_key.setdefault(key, []).append(idx)
-            for entry in surface_layers_raw:
-                if not isinstance(entry, dict):
-                    continue
-                key = (str(entry.get("name", "")), entry.get("source_path"))
-                candidates = index_by_key.get(key)
-                if not candidates:
-                    continue
-                idx = candidates.pop(0)
-                if idx < len(self.layer_vars):
-                    self.layer_vars[idx].set(bool(entry.get("visible", True)))
-
-        landxml_groups_raw = payload.get("landxml_groups")
-        if isinstance(landxml_groups_raw, dict):
-            for path, value in landxml_groups_raw.items():
-                var = self._landxml_group_vars.get(str(path))
-                if var is not None:
-                    var.set(bool(value))
-
-        raster_layers_raw = payload.get("raster_layers")
-        if isinstance(raster_layers_raw, list):
-            for entry in raster_layers_raw:
-                if not isinstance(entry, dict):
-                    continue
-                path = str(entry.get("path", ""))
-                if not path or not os.path.exists(path):
-                    continue
-                self._load_raster(path)
-                idx = len(self._raster_layers) - 1
-                if idx < 0:
-                    continue
-                layer = self._raster_layers[idx]
-                layer.visible.set(bool(entry.get("visible", True)))
-                try:
-                    layer.alpha.set(float(entry.get("alpha", layer.alpha.get())))
-                except (TypeError, ValueError, tk.TclError):
-                    pass
-                if bool(entry.get("is_elevation", False)) and layer.elevation_surface is not None:
-                    self._elevation_raster_index = idx
-
-        self.show_raster.set(bool(payload.get("show_raster", bool(self._raster_layers))))
-
-        sections_raw = payload.get("sections")
-        if isinstance(sections_raw, list):
-            for item in sections_raw:
-                if not isinstance(item, dict):
-                    continue
-                start = item.get("start")
-                end = item.get("end")
-                if not isinstance(start, (list, tuple)) or not isinstance(end, (list, tuple)):
-                    continue
-                if len(start) != 2 or len(end) != 2:
-                    continue
-                try:
-                    p0 = (float(start[0]), float(start[1]))
-                    p1 = (float(end[0]), float(end[1]))
-                except (TypeError, ValueError):
-                    continue
-                self._sections.append((p0, p1))
-        self._active_section_index = 0 if self._sections else None
-
-        masks_raw = payload.get("masks")
-        if isinstance(masks_raw, list):
-            for item in masks_raw:
-                if not isinstance(item, dict):
-                    continue
-                vertices_raw = item.get("vertices")
-                if not isinstance(vertices_raw, list):
-                    continue
-                vertices: list[tuple[float, float]] = []
-                for v in vertices_raw:
-                    if not isinstance(v, (list, tuple)) or len(v) != 2:
-                        continue
-                    try:
-                        vertices.append((float(v[0]), float(v[1])))
-                    except (TypeError, ValueError):
-                        continue
-                if len(vertices) < 3:
-                    continue
-                name = str(item.get("name", "")).strip() or None
-                visible = bool(item.get("visible", True))
-                self._append_mask(vertices, name=name, visible=visible)
-
-        active_mask = str(payload.get("active_mask", "")).strip()
-        if active_mask:
-            for idx, mask in enumerate(self._masks):
-                if mask.name == active_mask:
-                    self._set_active_mask_index(idx)
-                    break
-
-        notes_raw = payload.get("notes")
-        if isinstance(notes_raw, list):
-            for item in notes_raw:
-                if not isinstance(item, dict):
-                    continue
-                try:
-                    y = float(item.get("y"))
-                    x = float(item.get("x"))
-                except (TypeError, ValueError):
-                    continue
-                title = str(item.get("title", "")).strip()
-                text = str(item.get("text", "")).strip()
-                if not title and not text:
-                    continue
-                visible = bool(item.get("visible", True))
-                self._append_note(title=title, text=text, y=y, x=x, visible=visible)
-
-        names = [k.name for k in self.files]
-        top_name = str(payload.get("top_surface", ""))
-        bottom_name = str(payload.get("bottom_surface", ""))
-        if top_name in names:
-            self.top_var.set(top_name)
-        if bottom_name in names:
-            self.bottom_var.set(bottom_name)
-
-        volume_mode = str(payload.get("volume_source_mode", ""))
-        if volume_mode in VOLUME_LABEL_TO_MODE or volume_mode in VOLUME_MODE_LABELS.values():
-            self.volume_source_mode.set(volume_mode)
-        volume_method = str(payload.get("volume_method", "")).strip()
-        if volume_method in {"raster", "triangles"}:
-            self.volume_method.set(volume_method)
-        intermediate_type = str(payload.get("intermediate_type", ""))
-        if intermediate_type in INTERMEDIATE_LABEL_TO_TYPE or intermediate_type in INTERMEDIATE_TYPE_LABELS.values():
-            self.intermediate_type.set(intermediate_type)
-        self.intermediate_kof_var.set(str(payload.get("intermediate_kof", "")))
-        self.intermediate_raster_var.set(str(payload.get("intermediate_raster", "")))
         try:
-            self.intermediate_constant_z.set(float(payload.get("intermediate_constant_z", self.intermediate_constant_z.get())))
-        except (TypeError, ValueError, tk.TclError):
-            pass
-        scope = str(payload.get("mask_compute_scope", ""))
-        if scope in MASK_LABEL_TO_SCOPE or scope in MASK_SCOPE_LABELS.values():
-            self.mask_compute_scope.set(scope)
-
-        self._refresh_file_selectors()
-        self._refresh_intermediate_raster_selector()
-        self._refresh_raster_selector()
-        self._refresh_mask_controls()
-        self._refresh_section_controls()
-        self._refresh_layer_controls()
-        self._on_intermediate_type_change()
-        self._redraw()
+            project_payload = validate_project_payload(payload)
+        except ProjectPayloadError as exc:
+            messagebox.showerror("KOF Viewer", str(exc))
+            return
+        missing_sources = apply_project_payload(
+            self,
+            project_payload,
+            allowed_volume_modes=set(VOLUME_LABEL_TO_MODE) | set(VOLUME_MODE_LABELS.values()),
+            allowed_intermediate_types=set(INTERMEDIATE_LABEL_TO_TYPE) | set(INTERMEDIATE_TYPE_LABELS.values()),
+            allowed_mask_scopes=set(MASK_LABEL_TO_SCOPE) | set(MASK_SCOPE_LABELS.values()),
+        )
 
         msg = f"Project loaded:\n{in_path}"
         if missing_sources:
@@ -2192,228 +1909,52 @@ class KOFViewer(tk.Tk):
         )
 
     def _on_open_raster(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Open raster background",
-            filetypes=[
-                ("Raster images", "*.jpg *.jpeg *.png *.tif *.tiff *.bmp"),
-                ("All files", "*.*"),
-            ],
-        )
-        if not path:
-            return
-        self._load_raster(path)
+        self._raster_manager.on_open_raster()
 
     def _raster_display_name(self, idx: int) -> str:
-        layer = self._raster_layers[idx]
-        name = os.path.basename(layer.path)
-        marks: list[str] = []
-        if idx == self._elevation_raster_index:
-            marks.append("elev")
-        if idx == len(self._raster_layers) - 1:
-            marks.append("top")
-        if marks:
-            return f"{name} ({', '.join(marks)})"
-        return name
+        return self._raster_manager.raster_display_name(idx)
 
     def _refresh_raster_selector(self) -> None:
-        names = [self._raster_display_name(i) for i in range(len(self._raster_layers))]
-        self.active_raster_combo["values"] = names
-        if not names:
-            self._active_raster_index = None
-            self.active_raster_name.set("")
-            self._refresh_intermediate_raster_selector()
-            return
-        if self._active_raster_index is None or self._active_raster_index >= len(names):
-            self._active_raster_index = len(names) - 1
-        self.active_raster_name.set(names[self._active_raster_index])
-        self._sync_alpha_from_active()
-        self._refresh_intermediate_raster_selector()
+        self._raster_manager.refresh_raster_selector()
 
     def _set_active_raster_index(self, idx: Optional[int]) -> None:
-        if idx is None or idx < 0 or idx >= len(self._raster_layers):
-            self._active_raster_index = None
-            self.active_raster_name.set("")
-            return
-        self._active_raster_index = idx
-        self._refresh_raster_selector()
+        self._raster_manager.set_active_raster_index(idx)
 
     def _on_select_active_raster(self) -> None:
-        idx = self.active_raster_combo.current()
-        if idx < 0 or idx >= len(self._raster_layers):
-            return
-        self._active_raster_index = idx
-        self._sync_alpha_from_active()
+        self._raster_manager.on_select_active_raster()
 
     def _sync_alpha_from_active(self) -> None:
-        layer = self._get_active_raster_layer()
-        if layer is None:
-            return
-        self.raster_alpha.set(float(layer.alpha.get()))
+        self._raster_manager.sync_alpha_from_active()
 
     def _get_active_raster_layer(self) -> Optional[_RasterViewLayer]:
-        idx = self._active_raster_index
-        if idx is None or idx < 0 or idx >= len(self._raster_layers):
-            return None
-        return self._raster_layers[idx]
+        return self._raster_manager.get_active_raster_layer()
 
     def _top_visible_raster_layer(self) -> Optional[_RasterViewLayer]:
-        if not self.show_raster.get():
-            return None
-        for layer in reversed(self._raster_layers):
-            if layer.visible.get():
-                return layer
-        return None
+        return self._raster_manager.top_visible_raster_layer()
 
     def _on_move_raster_up(self) -> None:
-        idx = self._active_raster_index
-        if idx is None or idx >= len(self._raster_layers) - 1:
-            return
-        self._raster_layers[idx], self._raster_layers[idx + 1] = self._raster_layers[idx + 1], self._raster_layers[idx]
-        if self._elevation_raster_index == idx:
-            self._elevation_raster_index = idx + 1
-        elif self._elevation_raster_index == idx + 1:
-            self._elevation_raster_index = idx
-        self._active_raster_index = idx + 1
-        self._refresh_raster_selector()
-        self._refresh_layer_controls()
-        self._redraw()
+        self._raster_manager.on_move_raster_up()
 
     def _on_move_raster_down(self) -> None:
-        idx = self._active_raster_index
-        if idx is None or idx <= 0:
-            return
-        self._raster_layers[idx], self._raster_layers[idx - 1] = self._raster_layers[idx - 1], self._raster_layers[idx]
-        if self._elevation_raster_index == idx:
-            self._elevation_raster_index = idx - 1
-        elif self._elevation_raster_index == idx - 1:
-            self._elevation_raster_index = idx
-        self._active_raster_index = idx - 1
-        self._refresh_raster_selector()
-        self._refresh_layer_controls()
-        self._redraw()
+        self._raster_manager.on_move_raster_down()
 
     def _on_set_elevation_raster(self) -> None:
-        idx = self._active_raster_index
-        if idx is None:
-            messagebox.showinfo("KOF Viewer", "No active raster selected.")
-            return
-        layer = self._raster_layers[idx]
-        if layer.elevation_surface is None:
-            messagebox.showwarning(
-                "KOF Viewer",
-                "Selected raster is not a supported single-band elevation raster.",
-            )
-            return
-        self._elevation_raster_index = idx
-        self._refresh_raster_selector()
-        self._refresh_layer_controls()
-        self._redraw_2d()
+        self._raster_manager.on_set_elevation_raster()
 
     def _on_clear_raster(self) -> None:
-        idx = self._active_raster_index
-        if idx is None or idx < 0 or idx >= len(self._raster_layers):
-            return
-        self._raster_layers.pop(idx)
-        if self._elevation_raster_index is not None:
-            if self._elevation_raster_index == idx:
-                self._elevation_raster_index = None
-            elif self._elevation_raster_index > idx:
-                self._elevation_raster_index -= 1
-        if not self._raster_layers:
-            self.show_raster.set(False)
-            self._active_raster_index = None
-        else:
-            self._active_raster_index = min(idx, len(self._raster_layers) - 1)
-        self._refresh_raster_selector()
-        self._refresh_layer_controls()
-        self._redraw()
+        self._raster_manager.on_clear_raster()
 
     def _on_raster_alpha_change(self) -> None:
-        try:
-            alpha = float(self.raster_alpha.get())
-        except (tk.TclError, ValueError):
-            return
-        alpha = min(max(alpha, 0.05), 1.0)
-        self.raster_alpha.set(alpha)
-        layer = self._get_active_raster_layer()
-        if layer is not None:
-            layer.alpha.set(alpha)
-        if self._raster_layers and self.show_raster.get():
-            self._redraw_2d()
+        self._raster_manager.on_raster_alpha_change()
 
     def _on_tin_fill_alpha_change(self) -> None:
-        try:
-            alpha = float(self.tin_fill_alpha.get())
-        except (tk.TclError, ValueError):
-            alpha = 0.14
-        alpha = min(max(alpha, 0.0), 1.0)
-        self.tin_fill_alpha.set(alpha)
-        self._redraw_2d()
+        self._raster_manager.on_tin_fill_alpha_change()
 
     def _on_tin_fill_alpha_scale(self, _value: str) -> None:
-        # Scale updates the same variable continuously; just redraw.
-        self._on_tin_fill_alpha_change()
+        self._raster_manager.on_tin_fill_alpha_scale(_value)
 
     def _load_raster(self, path: str) -> None:
-        clip_bounds = self._all_files_bounds()
-        clip_buffer_m = self._safe_clip_buffer_m()
-        try:
-            layer = load_raster_layer(
-                path,
-                clip_bounds=clip_bounds,
-                clip_buffer_m=clip_buffer_m,
-                prefer_clip=bool(self.raster_clip_to_kof.get()),
-            )
-        except FileNotFoundError:
-            messagebox.showerror(
-                "KOF Viewer",
-                "No world file was found for the selected raster.\n\n"
-                "Expected one of: .jgw/.pgw/.tfw/.wld beside the image.",
-            )
-            return
-        except Exception as exc:  # noqa: BLE001
-            messagebox.showerror(
-                "KOF Viewer",
-                f"Failed to load raster or world file:\n{exc}",
-            )
-            return
-
-        elevation_surface: Optional[ElevationRasterSurface] = None
-        try:
-            elevation_surface = load_elevation_surface(
-                path,
-                clip_bounds=clip_bounds,
-                clip_buffer_m=clip_buffer_m,
-                prefer_clip=bool(self.raster_clip_to_kof.get()),
-            )
-        except Exception:
-            elevation_surface = None
-
-        self._raster_layers.append(
-            _RasterViewLayer(
-                path=path,
-                image=layer.image,
-                extent=layer.extent,
-                origin=layer.origin,
-                visible=tk.BooleanVar(value=True),
-                alpha=tk.DoubleVar(value=float(self.raster_alpha.get())),
-                elevation_surface=elevation_surface,
-            )
-        )
-        self._active_raster_index = len(self._raster_layers) - 1
-        if self._elevation_raster_index is None and elevation_surface is not None:
-            self._elevation_raster_index = self._active_raster_index
-        self.show_raster.set(True)
-        self._refresh_raster_selector()
-        self._refresh_layer_controls()
-        self._redraw()
-
-        if elevation_surface is None:
-            messagebox.showinfo(
-                "KOF Viewer",
-                "Raster loaded for display, but it is not a supported single-band elevation raster.\n"
-                "Volume modes using raster elevation require a single-band DEM.",
-            )
+        self._raster_manager.load_raster(path)
 
     def _on_reset_view(self) -> None:
         self._view_extent_2d = None
@@ -2647,19 +2188,7 @@ class KOFViewer(tk.Tk):
             self.intermediate_kof_var.set("")
 
     def _refresh_intermediate_raster_selector(self) -> None:
-        self._intermediate_raster_index_map.clear()
-        names: list[str] = []
-        for idx, layer in enumerate(self._raster_layers):
-            if layer.elevation_surface is None:
-                continue
-            label = self._raster_display_name(idx)
-            names.append(label)
-            self._intermediate_raster_index_map[label] = idx
-        self.intermediate_raster_combo["values"] = names
-        if names and self.intermediate_raster_var.get() not in self._intermediate_raster_index_map:
-            self.intermediate_raster_var.set(names[0])
-        if not names:
-            self.intermediate_raster_var.set("")
+        self._raster_manager.refresh_intermediate_raster_selector()
 
     def _refresh_layer_controls(self) -> None:
         for child in self.layers_inner.winfo_children():
@@ -3537,115 +3066,23 @@ class KOFViewer(tk.Tk):
 
     # --------------------------------------------------------- Section tool
     def _on_toggle_section(self) -> None:
-        if self._mask_mode:
-            self._end_mask_mode()
-        if self._measure_mode:
-            self._end_measure_mode()
-        if self._note_mode:
-            self._end_note_mode()
-        if self._section_mode:
-            self._end_section_mode()
-            return
-        if len(self.files) < 2:
-            messagebox.showinfo("KOF Viewer",
-                                "Load at least two files and select Top/Bottom first.")
-            return
-        if not self.top_var.get() or not self.bottom_var.get():
-            messagebox.showinfo("KOF Viewer",
-                                "Pick a top and bottom surface before drawing a section.")
-            return
-        self._section_mode = True
-        self._section_click_points = []
-        self.section_btn.configure(text="Cancel section")
-        self.notebook.select(0)  # switch to 2D tab
-        self.status.set("Section mode: click two points on the 2D plot "
-                        "(right-click or press Esc to cancel).")
-        self._section_cid = self.canvas2d.mpl_connect(
-            "button_press_event", self._on_section_click
-        )
-        self.bind("<Escape>", lambda _e: self._end_section_mode())
+        SectionTool.toggle(self)
 
     def _end_section_mode(self) -> None:
-        self._section_mode = False
-        if self._section_cid is not None:
-            self.canvas2d.mpl_disconnect(self._section_cid)
-            self._section_cid = None
-        self.section_btn.configure(text="Draw section")
-        self.unbind("<Escape>")
-        self._section_click_points = []
-        # Drop any in-progress preview; completed sections are kept via
-        # self._sections and redrawn by _redraw_2d.
-        self._section_preview = None
-        self._update_status()
+        SectionTool.end(self)
 
     def _on_section_click(self, event) -> None:  # noqa: ANN001
-        if event.inaxes is not self.ax2d:
-            return
-        if event.button == 3:  # right-click cancels
-            self._end_section_mode()
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-        self._section_click_points.append((event.xdata, event.ydata))
-
-        if len(self._section_click_points) == 1:
-            self.status.set(
-                "Section mode: click the second endpoint "
-                "(right-click or Esc to cancel)."
-            )
-            (y0, x0) = self._section_click_points[0]
-            self.ax2d.plot([y0], [x0], marker="x", color="black", markersize=8)
-            self.canvas2d.draw_idle()
-            return
-
-        (y0, x0), (y1, x1) = self._section_click_points
-        self._sections.append(((y0, x0), (y1, x1)))
-        self._active_section_index = len(self._sections) - 1
-        self._refresh_section_controls()
-
-        top = self._find_file(self.top_var.get())
-        bot = self._find_file(self.bottom_var.get())
-        self._end_section_mode()
-        self._redraw_2d()  # draw the persisted section (and clear preview)
-        if top is not None and bot is not None:
-            self._open_section_window_at_index(len(self._sections) - 1, top=top, bottom=bot)
+        SectionTool.on_click(self, event)
 
     # -------------------------------------------------------------- Map notes
     def _on_toggle_note_mode(self) -> None:
-        if self._section_mode:
-            self._end_section_mode()
-        if self._mask_mode:
-            self._end_mask_mode()
-        if self._mask_edit_mode:
-            self._end_mask_edit_mode()
-        if self._measure_mode:
-            self._end_measure_mode()
-        if self._note_mode:
-            self._end_note_mode()
-            self._redraw_2d()
-            return
-
-        self._note_mode = True
-        self.note_btn.configure(text="Cancel note")
-        self.notebook.select(0)
-        self.status.set("Note mode: click a point on the 2D map to place a note. Right-click or Esc to cancel.")
-        self._note_cid = self.canvas2d.mpl_connect("button_press_event", self._on_note_place_click)
-        self.bind("<Escape>", lambda _e: self._cancel_note_mode())
+        NoteTool.toggle(self)
 
     def _cancel_note_mode(self) -> None:
-        self._end_note_mode()
-        self._redraw_2d()
+        NoteTool.cancel(self)
 
     def _end_note_mode(self) -> None:
-        self._note_mode = False
-        self._cancel_pending_note_single_click()
-        if self._note_cid is not None:
-            self.canvas2d.mpl_disconnect(self._note_cid)
-            self._note_cid = None
-        if hasattr(self, "note_btn"):
-            self.note_btn.configure(text="Add note")
-        self.unbind("<Escape>")
-        self._update_status()
+        NoteTool.end(self)
 
     def _note_pick_tolerance(self) -> float:
         xmin, xmax = self.ax2d.get_xlim()
@@ -3798,27 +3235,7 @@ class KOFViewer(tk.Tk):
         return result["action"], result["title"], result["text"]
 
     def _on_note_place_click(self, event) -> None:  # noqa: ANN001
-        if event.inaxes is not self.ax2d:
-            return
-        if event.button == 3:
-            self._cancel_note_mode()
-            return
-        if event.button != 1:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-
-        action, title, text = self._edit_note_dialog(title_value="", text_value="", allow_delete=False)
-        if action != "save":
-            return
-        if not title and not text:
-            messagebox.showinfo("Map note", "Note was empty and was not created.")
-            return
-        self._append_note(title=title, text=text, y=float(event.xdata), x=float(event.ydata), visible=True)
-        self._end_note_mode()
-        self._redraw_2d()
-        note = self._notes[-1]
-        self.status.set(f"Added note '{note.title}'.")
+        NoteTool.on_place_click(self, event)
 
     def _show_note_at_index(self, idx: int) -> None:
         if idx < 0 or idx >= len(self._notes):
@@ -3934,53 +3351,13 @@ class KOFViewer(tk.Tk):
         return f"Meas {index + 1}"
 
     def _on_toggle_measure(self) -> None:
-        if self._section_mode:
-            self._end_section_mode()
-        if self._mask_mode:
-            self._end_mask_mode()
-        if self._mask_edit_mode:
-            self._end_mask_edit_mode()
-        if self._note_mode:
-            self._end_note_mode()
-        if self._measure_mode:
-            self._end_measure_mode()
-            self._redraw_2d()
-            return
-
-        self._measure_mode = True
-        self._measure_click_points = []
-        self.measure_btn.configure(text="Cancel measure")
-        if hasattr(self, "measure_toggle_btn"):
-            self.measure_toggle_btn.configure(text="Cancel measure")
-        self.notebook.select(0)
-        mode = self._current_measure_mode_key()
-        if mode == "polygon":
-            self.status.set(
-                "Measure polygon: left-click vertices, then right-click or double-click to close. Esc to cancel."
-            )
-        else:
-            self.status.set(
-                "Measure line: click two points on the 2D plot. Right-click or Esc to cancel."
-            )
-        self._measure_cid = self.canvas2d.mpl_connect("button_press_event", self._on_measure_click)
-        self.bind("<Escape>", lambda _e: self._cancel_measure_mode())
+        MeasureTool.toggle(self)
 
     def _cancel_measure_mode(self) -> None:
-        self._measure_click_points = []
-        self._end_measure_mode()
-        self._redraw_2d()
+        MeasureTool.cancel(self)
 
     def _end_measure_mode(self) -> None:
-        self._measure_mode = False
-        if self._measure_cid is not None:
-            self.canvas2d.mpl_disconnect(self._measure_cid)
-            self._measure_cid = None
-        self.measure_btn.configure(text="Measure")
-        if hasattr(self, "measure_toggle_btn"):
-            self.measure_toggle_btn.configure(text="Start measure")
-        self.unbind("<Escape>")
-        self._measure_click_points = []
-        self._update_status()
+        MeasureTool.end(self)
 
     def _finalize_line_measure(self, points: list[tuple[float, float]]) -> None:
         if len(points) != 2:
@@ -4017,41 +3394,7 @@ class KOFViewer(tk.Tk):
         self.status.set(f"{label}: area {area_m2:,.2f} m2, perimeter {perimeter_m:,.2f} m")
 
     def _on_measure_click(self, event) -> None:  # noqa: ANN001
-        if event.inaxes is not self.ax2d:
-            return
-        mode = self._current_measure_mode_key()
-
-        if event.button == 3:
-            if mode == "polygon" and len(self._measure_click_points) >= 3:
-                self._finalize_polygon_measure(self._measure_click_points)
-            else:
-                self._cancel_measure_mode()
-            return
-
-        if event.button != 1:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-
-        self._measure_click_points.append((float(event.xdata), float(event.ydata)))
-
-        if mode == "line":
-            if len(self._measure_click_points) == 1:
-                self.status.set("Measure line: click second point.")
-                self._redraw_2d()
-                return
-            self._finalize_line_measure(self._measure_click_points[:2])
-            return
-
-        if event.dblclick and len(self._measure_click_points) >= 3:
-            self._finalize_polygon_measure(self._measure_click_points)
-            return
-
-        self.status.set(
-            f"Measure polygon: {len(self._measure_click_points)} vertex/vertices. "
-            "Left-click to add more, right-click or double-click to close."
-        )
-        self._redraw_2d()
+        MeasureTool.on_click(self, event)
 
     def _on_clear_measurements(self) -> None:
         had_data = bool(self._measure_results)
@@ -4066,44 +3409,13 @@ class KOFViewer(tk.Tk):
 
     # ----------------------------------------------------------- Polygon mask
     def _on_toggle_mask(self) -> None:
-        if self._section_mode:
-            self._end_section_mode()
-        if self._measure_mode:
-            self._end_measure_mode()
-        if self._mask_edit_mode:
-            self._end_mask_edit_mode()
-        if self._note_mode:
-            self._end_note_mode()
-        if self._mask_mode:
-            self._end_mask_mode()
-            self._redraw_2d()
-            return
-        self._mask_mode = True
-        self._mask_click_points = []
-        self.mask_btn.configure(text="Cancel mask")
-        self.notebook.select(0)  # switch to 2D tab
-        self.status.set(
-            "Mask mode: left-click to add polygon vertices. "
-            "Right-click (or double-click) to close. Esc to cancel."
-        )
-        self._mask_cid = self.canvas2d.mpl_connect(
-            "button_press_event", self._on_mask_click
-        )
-        self.bind("<Escape>", lambda _e: self._cancel_mask_mode())
+        MaskTool.toggle(self)
 
     def _cancel_mask_mode(self) -> None:
-        self._mask_click_points = []
-        self._end_mask_mode()
-        self._redraw_2d()
+        MaskTool.cancel(self)
 
     def _end_mask_mode(self) -> None:
-        self._mask_mode = False
-        if self._mask_cid is not None:
-            self.canvas2d.mpl_disconnect(self._mask_cid)
-            self._mask_cid = None
-        self.mask_btn.configure(text="Draw mask")
-        self.unbind("<Escape>")
-        self._update_status()
+        MaskTool.end(self)
 
     def _on_clear_mask(self) -> None:
         had_mask = bool(self._masks)
@@ -4123,41 +3435,7 @@ class KOFViewer(tk.Tk):
         self._redraw()
 
     def _on_mask_click(self, event) -> None:  # noqa: ANN001
-        if event.inaxes is not self.ax2d:
-            return
-        if event.button == 3:  # right-click finalizes, if possible
-            if len(self._mask_click_points) >= 3:
-                self._append_mask(self._mask_click_points)
-                self._mask_click_points = []
-                self._end_mask_mode()
-                if self.last_volume is not None:
-                    self.volume_text.set("Volume: (stale – recompute)")
-                self._refresh_mask_controls()
-                self._redraw()
-            else:
-                self._cancel_mask_mode()
-            return
-        if event.button != 1:
-            return
-        if event.xdata is None or event.ydata is None:
-            return
-
-        self._mask_click_points.append((event.xdata, event.ydata))
-        if event.dblclick and len(self._mask_click_points) >= 3:
-            self._append_mask(self._mask_click_points)
-            self._mask_click_points = []
-            self._end_mask_mode()
-            if self.last_volume is not None:
-                self.volume_text.set("Volume: (stale – recompute)")
-            self._refresh_mask_controls()
-            self._redraw()
-            return
-
-        self.status.set(
-            f"Mask mode: {len(self._mask_click_points)} vertex/vertices. "
-            "Left-click to add more, right-click or double-click to close."
-        )
-        self._redraw_2d()
+        MaskTool.on_click(self, event)
 
     def _mask_pick_tolerance(self) -> float:
         xmin, xmax = self.ax2d.get_xlim()
@@ -4182,55 +3460,10 @@ class KOFViewer(tk.Tk):
         return None
 
     def _on_toggle_mask_edit(self) -> None:
-        if self._section_mode:
-            self._end_section_mode()
-        if self._measure_mode:
-            self._end_measure_mode()
-        if self._mask_mode:
-            self._end_mask_mode()
-        if self._note_mode:
-            self._end_note_mode()
-        if self._mask_edit_mode:
-            self._end_mask_edit_mode()
-            self._redraw_2d()
-            return
-
-        active = self._active_mask()
-        if active is None or len(active.vertices) < 3:
-            messagebox.showinfo("KOF Viewer", "Select a closed mask before editing.")
-            return
-
-        self._mask_edit_mode = True
-        self._mask_drag_vertex_index = None
-        self._mask_changed_since_last_compute = False
-        self.mask_edit_btn.configure(text="Finish mask edit")
-        self.notebook.select(0)
-        self.status.set(
-            "Mask edit: drag vertices on selected mask. Right-click or Esc to finish."
-        )
-        self._mask_edit_press_cid = self.canvas2d.mpl_connect("button_press_event", self._on_mask_edit_press)
-        self._mask_edit_motion_cid = self.canvas2d.mpl_connect("motion_notify_event", self._on_mask_edit_motion)
-        self._mask_edit_release_cid = self.canvas2d.mpl_connect("button_release_event", self._on_mask_edit_release)
-        self.bind("<Escape>", lambda _e: self._end_mask_edit_mode())
+        MaskEditTool.toggle(self)
 
     def _end_mask_edit_mode(self) -> None:
-        self._mask_edit_mode = False
-        if self._mask_edit_press_cid is not None:
-            self.canvas2d.mpl_disconnect(self._mask_edit_press_cid)
-            self._mask_edit_press_cid = None
-        if self._mask_edit_motion_cid is not None:
-            self.canvas2d.mpl_disconnect(self._mask_edit_motion_cid)
-            self._mask_edit_motion_cid = None
-        if self._mask_edit_release_cid is not None:
-            self.canvas2d.mpl_disconnect(self._mask_edit_release_cid)
-            self._mask_edit_release_cid = None
-        self._mask_drag_vertex_index = None
-        self.mask_edit_btn.configure(text="Edit selected mask")
-        self.unbind("<Escape>")
-        if self._mask_changed_since_last_compute and self.last_volume is not None:
-            self.volume_text.set("Volume: (stale – recompute)")
-        self._mask_changed_since_last_compute = False
-        self._update_status()
+        MaskEditTool.end(self)
 
     def _on_mask_edit_press(self, event) -> None:  # noqa: ANN001
         if not self._mask_edit_mode or event.inaxes is not self.ax2d:
@@ -4420,389 +3653,10 @@ class KOFViewer(tk.Tk):
         self._update_status()
 
     def _redraw_2d(self) -> None:
-        self.ax2d.clear()
-        self.ax2d.set_xlabel("Easting (Y)")
-        self.ax2d.set_ylabel("Northing (X)")
-        self.ax2d.grid(True, linestyle=":", alpha=0.5)
-
-        if self.show_raster.get() and self._raster_layers:
-            for layer in self._raster_layers:
-                if not layer.visible.get():
-                    continue
-                self.ax2d.imshow(
-                    layer.image,
-                    extent=layer.extent,
-                    origin=layer.origin,
-                    alpha=float(layer.alpha.get()),
-                    zorder=0,
-                )
-
-        for idx, kof in enumerate(self.files):
-            if not self._is_layer_visible(idx):
-                continue
-            color = FILE_COLORS[idx % len(FILE_COLORS)]
-            if isinstance(kof, KOFFile):
-                labeled = False
-                for block in kof.blocks:
-                    if not block.points:
-                        continue
-                    xs = [p.y for p in block.points]
-                    ys = [p.x for p in block.points]
-                    label = kof.name if not labeled else None
-                    labeled = True
-                    if block.is_polyline and self.show_lines.get() and len(block.points) >= 2:
-                        self.ax2d.plot(xs, ys, "-", color=color, linewidth=1.2, label=label)
-                        if self.show_markers.get():
-                            self.ax2d.plot(xs, ys, "o", color=color, markersize=3)
-                    else:
-                        marker = "o" if self.show_markers.get() else "."
-                        self.ax2d.plot(xs, ys, marker, color=color, markersize=4,
-                                       linestyle="None", label=label)
-
-                    if self.show_labels.get():
-                        for p in block.points:
-                            self.ax2d.annotate(
-                                p.pkt, (p.y, p.x), fontsize=7,
-                                xytext=(3, 3), textcoords="offset points", color=color,
-                            )
-            else:
-                if self.show_markers.get() and kof.ensure_triangulation() and kof._xy is not None:
-                    self.ax2d.plot(
-                        kof._xy[:, 0],
-                        kof._xy[:, 1],
-                        "o",
-                        color=color,
-                        markersize=2,
-                        linestyle="None",
-                        label=kof.name,
-                    )
-
-            draw_tin_faces = isinstance(kof, LandXMLSurface) and len(kof.faces) > 0 and self.show_lines.get()
-            if (self.show_triangulation.get() or draw_tin_faces) and kof.ensure_triangulation():
-                kept = kof.kept_simplices
-                if kept is not None and len(kept) > 0:
-                    if draw_tin_faces and self.show_tin_fill.get() and kof._xy is not None:
-                        face_vals = np.zeros(len(kept), dtype=float)
-                        self.ax2d.tripcolor(
-                            kof._xy[:, 0],
-                            kof._xy[:, 1],
-                            face_vals,
-                            triangles=kept,
-                            shading="flat",
-                            vmin=0.0,
-                            vmax=1.0,
-                            color=color,
-                            alpha=float(self.tin_fill_alpha.get()),
-                            zorder=1,
-                        )
-                    self.ax2d.triplot(
-                        kof._xy[:, 0], kof._xy[:, 1], kept,
-                        color=color, linewidth=0.45, alpha=0.75,
-                    )
-
-        for lidx, lx in enumerate(self.landxml_files):
-            color = FILE_COLORS[(len(self.files) + lidx) % len(FILE_COLORS)]
-            labeled = False
-            for alignment in lx.alignments:
-                if self.show_lines.get() and len(alignment.centerline) >= 2:
-                    ys = [pt[0] for pt in alignment.centerline]
-                    xs = [pt[1] for pt in alignment.centerline]
-                    self.ax2d.plot(
-                        ys,
-                        xs,
-                        "-",
-                        color=color,
-                        linewidth=1.6,
-                        alpha=0.85,
-                        label=f"{lx.name}::{alignment.name}" if not labeled else None,
-                    )
-                    labeled = True
-                if self.show_stations.get():
-                    for st in alignment.stations:
-                        self.ax2d.plot([st.y], [st.x], marker="x", color=color, markersize=4)
-                        self.ax2d.annotate(
-                            st.label,
-                            (st.y, st.x),
-                            fontsize=7,
-                            xytext=(3, 3),
-                            textcoords="offset points",
-                            color=color,
-                        )
-
-        if self.equal_aspect.get():
-            self.ax2d.set_aspect("equal", adjustable="datalim")
-        else:
-            self.ax2d.set_aspect("auto")
-
-        if self._view_extent_2d is not None:
-            xmin, xmax, ymin, ymax = self._view_extent_2d
-            self.ax2d.set_xlim(xmin, xmax)
-            self.ax2d.set_ylim(ymin, ymax)
-
-        # Persisted section lines (drawn on top of surface data).
-        for i, ((y0, x0), (y1, x1)) in enumerate(self._sections):
-            label = self._section_label(i)
-            self.ax2d.plot([y0, y1], [x0, x1], "-", color="black", linewidth=1.6,
-                           zorder=5)
-            self.ax2d.plot([y0, y1], [x0, x1], "s", color="black", markersize=4,
-                           zorder=6)
-            # Label the two endpoints as A / A' (etc.)
-            self.ax2d.annotate(
-                label, (y0, x0), fontsize=9, fontweight="bold", color="black",
-                xytext=(6, 6), textcoords="offset points", zorder=7,
-            )
-            self.ax2d.annotate(
-                f"{label}'", (y1, x1), fontsize=9, fontweight="bold", color="black",
-                xytext=(6, 6), textcoords="offset points", zorder=7,
-            )
-
-        if (
-            self._active_section_marker_index is not None
-            and self._active_section_marker_chainage_m is not None
-            and 0 <= self._active_section_marker_index < len(self._sections)
-        ):
-            (y0, x0), (y1, x1) = self._sections[self._active_section_marker_index]
-            dy = y1 - y0
-            dx = x1 - x0
-            length = float(np.hypot(dy, dx))
-            if length > 0:
-                chainage = min(max(self._active_section_marker_chainage_m, 0.0), length)
-                t = chainage / length
-                py = y0 + (dy * t)
-                px = x0 + (dx * t)
-
-                xmin, xmax = self.ax2d.get_xlim()
-                ymin, ymax = self.ax2d.get_ylim()
-                span = max(abs(xmax - xmin), abs(ymax - ymin), 1e-9)
-                tick_half_len = max(0.5, span * 0.012)
-                perp_y = -dx / length
-                perp_x = dy / length
-                y_tick0 = py - (perp_y * tick_half_len)
-                x_tick0 = px - (perp_x * tick_half_len)
-                y_tick1 = py + (perp_y * tick_half_len)
-                x_tick1 = px + (perp_x * tick_half_len)
-
-                self.ax2d.plot(
-                    [y_tick0, y_tick1],
-                    [x_tick0, x_tick1],
-                    "-",
-                    color="#b00020",
-                    linewidth=2.0,
-                    zorder=16,
-                )
-                self.ax2d.plot(
-                    [py],
-                    [px],
-                    "o",
-                    color="#b00020",
-                    markersize=6,
-                    zorder=17,
-                )
-                self.ax2d.annotate(
-                    f"s={chainage:,.2f} m",
-                    (py, px),
-                    fontsize=8,
-                    color="#b00020",
-                    xytext=(8, -12),
-                    textcoords="offset points",
-                    zorder=18,
-                )
-
-        # Persisted masks (active one highlighted).
-        for idx, mask in enumerate(self._masks):
-            if not self._mask_is_visible(idx):
-                continue
-            if len(mask.vertices) < 3:
-                continue
-            arr = np.asarray(mask.vertices, dtype=float)
-            closed = np.vstack([arr, arr[0]])
-            is_active = idx == self._active_mask_index
-            fill_alpha = 0.20 if is_active else 0.10
-            edge_width = 2.4 if is_active else 1.2
-            color = FILE_COLORS[idx % len(FILE_COLORS)]
-            self.ax2d.fill(closed[:, 0], closed[:, 1], color=color, alpha=fill_alpha, zorder=8)
-            self.ax2d.plot(closed[:, 0], closed[:, 1], "-", color=color, linewidth=edge_width, zorder=9)
-            self.ax2d.plot(arr[:, 0], arr[:, 1], "o", color=color, markersize=4, zorder=10)
-            self.ax2d.annotate(
-                mask.name,
-                (arr[0, 0], arr[0, 1]),
-                fontsize=8,
-                color=color,
-                xytext=(6, 6),
-                textcoords="offset points",
-                fontweight="bold" if is_active else "normal",
-                zorder=11,
-            )
-
-        # In-progress polygon while mask mode is active.
-        if self._mask_mode and self._mask_click_points:
-            arr = np.asarray(self._mask_click_points, dtype=float)
-            self.ax2d.plot(arr[:, 0], arr[:, 1], "--", color="#cc8a00",
-                           linewidth=1.3, zorder=11)
-            self.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#cc8a00",
-                           markersize=4, zorder=12)
-            if len(arr) >= 2:
-                self.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]],
-                               ":", color="#cc8a00", linewidth=1.0, zorder=11)
-
-        # Persisted measurement overlays.
-        for idx, item in enumerate(self._measure_results):
-            kind = item.get("kind", "")
-            points = item.get("points", [])
-            if not isinstance(points, list) or len(points) < 2:
-                continue
-            arr = np.asarray(points, dtype=float)
-            label = self._measurement_label(idx)
-            color = "#0b7285"
-
-            if kind == "line" and len(arr) >= 2:
-                p0 = arr[0]
-                p1 = arr[1]
-                self.ax2d.plot([p0[0], p1[0]], [p0[1], p1[1]], "-", color=color, linewidth=1.8, zorder=12)
-                self.ax2d.plot([p0[0], p1[0]], [p0[1], p1[1]], "o", color=color, markersize=4, zorder=13)
-                mid = (0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1]))
-                dist = float(item.get("length_m", self._measure_line_length((p0[0], p0[1]), (p1[0], p1[1]))))
-                self.ax2d.annotate(
-                    f"{label}: {dist:,.2f} m",
-                    mid,
-                    fontsize=8,
-                    color=color,
-                    xytext=(6, 6),
-                    textcoords="offset points",
-                    zorder=14,
-                )
-            elif kind == "polygon" and len(arr) >= 3:
-                closed = np.vstack([arr, arr[0]])
-                self.ax2d.fill(closed[:, 0], closed[:, 1], color=color, alpha=0.10, zorder=11)
-                self.ax2d.plot(closed[:, 0], closed[:, 1], "-", color=color, linewidth=1.6, zorder=12)
-                self.ax2d.plot(arr[:, 0], arr[:, 1], "o", color=color, markersize=3.5, zorder=13)
-                area = float(item.get("area_m2", self._measure_polygon_area([(float(p[0]), float(p[1])) for p in arr])))
-                peri = float(item.get("perimeter_m", self._measure_polygon_perimeter([(float(p[0]), float(p[1])) for p in arr])))
-                center = (float(np.mean(arr[:, 0])), float(np.mean(arr[:, 1])))
-                self.ax2d.annotate(
-                    f"{label}: {area:,.2f} m2 | {peri:,.2f} m",
-                    center,
-                    fontsize=8,
-                    color=color,
-                    xytext=(6, 6),
-                    textcoords="offset points",
-                    zorder=14,
-                )
-
-        # In-progress measurement while measure mode is active.
-        if self._measure_mode and self._measure_click_points:
-            arr = np.asarray(self._measure_click_points, dtype=float)
-            kind = self._current_measure_mode_key()
-            self.ax2d.plot(arr[:, 0], arr[:, 1], "--", color="#0b7285", linewidth=1.4, zorder=14)
-            self.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#0b7285", markersize=4, zorder=15)
-            if kind == "polygon" and len(arr) >= 2:
-                self.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]], ":", color="#0b7285", linewidth=1.0, zorder=14)
-
-        # Persisted note markers.
-        for idx, note in enumerate(self._notes):
-            if not note.visible:
-                continue
-            is_active = idx == self._active_note_index
-            color = "#b23a48" if is_active else "#495057"
-            edge_width = 2.0 if is_active else 1.2
-            marker_size = 11 if is_active else 9
-            self.ax2d.plot(
-                [note.y],
-                [note.x],
-                "o",
-                markerfacecolor="#fff9db",
-                markeredgecolor=color,
-                markeredgewidth=edge_width,
-                markersize=marker_size,
-                zorder=19,
-            )
-            self.ax2d.annotate(
-                "N",
-                (note.y, note.x),
-                ha="center",
-                va="center",
-                fontsize=7,
-                fontweight="bold",
-                color=color,
-                zorder=20,
-            )
-            self.ax2d.annotate(
-                note.title,
-                (note.y, note.x),
-                fontsize=8,
-                color=color,
-                xytext=(8, 8),
-                textcoords="offset points",
-                fontweight="bold" if is_active else "normal",
-                zorder=21,
-            )
-
-        if self.files or self.landxml_files:
-            self.ax2d.legend(loc="best", fontsize=8)
-        else:
-            self.ax2d.text(
-                0.5, 0.5, "Open a .kof or .xml file to begin",
-                transform=self.ax2d.transAxes, ha="center", va="center", color="gray",
-            )
-
-        self.fig2d.tight_layout()
-        self.canvas2d.draw_idle()
+        render_2d(self, FILE_COLORS)
 
     def _redraw_3d(self) -> None:
-        self.ax3d.clear()
-        self.ax3d.set_xlabel("Easting (Y)")
-        self.ax3d.set_ylabel("Northing (X)")
-        self.ax3d.set_zlabel("Elevation (H)")
-
-        for idx, kof in enumerate(self.files):
-            if not self._is_layer_visible(idx):
-                continue
-            color = FILE_COLORS[idx % len(FILE_COLORS)]
-            labeled = False
-            if self.show_triangulation.get() and hasattr(kof, "ensure_triangulation") and kof.ensure_triangulation():
-                kept = kof.kept_simplices
-                if kept is not None and len(kept) > 0:
-                    self.ax3d.plot_trisurf(
-                        kof._xy[:, 0], kof._xy[:, 1], kof._z,
-                        triangles=kept,
-                        color=color, alpha=0.35, linewidth=0.2, edgecolor=color,
-                    )
-            if isinstance(kof, KOFFile):
-                for block in kof.blocks:
-                    if not block.points:
-                        continue
-                    xs = [p.y for p in block.points]
-                    ys = [p.x for p in block.points]
-                    zs = [p.h for p in block.points]
-                    label = kof.name if not labeled else None
-                    labeled = True
-                    if block.is_polyline and self.show_lines.get() and len(block.points) >= 2:
-                        self.ax3d.plot(xs, ys, zs, "-", color=color,
-                                       linewidth=1.2, label=label)
-                        if self.show_markers.get():
-                            self.ax3d.scatter(xs, ys, zs, color=color, s=10)
-                    else:
-                        if self.show_markers.get():
-                            self.ax3d.scatter(xs, ys, zs, color=color, s=12, label=label)
-
-                    if self.show_labels.get():
-                        for p in block.points:
-                            self.ax3d.text(p.y, p.x, p.h, p.pkt, fontsize=7, color=color)
-            else:
-                if kof.ensure_triangulation() and kof._xy is not None and kof._z is not None and self.show_markers.get():
-                    self.ax3d.scatter(kof._xy[:, 0], kof._xy[:, 1], kof._z, color=color, s=10, label=kof.name)
-
-        if self.files:
-            self.ax3d.legend(loc="best", fontsize=8)
-            self._equalize_3d_aspect()
-        else:
-            self.ax3d.text2D(
-                0.5, 0.5, "Open a surface-enabled file to begin",
-                transform=self.ax3d.transAxes, ha="center", va="center", color="gray",
-            )
-
-        self.fig3d.tight_layout()
-        self.canvas3d.draw_idle()
+        render_3d(self, FILE_COLORS)
 
     def _equalize_3d_aspect(self) -> None:
         all_x: list[float] = []
