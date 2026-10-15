@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import tkinter as tk
+from tkinter import ttk
 from tkinter import messagebox
 
 TOOL_NONE = "none"
@@ -101,6 +103,155 @@ class SectionTool:
 
 class NoteTool:
     @staticmethod
+    def pick_tolerance(viewer) -> float:  # noqa: ANN001
+        xmin, xmax = viewer.ax2d.get_xlim()
+        ymin, ymax = viewer.ax2d.get_ylim()
+        span = max(abs(xmax - xmin), abs(ymax - ymin), 1e-9)
+        return span * 0.02
+
+    @staticmethod
+    def pick_index(viewer, y: float, x: float):  # noqa: ANN001
+        if not viewer._notes:
+            return None
+        tol = NoteTool.pick_tolerance(viewer)
+        best_idx = None
+        best_dist2 = float("inf")
+        for idx, note in enumerate(viewer._notes):
+            if not note.visible:
+                continue
+            dy = note.y - y
+            dx = note.x - x
+            dist2 = (dy * dy) + (dx * dx)
+            if dist2 <= (tol * tol) and dist2 < best_dist2:
+                best_dist2 = dist2
+                best_idx = idx
+        return best_idx
+
+    @staticmethod
+    def default_title(index: int) -> str:
+        return f"Note {index + 1}"
+
+    @staticmethod
+    def edit_dialog(
+        viewer,  # noqa: ANN001
+        *,
+        title_value: str,
+        text_value: str,
+        allow_delete: bool,
+    ) -> tuple[str, str, str]:
+        dialog = tk.Toplevel(viewer)
+        dialog.title("Map note")
+        dialog.transient(viewer)
+        dialog.grab_set()
+        dialog.resizable(True, True)
+
+        container = ttk.Frame(dialog, padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(container, text="Title:").pack(anchor="w")
+        title_var = tk.StringVar(value=title_value)
+        title_entry = ttk.Entry(container, textvariable=title_var, width=48)
+        title_entry.pack(fill=tk.X, pady=(2, 8))
+
+        ttk.Label(container, text="Comment:").pack(anchor="w")
+        text_widget = tk.Text(container, width=52, height=10, wrap="word")
+        text_widget.pack(fill=tk.BOTH, expand=True, pady=(2, 8))
+        text_widget.insert("1.0", text_value)
+
+        result: dict[str, str] = {
+            "action": "cancel",
+            "title": title_value,
+            "text": text_value,
+        }
+
+        def _save() -> None:
+            result["action"] = "save"
+            result["title"] = title_var.get().strip()
+            result["text"] = text_widget.get("1.0", "end-1c").strip()
+            dialog.destroy()
+
+        def _delete() -> None:
+            result["action"] = "delete"
+            result["title"] = title_var.get().strip()
+            result["text"] = text_widget.get("1.0", "end-1c").strip()
+            dialog.destroy()
+
+        buttons = ttk.Frame(container)
+        buttons.pack(fill=tk.X)
+        if allow_delete:
+            ttk.Button(buttons, text="Delete", command=_delete).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(buttons, text="Save", command=_save).pack(side=tk.RIGHT, padx=(0, 6))
+
+        dialog.bind("<Escape>", lambda _e: dialog.destroy())
+        title_entry.focus_set()
+        viewer.wait_window(dialog)
+        return result["action"], result["title"], result["text"]
+
+    @staticmethod
+    def show_at_index(viewer, idx: int) -> None:  # noqa: ANN001
+        if idx < 0 or idx >= len(viewer._notes):
+            return
+        viewer._active_note_index = idx
+        note = viewer._notes[idx]
+        body = note.text if note.text else "(no comment)"
+        messagebox.showinfo(note.title, body)
+        viewer._redraw_2d()
+
+    @staticmethod
+    def edit_at_index(viewer, idx: int) -> None:  # noqa: ANN001
+        if idx < 0 or idx >= len(viewer._notes):
+            return
+        note = viewer._notes[idx]
+        action, title, text = NoteTool.edit_dialog(
+            viewer,
+            title_value=note.title,
+            text_value=note.text,
+            allow_delete=True,
+        )
+        if action == "delete":
+            if viewer._delete_note_at_index(idx, ask_confirm=True):
+                viewer._redraw_2d()
+                viewer.status.set("Note deleted.")
+            return
+        if action != "save":
+            return
+        if not title and not text:
+            if messagebox.askyesno("Delete empty note", "The note is empty. Delete it?"):
+                if viewer._delete_note_at_index(idx, ask_confirm=False):
+                    viewer._redraw_2d()
+                    viewer.status.set("Note deleted.")
+            return
+        note.title = title or NoteTool.default_title(idx)
+        note.text = text
+        viewer._active_note_index = idx
+        viewer._refresh_layer_controls()
+        viewer._redraw_2d()
+        viewer.status.set(f"Updated note '{note.title}'.")
+
+    @staticmethod
+    def on_map_click(viewer, event) -> None:  # noqa: ANN001
+        if event.inaxes is not viewer.ax2d:
+            return
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        if viewer._section_mode or viewer._mask_mode or viewer._mask_edit_mode or viewer._measure_mode or viewer._note_mode:
+            return
+        idx = NoteTool.pick_index(viewer, float(event.xdata), float(event.ydata))
+        if idx is None:
+            viewer._cancel_pending_note_single_click()
+            return
+        if event.dblclick:
+            viewer._cancel_pending_note_single_click()
+            NoteTool.edit_at_index(viewer, idx)
+            return
+        viewer._cancel_pending_note_single_click()
+        viewer._pending_note_click_index = idx
+        viewer._pending_note_click_after_id = viewer.after(250, viewer._run_pending_note_single_click)
+
+    @staticmethod
     def toggle(viewer) -> None:  # noqa: ANN001
         if viewer._section_mode:
             viewer._end_section_mode()
@@ -153,7 +304,12 @@ class NoteTool:
         if event.xdata is None or event.ydata is None:
             return
 
-        action, title, text = viewer._edit_note_dialog(title_value="", text_value="", allow_delete=False)
+        action, title, text = NoteTool.edit_dialog(
+            viewer,
+            title_value="",
+            text_value="",
+            allow_delete=False,
+        )
         if action != "save":
             return
         if not title and not text:
@@ -394,3 +550,46 @@ class MaskEditTool:
         viewer._mask_changed_since_last_compute = False
         viewer._refresh_mask_controls()
         viewer._update_status()
+
+    @staticmethod
+    def on_press(viewer, event) -> None:  # noqa: ANN001
+        if not viewer._mask_edit_mode or event.inaxes is not viewer.ax2d:
+            return
+        if event.button == 3:
+            viewer._end_mask_edit_mode()
+            viewer._redraw_2d()
+            return
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        active = viewer._active_mask()
+        if active is None:
+            return
+        idx = viewer._pick_vertex_index(active.vertices, (event.xdata, event.ydata))
+        if idx is not None:
+            viewer._mask_drag_vertex_index = idx
+
+    @staticmethod
+    def on_motion(viewer, event) -> None:  # noqa: ANN001
+        if not viewer._mask_edit_mode:
+            return
+        idx = viewer._mask_drag_vertex_index
+        if idx is None:
+            return
+        if event.inaxes is not viewer.ax2d or event.xdata is None or event.ydata is None:
+            return
+        active = viewer._active_mask()
+        if active is None or idx < 0 or idx >= len(active.vertices):
+            return
+        active.vertices[idx] = (float(event.xdata), float(event.ydata))
+        viewer._clear_cached_mask_volume_results()
+        viewer._mask_changed_since_last_compute = True
+        viewer._redraw_2d()
+
+    @staticmethod
+    def on_release(viewer, event) -> None:  # noqa: ANN001
+        if not viewer._mask_edit_mode:
+            return
+        if event.button == 1:
+            viewer._mask_drag_vertex_index = None
