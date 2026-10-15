@@ -30,6 +30,8 @@ Usage
     python kof_viewer.py file1.kof file2.kof   # preload files
 """
 
+__version__ = "0.2026.10.15"
+
 from __future__ import annotations
 
 import argparse
