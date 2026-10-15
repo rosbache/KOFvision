@@ -30,9 +30,9 @@ Usage
     python kof_viewer.py file1.kof file2.kof   # preload files
 """
 
-__version__ = "0.2026.10.15"
-
 from __future__ import annotations
+
+__version__ = "0.2026.10.15"
 
 import argparse
 import copy
@@ -540,6 +540,28 @@ class KOFViewer(tk.Tk):
     def _invoke_shortcut(callback) -> str:  # noqa: ANN001
         callback()
         return "break"
+
+    def _deactivate_2d_nav_mode(self) -> None:
+        """Ensure Matplotlib pan/zoom mode is off so custom map tools get clicks."""
+        if not hasattr(self, "toolbar2d"):
+            return
+        toolbar = self.toolbar2d
+
+        # Newer Matplotlib exposes a mode enum/string.
+        mode_raw = getattr(toolbar, "mode", "")
+        mode_text = str(mode_raw).lower()
+
+        # Older NavigationToolbar2Tk keeps active mode on _active.
+        active_raw = getattr(toolbar, "_active", None)
+        active_text = str(active_raw).lower() if active_raw is not None else ""
+
+        try:
+            if "pan" in mode_text or active_text == "pan":
+                toolbar.pan()
+            elif "zoom" in mode_text or active_text == "zoom":
+                toolbar.zoom()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _make_toolbar_button(
         self,

@@ -17,6 +17,25 @@ def initialize_2d_axes(viewer: Any) -> None:
     ax.set_ylabel("Northing (X)")
 
 
+def _max_label_count(viewer: Any) -> int:
+    var = getattr(viewer, "max_labels", None)
+    if var is None:
+        return 400
+    try:
+        value = int(var.get())
+    except Exception:  # noqa: BLE001
+        return 400
+    return max(0, value)
+
+
+def _label_step(count: int, max_labels: int) -> int:
+    if max_labels <= 0:
+        return 10**9
+    if count <= max_labels:
+        return 1
+    return int(np.ceil(count / max_labels))
+
+
 def initialize_3d_axes(viewer: Any) -> None:
     ax = viewer.ax3d
     ax.clear()
@@ -72,7 +91,10 @@ def _draw_kof_surface(viewer: Any, surface: KOFFile, color: str) -> None:
             viewer.ax2d.plot(xs, ys, marker, color=color, markersize=4, linestyle="None", label=label)
 
         if viewer.show_labels.get():
-            for point in block.points:
+            step = _label_step(len(block.points), _max_label_count(viewer))
+            for pidx, point in enumerate(block.points):
+                if pidx % step != 0:
+                    continue
                 viewer.ax2d.annotate(
                     point.pkt,
                     (point.y, point.x),
@@ -146,7 +168,10 @@ def _draw_alignments_and_stations(viewer: Any, file_colors: list[str]) -> None:
                 )
                 labeled = True
             if viewer.show_stations.get():
-                for station in alignment.stations:
+                step = _label_step(len(alignment.stations), _max_label_count(viewer))
+                for sidx, station in enumerate(alignment.stations):
+                    if sidx % step != 0:
+                        continue
                     viewer.ax2d.plot([station.y], [station.x], marker="x", color=color, markersize=4)
                     viewer.ax2d.annotate(
                         station.label,
@@ -214,6 +239,7 @@ def _draw_active_section_marker(viewer: Any) -> None:
         return
 
     chainage = min(max(viewer._active_section_marker_chainage_m, 0.0), length)
+    section_label = viewer._section_label(viewer._active_section_marker_index)
     t = chainage / length
     py = y0 + (dy * t)
     px = x0 + (dx * t)
@@ -232,7 +258,7 @@ def _draw_active_section_marker(viewer: Any) -> None:
     viewer.ax2d.plot([y_tick0, y_tick1], [x_tick0, x_tick1], "-", color="#b00020", linewidth=2.0, zorder=16)
     viewer.ax2d.plot([py], [px], "o", color="#b00020", markersize=6, zorder=17)
     viewer.ax2d.annotate(
-        f"s={chainage:,.2f} m",
+        f"{section_label} | s={chainage:,.2f} m",
         (py, px),
         fontsize=8,
         color="#b00020",
