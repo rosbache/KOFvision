@@ -87,7 +87,14 @@ from kofvision.viewer_serialization import (
     validate_project_payload,
 )
 from kofvision.viewer_state import clear_cached_mask_volume_results, reset_for_clear
-from kofvision.viewer_ui import DARK_COLORS, configure_viewer_styles
+from kofvision.viewer_ui import (
+    DARK_COLORS,
+    apply_matplotlib_figure_theme,
+    apply_matplotlib_toolbar_theme,
+    configure_viewer_styles,
+    get_theme_palette,
+    normalize_theme_name,
+)
 from kofvision.viewer_tools import (
     MaskEditTool,
     MaskTool,
@@ -179,6 +186,7 @@ class _HoverTooltip:
     def _show(self, _event=None) -> None:  # noqa: ANN001
         if self.tip_window is not None:
             return
+        palette = getattr(self.widget.winfo_toplevel(), "_theme", DARK_COLORS)
         x = self.widget.winfo_rootx() + 18
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
         tip = tk.Toplevel(self.widget)
@@ -188,8 +196,8 @@ class _HoverTooltip:
             tip,
             text=self.text,
             justify=tk.LEFT,
-            background=DARK_COLORS["bg_surface"],
-            foreground=DARK_COLORS["fg_primary"],
+            background=palette.get("tooltip_bg", DARK_COLORS["tooltip_bg"]),
+            foreground=palette.get("tooltip_fg", DARK_COLORS["tooltip_fg"]),
             relief=tk.SOLID,
             borderwidth=1,
             padx=6,
@@ -210,9 +218,12 @@ class KOFViewer(tk.Tk):
         super().__init__()
         self.title("KOF Viewer – 2D / 3D / Volume / Section")
         self.geometry("1300x860")
+        env_theme = os.environ.get("KOFVISION_THEME", "dark")
+        self.theme_mode = tk.StringVar(value=normalize_theme_name(env_theme))
+        self._theme = get_theme_palette(self.theme_mode.get())
         self._ctk_enabled = ctk is not None and os.environ.get("KOFVISION_DISABLE_CTK", "0") != "1"
         if self._ctk_enabled:
-            ctk.set_appearance_mode("Dark")
+            ctk.set_appearance_mode("Dark" if self.theme_mode.get() == "dark" else "Light")
             ctk.set_default_color_theme("blue")
 
         self.files: list[KOFFile | LandXMLSurface] = []
@@ -271,6 +282,7 @@ class KOFViewer(tk.Tk):
         self._section_preview = None  # transient Line2D while drawing
         self._sections: list[tuple[tuple[float, float], tuple[float, float]]] = []
         self._section_windows: list[tk.Toplevel] = []
+        self._mask_results_windows: list[tk.Toplevel] = []
         self._active_section_marker_index: Optional[int] = None
         self._active_section_marker_chainage_m: Optional[float] = None
         self._active_section_index: Optional[int] = None
@@ -321,6 +333,7 @@ class KOFViewer(tk.Tk):
         self._build_body()
         self._build_statusbar()
         self._bind_shortcuts()
+        self._apply_theme(self.theme_mode.get(), redraw=False)
 
         for path in initial_files or []:
             self._load_file(path, redraw=False)
@@ -329,7 +342,72 @@ class KOFViewer(tk.Tk):
         self._redraw()
 
     def _configure_styles(self) -> None:
-        configure_viewer_styles(self)
+        self._theme = configure_viewer_styles(self, self.theme_mode.get())
+
+    def _cleanup_mask_results_windows(self) -> None:
+        self._mask_results_windows = [w for w in self._mask_results_windows if w.winfo_exists()]
+
+    def _close_mask_results_windows(self) -> None:
+        self._cleanup_mask_results_windows()
+        for win in self._mask_results_windows:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        self._mask_results_windows.clear()
+
+    def _apply_theme(self, theme_name: Optional[str] = None, *, redraw: bool = True) -> None:
+        mode = normalize_theme_name(theme_name or self.theme_mode.get())
+        self.theme_mode.set(mode)
+        if self._ctk_enabled:
+            ctk.set_appearance_mode("Dark" if mode == "dark" else "Light")
+
+        self._theme = configure_viewer_styles(self, mode)
+
+        if hasattr(self, "measure_mode_menu"):
+            self.measure_mode_menu.configure(
+                background=self._theme["bg_surface"],
+                foreground=self._theme["fg_primary"],
+                activebackground=self._theme["accent"],
+                activeforeground="#ffffff",
+            )
+        if hasattr(self, "theme_menu"):
+            self.theme_menu.configure(
+                background=self._theme["bg_surface"],
+                foreground=self._theme["fg_primary"],
+                activebackground=self._theme["accent"],
+                activeforeground="#ffffff",
+            )
+        if hasattr(self, "theme_btn"):
+            self.theme_btn.configure(text=f"Theme: {mode.title()}")
+
+        if hasattr(self, "controls_canvas"):
+            self.controls_canvas.configure(background=self._theme["bg_surface"])
+
+        if hasattr(self, "fig2d"):
+            apply_matplotlib_figure_theme(self.fig2d, self._theme)
+        if hasattr(self, "fig3d"):
+            apply_matplotlib_figure_theme(self.fig3d, self._theme)
+        if hasattr(self, "toolbar2d"):
+            apply_matplotlib_toolbar_theme(self.toolbar2d, self._theme)
+        if hasattr(self, "toolbar3d"):
+            apply_matplotlib_toolbar_theme(self.toolbar3d, self._theme)
+
+        self._cleanup_section_windows()
+        for win in self._section_windows:
+            if hasattr(win, "refresh_theme"):
+                win.refresh_theme(self._theme)
+
+        self._cleanup_mask_results_windows()
+        for win in self._mask_results_windows:
+            if hasattr(win, "refresh_theme"):
+                win.refresh_theme(self._theme)
+
+        if redraw and hasattr(self, "canvas2d") and hasattr(self, "canvas3d"):
+            self._redraw()
+
+    def _on_theme_changed(self) -> None:
+        self._apply_theme(self.theme_mode.get(), redraw=True)
 
     def _bind_shortcuts(self) -> None:
         self.bind_all("<Control-o>", lambda _e: self._invoke_shortcut(self._on_open))
@@ -422,17 +500,25 @@ class KOFViewer(tk.Tk):
         _HoverTooltip(self.note_btn, "Shortcut: Ctrl+Shift+N")
 
         self.measure_mode_btn = ttk.Menubutton(top, text="Measure mode")
-        measure_mode_menu = tk.Menu(self.measure_mode_btn, tearoff=False)
+        self.measure_mode_menu = tk.Menu(self.measure_mode_btn, tearoff=False)
         for _mode_key, mode_label in MEASURE_MODE_LABELS.items():
-            measure_mode_menu.add_radiobutton(
+            self.measure_mode_menu.add_radiobutton(
                 label=mode_label,
                 value=mode_label,
                 variable=self.measure_mode,
                 command=self._on_measure_mode_changed,
             )
-        self.measure_mode_btn.configure(menu=measure_mode_menu)
+        self.measure_mode_btn.configure(menu=self.measure_mode_menu)
         self.measure_mode_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.measure_mode_btn, "Choose how Measure behaves (line distance or polygon area).")
+
+        self.theme_btn = ttk.Menubutton(top, text="Theme")
+        self.theme_menu = tk.Menu(self.theme_btn, tearoff=False)
+        self.theme_menu.add_radiobutton(label="Dark", value="dark", variable=self.theme_mode, command=self._on_theme_changed)
+        self.theme_menu.add_radiobutton(label="Light", value="light", variable=self.theme_mode, command=self._on_theme_changed)
+        self.theme_btn.configure(menu=self.theme_menu)
+        self.theme_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.theme_btn, "Switch between dark and light application themes.")
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
@@ -447,7 +533,7 @@ class KOFViewer(tk.Tk):
         ttk.Label(
             top,
             text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute, Ctrl+Shift+N note",
-            foreground=DARK_COLORS["fg_muted"],
+            style="Muted.TLabel",
         ).pack(side=tk.RIGHT, padx=(8, 0))
 
     def _add_collapsible_panel(
@@ -878,8 +964,8 @@ class KOFViewer(tk.Tk):
         self.ax3d = self.fig3d.add_subplot(111, projection="3d")
         self.canvas3d = FigureCanvasTkAgg(self.fig3d, master=frame3d)
         self.canvas3d.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        toolbar3d = NavigationToolbar2Tk(self.canvas3d, frame3d)
-        toolbar3d.update()
+        self.toolbar3d = NavigationToolbar2Tk(self.canvas3d, frame3d)
+        self.toolbar3d.update()
         self.notebook.add(frame3d, text="3D")
 
         self.controls_frame = ttk.Frame(body, padding=(2, 2, 4, 4), width=380)
@@ -891,7 +977,7 @@ class KOFViewer(tk.Tk):
         ttk.Label(controls_header, text="Panels", style="PanelHeader.TLabel").pack(side=tk.LEFT)
 
         self.controls_canvas = tk.Canvas(self.controls_frame, highlightthickness=0, borderwidth=0)
-        self.controls_canvas.configure(background=DARK_COLORS["bg_surface"])
+        self.controls_canvas.configure(background=self._theme["bg_surface"])
         self.controls_scrollbar = ttk.Scrollbar(
             self.controls_frame,
             orient=tk.VERTICAL,
@@ -1104,6 +1190,7 @@ class KOFViewer(tk.Tk):
         )
 
     def _on_clear(self) -> None:
+        self._close_mask_results_windows()
         reset_for_clear(self)
         self._refresh_mask_controls()
         self._refresh_section_controls()
@@ -1127,7 +1214,9 @@ class KOFViewer(tk.Tk):
         if not self._last_mask_volume_results:
             messagebox.showinfo("KOF Viewer", "No per-mask volume results available. Run Compute volume first.")
             return
-        MaskVolumeResultsWindow(self, self._last_mask_volume_results)
+        self._cleanup_mask_results_windows()
+        popup = MaskVolumeResultsWindow(self, self._last_mask_volume_results, theme_palette=self._theme)
+        self._mask_results_windows.append(popup)
 
     def _on_export_mask_results_csv(self) -> None:
         rows = self._last_mask_volume_results
@@ -3031,6 +3120,7 @@ class KOFViewer(tk.Tk):
             bottom,
             (y0, x0),
             (y1, x1),
+            theme_palette=self._theme,
             raster_surface=self._section_reference_raster(),
             intermediate_surface=section_intermediate,
             area_top_surface=area_top_surface,
@@ -3638,6 +3728,7 @@ class SectionWindow(tk.Toplevel):
         bottom: SurfaceLike,
         p0: tuple[float, float],
         p1: tuple[float, float],
+        theme_palette: Optional[dict[str, str]] = None,
         raster_surface: Optional[ElevationRasterSurface] = None,
         intermediate_surface: Optional[Any] = None,
         area_top_surface: Optional[Any] = None,
@@ -3650,6 +3741,8 @@ class SectionWindow(tk.Toplevel):
         on_chainage_change: Optional[Any] = None,
     ) -> None:
         super().__init__(master)
+        self._theme = dict(theme_palette or DARK_COLORS)
+        self.configure(background=self._theme["bg_root"])
         title_label = f" ({label}–{label}')" if label else ""
         raster_title = " + raster" if raster_surface is not None else ""
         intermediate_title = " + intermediate" if intermediate_surface is not None else ""
@@ -3706,6 +3799,8 @@ class SectionWindow(tk.Toplevel):
         fig = Figure(figsize=(8, 4.5), dpi=100)
         ax = fig.add_subplot(111)
         self._section_ax = ax
+        apply_matplotlib_figure_theme(fig, self._theme)
+        ax.set_facecolor(self._theme["mpl_axes_bg"])
 
         if np.any(np.isfinite(z_top)):
             ax.plot(dists, z_top, color="#1f77b4", linewidth=1.6,
@@ -3776,7 +3871,7 @@ class SectionWindow(tk.Toplevel):
         center_dist = 0.5 * total_len
         self._chainage_indicator = ax.axvline(
             center_dist,
-            color="#444444",
+            color=self._theme["mpl_spine"],
             linestyle="--",
             linewidth=1.1,
             alpha=0.85,
@@ -3787,6 +3882,13 @@ class SectionWindow(tk.Toplevel):
         ax.set_ylabel("Elevation (m)")
         ax.grid(True, linestyle=":", alpha=0.5)
         ax.legend(loc="best", fontsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(self._theme["mpl_spine"])
+        ax.xaxis.label.set_color(self._theme["mpl_text"])
+        ax.yaxis.label.set_color(self._theme["mpl_text"])
+        ax.tick_params(axis="x", colors=self._theme["mpl_text"])
+        ax.tick_params(axis="y", colors=self._theme["mpl_text"])
+        ax.title.set_color(self._theme["mpl_text"])
         ax.set_title(
             f"Length {total_len:,.2f} m   |   "
             f"Area ({area_top_label} - {area_bottom_label}) net {area_net:+,.2f} m²   "
@@ -3796,8 +3898,9 @@ class SectionWindow(tk.Toplevel):
         canvas = FigureCanvasTkAgg(fig, master=self)
         self._section_canvas = canvas
         canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-        toolbar = NavigationToolbar2Tk(canvas, self)
-        toolbar.update()
+        self._toolbar = NavigationToolbar2Tk(canvas, self)
+        self._toolbar.update()
+        apply_matplotlib_toolbar_theme(self._toolbar, self._theme)
 
         slider_row = ttk.Frame(self, padding=(8, 4, 8, 0))
         slider_row.pack(side=tk.BOTTOM, fill=tk.X)
@@ -3828,6 +3931,33 @@ class SectionWindow(tk.Toplevel):
         info.pack(side=tk.BOTTOM, fill=tk.X)
 
         self._set_chainage(center_dist, notify=True, update_slider=False)
+        self.refresh_theme(self._theme)
+
+    def refresh_theme(self, theme_palette: dict[str, str]) -> None:
+        self._theme = dict(theme_palette)
+        self.configure(background=self._theme["bg_root"])
+        apply_matplotlib_figure_theme(self._section_canvas.figure, self._theme)
+        ax = self._section_ax
+        ax.set_facecolor(self._theme["mpl_axes_bg"])
+        for spine in ax.spines.values():
+            spine.set_color(self._theme["mpl_spine"])
+        ax.xaxis.label.set_color(self._theme["mpl_text"])
+        ax.yaxis.label.set_color(self._theme["mpl_text"])
+        ax.tick_params(axis="x", colors=self._theme["mpl_text"])
+        ax.tick_params(axis="y", colors=self._theme["mpl_text"])
+        ax.title.set_color(self._theme["mpl_text"])
+        ax.grid(True, linestyle=":", alpha=0.5, color=self._theme["mpl_grid"])
+        legend = ax.get_legend()
+        if legend is not None:
+            frame = legend.get_frame()
+            frame.set_facecolor(self._theme["mpl_legend_bg"])
+            frame.set_edgecolor(self._theme["mpl_legend_edge"])
+            frame.set_alpha(0.9)
+            for txt in legend.get_texts():
+                txt.set_color(self._theme["mpl_text"])
+        if hasattr(self, "_toolbar"):
+            apply_matplotlib_toolbar_theme(self._toolbar, self._theme)
+        self._section_canvas.draw_idle()
 
     def _set_chainage(self, chainage_m: float, *, notify: bool, update_slider: bool) -> None:
         if self._section_total_len <= 0:
@@ -3883,28 +4013,41 @@ class MaskVolumeResultsWindow(tk.Toplevel):
             return None
 
     @staticmethod
-    def _soften_hex_color(hex_color: str, *, strength: float = 0.88) -> str:
-        """Blend a hex color toward white so it works as a table row background."""
+    def _blend_hex_color(hex_color: str, *, target_hex: str, strength: float = 0.88) -> str:
+        """Blend a hex color toward a target color for table row backgrounds."""
         h = (hex_color or "").strip().lstrip("#")
+        target = (target_hex or "").strip().lstrip("#")
         if len(h) != 6:
             return "#f5f5f5"
+        if len(target) != 6:
+            target = "ffffff"
         try:
             r = int(h[0:2], 16)
             g = int(h[2:4], 16)
             b = int(h[4:6], 16)
+            tr = int(target[0:2], 16)
+            tg = int(target[2:4], 16)
+            tb = int(target[4:6], 16)
         except ValueError:
             return "#f5f5f5"
 
         t = min(max(float(strength), 0.0), 1.0)
-        rr = int(round(r + (255 - r) * t))
-        gg = int(round(g + (255 - g) * t))
-        bb = int(round(b + (255 - b) * t))
+        rr = int(round(r + (tr - r) * t))
+        gg = int(round(g + (tg - g) * t))
+        bb = int(round(b + (tb - b) * t))
         return f"#{rr:02x}{gg:02x}{bb:02x}"
 
-    def __init__(self, master: tk.Misc, rows: list[dict[str, Any]]) -> None:
+    def __init__(self, master: tk.Misc, rows: list[dict[str, Any]], theme_palette: Optional[dict[str, str]] = None) -> None:
         super().__init__(master)
+        self._theme = dict(theme_palette or DARK_COLORS)
+        self._rows = rows
         self.title("Per-mask volume summary")
         self.geometry("1560x420")
+        self.configure(background=self._theme["bg_root"])
+
+        self._style = ttk.Style(self)
+        self._tree_style_name = "MaskResults.Treeview"
+        self._header_style_name = "MaskResults.Treeview.Heading"
 
         frame = ttk.Frame(self, padding=8)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -3923,7 +4066,8 @@ class MaskVolumeResultsWindow(tk.Toplevel):
             "intermediate_bottom_fill",
             "status",
         )
-        tree = ttk.Treeview(frame, columns=columns, show="headings", height=14)
+        tree = ttk.Treeview(frame, columns=columns, show="headings", height=14, style=self._tree_style_name)
+        self._tree = tree
         tree.heading("mask", text="Mask")
         tree.heading("area", text="Area (m2)")
         tree.heading("net", text="Net (m3)")
@@ -3973,7 +4117,7 @@ class MaskVolumeResultsWindow(tk.Toplevel):
         for idx, row in enumerate(rows):
             base_color = FILE_COLORS[idx % len(FILE_COLORS)]
             tag_name = f"mask_row_{idx}"
-            tree.tag_configure(tag_name, background=self._soften_hex_color(base_color), foreground="#202020")
+            tree.tag_configure(tag_name, background=self._blend_hex_color(base_color, target_hex=self._theme["bg_root"]), foreground=self._theme["table_row_text"])
 
             area_raw = row.get("area_m2", "")
             net_raw = row.get("net_m3", "")
@@ -4051,7 +4195,12 @@ class MaskVolumeResultsWindow(tk.Toplevel):
         if has_numeric_values:
             total_font = tkfont.nametofont("TkDefaultFont").copy()
             total_font.configure(weight="bold")
-            tree.tag_configure("grand_total", background="#dfeaf5", foreground="#102030", font=total_font)
+            tree.tag_configure(
+                "grand_total",
+                background=self._theme["table_total_bg"],
+                foreground=self._theme["table_total_fg"],
+                font=total_font,
+            )
             tree.insert(
                 "",
                 tk.END,
@@ -4079,6 +4228,36 @@ class MaskVolumeResultsWindow(tk.Toplevel):
             padding=(8, 2),
         )
         footer.pack(side=tk.BOTTOM, fill=tk.X)
+        self.refresh_theme(self._theme)
+
+    def refresh_theme(self, theme_palette: dict[str, str]) -> None:
+        self._theme = dict(theme_palette)
+        self.configure(background=self._theme["bg_root"])
+        self._style.configure(
+            self._tree_style_name,
+            background=self._theme["bg_surface"],
+            fieldbackground=self._theme["bg_surface"],
+            foreground=self._theme["fg_primary"],
+            bordercolor=self._theme["bg_border"],
+        )
+        self._style.configure(
+            self._header_style_name,
+            background=self._theme["bg_panel"],
+            foreground=self._theme["fg_primary"],
+        )
+        for idx in range(len(self._rows)):
+            base_color = FILE_COLORS[idx % len(FILE_COLORS)]
+            tag_name = f"mask_row_{idx}"
+            self._tree.tag_configure(
+                tag_name,
+                background=self._blend_hex_color(base_color, target_hex=self._theme["bg_root"]),
+                foreground=self._theme["table_row_text"],
+            )
+        self._tree.tag_configure(
+            "grand_total",
+            background=self._theme["table_total_bg"],
+            foreground=self._theme["table_total_fg"],
+        )
 
 
 # ---------------------------------------------------------------------------

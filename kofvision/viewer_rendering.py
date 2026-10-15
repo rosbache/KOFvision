@@ -5,17 +5,23 @@ from typing import Any
 import numpy as np
 
 from kofvision.models import KOFFile, LandXMLSurface
+from kofvision.viewer_ui import apply_matplotlib_axes_theme, apply_matplotlib_figure_theme, apply_matplotlib_legend_theme
 
 
-def initialize_2d_axes(ax: Any) -> None:
+def initialize_2d_axes(viewer: Any) -> None:
+    ax = viewer.ax2d
     ax.clear()
+    apply_matplotlib_figure_theme(viewer.fig2d, viewer._theme)
+    apply_matplotlib_axes_theme(ax, viewer._theme)
     ax.set_xlabel("Easting (Y)")
     ax.set_ylabel("Northing (X)")
-    ax.grid(True, linestyle=":", alpha=0.5)
 
 
-def initialize_3d_axes(ax: Any) -> None:
+def initialize_3d_axes(viewer: Any) -> None:
+    ax = viewer.ax3d
     ax.clear()
+    apply_matplotlib_figure_theme(viewer.fig3d, viewer._theme)
+    apply_matplotlib_axes_theme(ax, viewer._theme, is_3d=True)
     ax.set_xlabel("Easting (Y)")
     ax.set_ylabel("Northing (X)")
     ax.set_zlabel("Elevation (H)")
@@ -165,16 +171,17 @@ def _apply_2d_view(viewer: Any) -> None:
 
 
 def _draw_sections(viewer: Any) -> None:
+    section_color = viewer._theme.get("mpl_section_line", "#1f2937")
     for idx, ((y0, x0), (y1, x1)) in enumerate(viewer._sections):
         label = viewer._section_label(idx)
-        viewer.ax2d.plot([y0, y1], [x0, x1], "-", color="black", linewidth=1.6, zorder=5)
-        viewer.ax2d.plot([y0, y1], [x0, x1], "s", color="black", markersize=4, zorder=6)
+        viewer.ax2d.plot([y0, y1], [x0, x1], "-", color=section_color, linewidth=1.6, zorder=5)
+        viewer.ax2d.plot([y0, y1], [x0, x1], "s", color=section_color, markersize=4, zorder=6)
         viewer.ax2d.annotate(
             label,
             (y0, x0),
             fontsize=9,
             fontweight="bold",
-            color="black",
+            color=section_color,
             xytext=(6, 6),
             textcoords="offset points",
             zorder=7,
@@ -184,7 +191,7 @@ def _draw_sections(viewer: Any) -> None:
             (y1, x1),
             fontsize=9,
             fontweight="bold",
-            color="black",
+            color=section_color,
             xytext=(6, 6),
             textcoords="offset points",
             zorder=7,
@@ -371,6 +378,7 @@ def _draw_notes(viewer: Any) -> None:
 def _draw_2d_legend_or_empty_state(viewer: Any) -> None:
     if viewer.files or viewer.landxml_files:
         viewer.ax2d.legend(loc="best", fontsize=8)
+        apply_matplotlib_legend_theme(viewer.ax2d, viewer._theme)
         return
     viewer.ax2d.text(
         0.5,
@@ -379,12 +387,12 @@ def _draw_2d_legend_or_empty_state(viewer: Any) -> None:
         transform=viewer.ax2d.transAxes,
         ha="center",
         va="center",
-        color="gray",
+        color=viewer._theme.get("mpl_empty_state", "gray"),
     )
 
 
 def render_2d(viewer: Any, file_colors: list[str]) -> None:
-    initialize_2d_axes(viewer.ax2d)
+    initialize_2d_axes(viewer)
     _draw_rasters(viewer)
     _draw_surface_layers(viewer, file_colors)
     _draw_alignments_and_stations(viewer, file_colors)
@@ -448,6 +456,7 @@ def _draw_3d_surface_layers(viewer: Any, file_colors: list[str]) -> None:
 def _draw_3d_legend_or_empty_state(viewer: Any) -> None:
     if viewer.files:
         viewer.ax3d.legend(loc="best", fontsize=8)
+        apply_matplotlib_legend_theme(viewer.ax3d, viewer._theme)
         viewer._equalize_3d_aspect()
         return
     viewer.ax3d.text2D(
@@ -457,12 +466,12 @@ def _draw_3d_legend_or_empty_state(viewer: Any) -> None:
         transform=viewer.ax3d.transAxes,
         ha="center",
         va="center",
-        color="gray",
+        color=viewer._theme.get("mpl_empty_state", "gray"),
     )
 
 
 def render_3d(viewer: Any, file_colors: list[str]) -> None:
-    initialize_3d_axes(viewer.ax3d)
+    initialize_3d_axes(viewer)
     _draw_3d_surface_layers(viewer, file_colors)
     _draw_3d_legend_or_empty_state(viewer)
     viewer.fig3d.tight_layout()

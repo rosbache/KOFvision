@@ -84,7 +84,13 @@ class SectionTool:
         if len(viewer._section_click_points) == 1:
             viewer.status.set("Section mode: click the second endpoint (right-click or Esc to cancel).")
             y0, x0 = viewer._section_click_points[0]
-            viewer.ax2d.plot([y0], [x0], marker="x", color="black", markersize=8)
+            viewer.ax2d.plot(
+                [y0],
+                [x0],
+                marker="x",
+                color=viewer._theme.get("mpl_section_line", "black"),
+                markersize=8,
+            )
             viewer.canvas2d.draw_idle()
             return
 
