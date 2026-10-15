@@ -89,10 +89,13 @@ def get_theme_palette(theme_name: str | None) -> dict[str, str]:
 
 
 def _apply_toolbar_widget_colors(widget: tk.Widget, palette: dict[str, str]) -> None:
-    try:
-        widget.configure(background=palette["mpl_toolbar_bg"])
-    except tk.TclError:
-        pass
+    widget_class = widget.winfo_class()
+    is_button_like = widget_class in {"Button", "Checkbutton", "Radiobutton"}
+    if not is_button_like:
+        try:
+            widget.configure(background=palette["mpl_toolbar_bg"])
+        except tk.TclError:
+            pass
     for child in widget.winfo_children():
         try:
             child.configure(
