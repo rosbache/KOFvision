@@ -3982,6 +3982,10 @@ class KOFViewer(tk.Tk):
             len(self._section_click_points),
             len(self._mask_click_points),
             len(self._measure_click_points),
+            self._active_section_marker_index,
+            round(float(self._active_section_marker_chainage_m), 6)
+            if self._active_section_marker_chainage_m is not None
+            else None,
             layer_visibility_checksum,
             landxml_group_checksum,
             raster_checksum,
