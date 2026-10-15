@@ -29,6 +29,18 @@ This folder documents the modularized viewer architecture introduced to split th
   - 2D/3D rendering entrypoints plus split draw-pass functions.
 - `kofvision/viewer_ui.py`
   - Style setup helpers for ttk-based look-and-feel.
+- `kofvision/viewer_undo.py`
+  - Snapshot-based undo/redo stack.
+- `kofvision/task_executor.py`
+  - Background task execution with UI-thread callbacks.
+- `kofvision/report_service.py`
+  - Profile area/volume integration helpers.
+- `kofvision/volume_controller.py`
+  - Volume compute orchestration helpers.
+- `kofvision/preferences.py`
+  - Persistent local viewer preferences.
+- `kofvision/report_templates.py`
+  - HTML report template and theme rendering.
 
 ## Dependency Direction
 
@@ -51,4 +63,7 @@ When adding features:
 - Put raster list and selection logic in `raster_management.py`.
 - Put payload structure changes in `viewer_serialization.py`.
 - Put plotting changes in `viewer_rendering.py`.
+- Put undo stack behavior in `viewer_undo.py`.
+- Put long-running background job wrappers in `task_executor.py`.
+- Put report styling/templates in `report_templates.py`.
 - Keep `kof_viewer.py` as orchestration glue only.

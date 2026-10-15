@@ -18,6 +18,7 @@ Interactive 2D tool state machines.
 - Enter/exit tool modes.
 - Consume matplotlib events (click/move/release).
 - Update transient tool state and finalize persisted results.
+- Route finalized mutations through coordinator append/update helpers so undo snapshots are recorded.
 
 ## Recent Extraction Scope
 

@@ -10,6 +10,8 @@
 - Bind callbacks and keyboard shortcuts.
 - Coordinate feature modules.
 - Hold shared runtime state that modules operate on.
+- Coordinate async background jobs (volume/report) and apply results on UI thread.
+- Own undo/redo snapshot boundaries for user-edit operations.
 
 ## What Should Stay Here
 
@@ -32,3 +34,8 @@
 - Raster layer operations -> `raster_management.py`
 - Tool workflows -> `viewer_tools.py`
 - 2D/3D draw implementation -> `viewer_rendering.py`
+- Undo/redo stack implementation -> `viewer_undo.py`
+- Background execution -> `task_executor.py`
+- Report math helpers -> `report_service.py`
+- Volume compute helpers -> `volume_controller.py`
+- Preferences persistence -> `preferences.py`

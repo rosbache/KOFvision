@@ -9,6 +9,7 @@ State transition helpers for bulk reset operations.
 - Clear state for "new/clear" flow.
 - Clear state for project-load flow.
 - Clear cached per-mask volume result structures.
+- Reset non-persisted runtime state (`ViewerRuntimeState`) signatures/history.
 
 ## Design Notes
 
