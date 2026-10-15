@@ -48,6 +48,10 @@ class SectionTool:
         if not viewer.top_var.get() or not viewer.bottom_var.get():
             messagebox.showinfo("KOF Viewer", "Pick a top and bottom surface before drawing a section.")
             return
+
+        if hasattr(viewer, "_deactivate_2d_nav_mode"):
+            viewer._deactivate_2d_nav_mode()
+
         viewer._section_mode = True
         viewer._tool_dispatch.activate(TOOL_SECTION)
         viewer._section_click_points = []
@@ -95,9 +99,12 @@ class SectionTool:
             return
 
         (y0, x0), (y1, x1) = viewer._section_click_points
-        viewer._sections.append(((y0, x0), (y1, x1)))
-        viewer._active_section_index = len(viewer._sections) - 1
-        viewer._refresh_section_controls()
+        if hasattr(viewer, "_append_section"):
+            viewer._append_section(((y0, x0), (y1, x1)), track_undo=True, undo_label="Draw section")
+        else:
+            viewer._sections.append(((y0, x0), (y1, x1)))
+            viewer._active_section_index = len(viewer._sections) - 1
+            viewer._refresh_section_controls()
 
         top = viewer._find_file(viewer.top_var.get())
         bot = viewer._find_file(viewer.bottom_var.get())
@@ -272,6 +279,9 @@ class NoteTool:
             viewer._redraw_2d()
             return
 
+        if hasattr(viewer, "_deactivate_2d_nav_mode"):
+            viewer._deactivate_2d_nav_mode()
+
         viewer._note_mode = True
         viewer._tool_dispatch.activate(TOOL_NOTE)
         viewer.note_btn.configure(text="Cancel note")
@@ -343,6 +353,9 @@ class MeasureTool:
             viewer._end_measure_mode()
             viewer._redraw_2d()
             return
+
+        if hasattr(viewer, "_deactivate_2d_nav_mode"):
+            viewer._deactivate_2d_nav_mode()
 
         viewer._measure_mode = True
         viewer._tool_dispatch.activate(TOOL_MEASURE)
@@ -433,6 +446,10 @@ class MaskTool:
             viewer._end_mask_mode()
             viewer._redraw_2d()
             return
+
+        if hasattr(viewer, "_deactivate_2d_nav_mode"):
+            viewer._deactivate_2d_nav_mode()
+
         viewer._mask_mode = True
         viewer._tool_dispatch.activate(TOOL_MASK)
         viewer._mask_click_points = []
