@@ -33,6 +33,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import os
@@ -105,6 +106,17 @@ from kofvision.viewer_tools import (
 )
 from kofvision.viewer_rendering import render_2d, render_3d
 from kofvision.raster_management import RasterLayerManager
+from kofvision.preferences import ViewerPreferences, load_preferences, save_preferences
+from kofvision.report_service import (
+    apply_cumulative_profile_volumes,
+    cumulative_profile_volumes,
+    integrate_profile_areas_to_volume,
+)
+from kofvision.task_executor import TaskExecutor
+from kofvision.validation import safe_float
+from kofvision.volume_controller import combine_volume_results, compute_volume_for_mask
+from kofvision.viewer_runtime_state import ViewerRuntimeState
+from kofvision.viewer_undo import EditSnapshot, UndoRedoManager
 
 try:
     import customtkinter as ctk
@@ -267,6 +279,9 @@ class KOFViewer(tk.Tk):
         self.xsd_local_schema_path = tk.StringVar(value="")
         self.mask_compute_scope = tk.StringVar(value=MASK_SCOPE_LABELS["selected"])
         self.measure_mode = tk.StringVar(value=MEASURE_MODE_LABELS["line"])
+        self.max_labels = tk.IntVar(value=400)
+        self.report_template = tk.StringVar(value="standard")
+        self.report_theme = tk.StringVar(value="auto")
 
         # Raster background state (2D tab only)
         self._raster_layers: list[_RasterViewLayer] = []
@@ -326,6 +341,16 @@ class KOFViewer(tk.Tk):
         self._RasterViewLayerClass = _RasterViewLayer
         self._tool_dispatch = ToolDispatcher()
         self._raster_manager = RasterLayerManager(self)
+        self._task_executor = TaskExecutor(self)
+        self.runtime_state = ViewerRuntimeState()
+        self._undo = UndoRedoManager(
+            apply_snapshot=self._apply_edit_snapshot,
+            on_change=self._refresh_undo_redo_controls,
+        )
+        self._volume_task_running = False
+        self._report_task_running = False
+
+        self._apply_preferences(load_preferences())
 
         self._configure_styles()
 
@@ -334,12 +359,98 @@ class KOFViewer(tk.Tk):
         self._build_statusbar()
         self._bind_shortcuts()
         self._apply_theme(self.theme_mode.get(), redraw=False)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         for path in initial_files or []:
             self._load_file(path, redraw=False)
         self._refresh_file_selectors()
         self._refresh_layer_controls()
         self._redraw()
+
+    def _apply_preferences(self, prefs: ViewerPreferences) -> None:
+        self.theme_mode.set(prefs.theme)
+        self.volume_method.set(prefs.volume_method)
+        self.station_interval_m.set(safe_float(prefs.station_interval_m, default=10.0, min_value=1.0))
+        self.station_label_format.set(prefs.station_label_format)
+        self.show_labels.set(bool(prefs.show_labels))
+        self.show_markers.set(bool(prefs.show_markers))
+        self.show_lines.set(bool(prefs.show_lines))
+        self.show_triangulation.set(bool(prefs.show_triangulation))
+
+    def _capture_preferences(self) -> ViewerPreferences:
+        return ViewerPreferences(
+            theme=self.theme_mode.get(),
+            volume_method=self.volume_method.get(),
+            station_interval_m=safe_float(self.station_interval_m.get(), default=10.0, min_value=1.0),
+            station_label_format=self.station_label_format.get(),
+            show_labels=bool(self.show_labels.get()),
+            show_markers=bool(self.show_markers.get()),
+            show_lines=bool(self.show_lines.get()),
+            show_triangulation=bool(self.show_triangulation.get()),
+        )
+
+    def _on_close(self) -> None:
+        try:
+            save_preferences(self._capture_preferences())
+        except Exception:  # noqa: BLE001
+            pass
+        self._task_executor.shutdown()
+        self.destroy()
+
+    def _capture_edit_snapshot(self) -> EditSnapshot:
+        return EditSnapshot(
+            sections=copy.deepcopy(self._sections),
+            masks=copy.deepcopy(self._masks),
+            notes=copy.deepcopy(self._notes),
+            measurements=copy.deepcopy(self._measure_results),
+            active_section_index=self._active_section_index,
+            active_mask_index=self._active_mask_index,
+            active_note_index=self._active_note_index,
+        )
+
+    def _apply_edit_snapshot(self, snapshot: EditSnapshot) -> None:
+        self._close_section_windows()
+        self._sections = copy.deepcopy(snapshot.sections)
+        self._masks = copy.deepcopy(snapshot.masks)
+        self._notes = copy.deepcopy(snapshot.notes)
+        self._measure_results = copy.deepcopy(snapshot.measurements)
+        self._active_section_index = snapshot.active_section_index
+        self._active_mask_index = snapshot.active_mask_index
+        self._active_note_index = snapshot.active_note_index
+
+        self._clear_active_section_marker(redraw=False)
+        self._mask_click_points.clear()
+        self._measure_click_points.clear()
+
+        self._mask_visibility_vars = [tk.BooleanVar(value=bool(m.visible)) for m in self._masks]
+        self._note_visibility_vars = [tk.BooleanVar(value=bool(n.visible)) for n in self._notes]
+        self._clear_cached_mask_volume_results()
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._refresh_mask_controls()
+        self._refresh_section_controls()
+        self._refresh_layer_controls()
+        self._redraw()
+
+    def _record_undoable_edit(self, label: str, before: EditSnapshot) -> None:
+        after = self._capture_edit_snapshot()
+        self._undo.record(label, before, after)
+
+    def _refresh_undo_redo_controls(self) -> None:
+        if hasattr(self, "undo_btn"):
+            self.undo_btn.configure(state="normal" if self._undo.can_undo else "disabled")
+        if hasattr(self, "redo_btn"):
+            self.redo_btn.configure(state="normal" if self._undo.can_redo else "disabled")
+
+    def _on_undo(self) -> None:
+        label = self._undo.undo()
+        if label:
+            self.status.set(f"Undo: {label}")
+
+    def _on_redo(self) -> None:
+        label = self._undo.redo()
+        if label:
+            self.status.set(f"Redo: {label}")
 
     def _configure_styles(self) -> None:
         self._theme = configure_viewer_styles(self, self.theme_mode.get())
@@ -412,6 +523,8 @@ class KOFViewer(tk.Tk):
     def _bind_shortcuts(self) -> None:
         self.bind_all("<Control-o>", lambda _e: self._invoke_shortcut(self._on_open))
         self.bind_all("<Control-e>", lambda _e: self._invoke_shortcut(self._on_export_gpkg))
+        self.bind_all("<Control-z>", lambda _e: self._invoke_shortcut(self._on_undo))
+        self.bind_all("<Control-y>", lambda _e: self._invoke_shortcut(self._on_redo))
         self.bind_all("<Control-Shift-K>", lambda _e: self._invoke_shortcut(self._on_clear))
         self.bind_all("<Control-Shift-Z>", lambda _e: self._invoke_shortcut(self._on_zoom_selected_layers))
         self.bind_all("<Control-Shift-R>", lambda _e: self._invoke_shortcut(self._on_reset_view))
@@ -464,6 +577,15 @@ class KOFViewer(tk.Tk):
         clear_btn = self._make_toolbar_button(top, text="Clear", command=self._on_clear)
         clear_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(clear_btn, "Shortcut: Ctrl+Shift+K")
+
+        self.undo_btn = self._make_toolbar_button(top, text="Undo", command=self._on_undo)
+        self.undo_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.undo_btn, "Shortcut: Ctrl+Z")
+
+        self.redo_btn = self._make_toolbar_button(top, text="Redo", command=self._on_redo)
+        self.redo_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.redo_btn, "Shortcut: Ctrl+Y")
+        self._refresh_undo_redo_controls()
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
@@ -527,6 +649,9 @@ class KOFViewer(tk.Tk):
 
         load_project_btn = self._make_toolbar_button(top, text="Load project", command=self._on_load_project)
         load_project_btn.pack(side=tk.LEFT, padx=3)
+
+        self.mode_badge = ttk.Label(top, text="Mode: idle", style="Muted.TLabel")
+        self.mode_badge.pack(side=tk.LEFT, padx=(8, 0))
 
         self._on_measure_mode_changed()
 
@@ -606,6 +731,22 @@ class KOFViewer(tk.Tk):
         )
         self.station_label_combo.pack(side=tk.LEFT, padx=(6, 0))
         self.station_label_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_station_settings_changed())
+
+        label_row = ttk.Frame(display_panel)
+        label_row.pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(label_row, text="Max labels:").pack(side=tk.LEFT)
+        self.max_labels_spin = ttk.Spinbox(
+            label_row,
+            from_=0,
+            to=10000,
+            increment=25,
+            width=8,
+            textvariable=self.max_labels,
+            command=self._redraw_2d,
+        )
+        self.max_labels_spin.pack(side=tk.LEFT, padx=(6, 0))
+        self.max_labels_spin.bind("<Return>", lambda _e: self._redraw_2d())
+        self.max_labels_spin.bind("<FocusOut>", lambda _e: self._redraw_2d())
 
         tin_row = ttk.Frame(display_panel)
         tin_row.pack(fill=tk.X, pady=(4, 0))
@@ -877,6 +1018,27 @@ class KOFViewer(tk.Tk):
         ttk.Button(sections_panel, text="Clear sections", command=self._on_clear_sections).pack(fill=tk.X, pady=(0, 2))
         ttk.Button(sections_panel, text="Save sections...", command=self._on_save_sections_json).pack(fill=tk.X, pady=2)
         ttk.Button(sections_panel, text="Load sections...", command=self._on_load_sections_json).pack(fill=tk.X, pady=2)
+
+        ttk.Label(sections_panel, text="Report template:").pack(anchor="w", pady=(2, 0))
+        self.report_template_combo = ttk.Combobox(
+            sections_panel,
+            textvariable=self.report_template,
+            values=["standard", "compact"],
+            state="readonly",
+            width=26,
+        )
+        self.report_template_combo.pack(fill=tk.X, pady=(2, 2))
+
+        ttk.Label(sections_panel, text="Report theme:").pack(anchor="w", pady=(2, 0))
+        self.report_theme_combo = ttk.Combobox(
+            sections_panel,
+            textvariable=self.report_theme,
+            values=["auto", "light", "dark", "print"],
+            state="readonly",
+            width=26,
+        )
+        self.report_theme_combo.pack(fill=tk.X, pady=(2, 2))
+
         ttk.Button(sections_panel, text="Export section report...", command=self._on_export_section_report).pack(fill=tk.X, pady=2)
         ttk.Button(sections_panel, text="Open section report in browser...", command=self._on_open_section_report_browser).pack(fill=tk.X, pady=2)
         ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
@@ -937,6 +1099,15 @@ class KOFViewer(tk.Tk):
 
         self.layers_frame = ttk.LabelFrame(body, text="Layers", padding=6)
         self.layers_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(4, 2), pady=(0, 4))
+
+        filter_row = ttk.Frame(self.layers_frame)
+        filter_row.pack(fill=tk.X, pady=(0, 4))
+        self.layer_filter_var = tk.StringVar(value="")
+        self.layer_filter_entry = ttk.Entry(filter_row, textvariable=self.layer_filter_var, width=20)
+        self.layer_filter_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.layer_filter_entry.bind("<Return>", lambda _e: self._refresh_layer_controls())
+        ttk.Button(filter_row, text="Apply", width=7, command=self._refresh_layer_controls).pack(side=tk.LEFT, padx=(4, 0))
+
         self.layers_inner = ttk.Frame(self.layers_frame)
         self.layers_inner.pack(fill=tk.BOTH, expand=True)
         self._refresh_layer_controls()
@@ -1192,6 +1363,7 @@ class KOFViewer(tk.Tk):
     def _on_clear(self) -> None:
         self._close_mask_results_windows()
         reset_for_clear(self)
+        self._undo.clear()
         self._refresh_mask_controls()
         self._refresh_section_controls()
         self._refresh_mask_result_actions()
@@ -1354,14 +1526,19 @@ class KOFViewer(tk.Tk):
         name: Optional[str] = None,
         *,
         visible: bool = True,
+        track_undo: bool = True,
+        undo_label: str = "Add mask",
     ) -> None:
         if len(vertices) < 3:
             return
+        before = self._capture_edit_snapshot() if track_undo else None
         mask_name = self._dedupe_mask_name(name or self._next_mask_name())
         self._masks.append(MaskDefinition(name=mask_name, vertices=list(vertices), visible=bool(visible)))
         self._mask_visibility_vars.append(tk.BooleanVar(value=bool(visible)))
         self._clear_cached_mask_volume_results()
         self._set_active_mask_index(len(self._masks) - 1)
+        if before is not None:
+            self._record_undoable_edit(undo_label, before)
 
     def _refresh_mask_controls(self) -> None:
         if hasattr(self, "mask_combo"):
@@ -1474,6 +1651,8 @@ class KOFViewer(tk.Tk):
         if replace is None:
             return
 
+        before = self._capture_edit_snapshot()
+
         if replace:
             self._masks.clear()
             self._mask_visibility_vars.clear()
@@ -1482,7 +1661,7 @@ class KOFViewer(tk.Tk):
         loaded_names: list[str] = []
         for mask in masks:
             name = self._dedupe_mask_name(mask.name)
-            self._append_mask(mask.vertices, name=name, visible=mask.visible)
+            self._append_mask(mask.vertices, name=name, visible=mask.visible, track_undo=False)
             loaded_names.append(name)
 
         self._mask_click_points.clear()
@@ -1498,6 +1677,7 @@ class KOFViewer(tk.Tk):
             self._zoom_to_bounds(self._polygon_bounds(active_poly))
         self._refresh_mask_controls()
         self._redraw()
+        self._record_undoable_edit("Load masks", before)
 
         messagebox.showinfo(
             "KOF Viewer",
@@ -1543,12 +1723,15 @@ class KOFViewer(tk.Tk):
             messagebox.showerror("KOF Viewer", f"Failed to load sections JSON:\n{exc}")
             return
 
+        before = self._capture_edit_snapshot()
+
         self._close_section_windows()
         self._sections = list(sections)
         self._clear_active_section_marker(redraw=False)
         self._active_section_index = 0 if self._sections else None
         self._refresh_section_controls()
         self._redraw()
+        self._record_undoable_edit("Load sections", before)
 
     def _on_save_project(self) -> None:
         out_path = filedialog.asksaveasfilename(
@@ -1598,6 +1781,7 @@ class KOFViewer(tk.Tk):
             allowed_intermediate_types=set(INTERMEDIATE_LABEL_TO_TYPE) | set(INTERMEDIATE_TYPE_LABELS.values()),
             allowed_mask_scopes=set(MASK_LABEL_TO_SCOPE) | set(MASK_SCOPE_LABELS.values()),
         )
+        self._undo.clear()
 
         msg = f"Project loaded:\n{in_path}"
         if missing_sources:
@@ -1606,45 +1790,11 @@ class KOFViewer(tk.Tk):
 
     @staticmethod
     def _integrate_profile_areas_to_volume(stations_m: list[float], areas_m2: list[float]) -> float:
-        if len(stations_m) < 2 or len(areas_m2) < 2:
-            return float("nan")
-        s = np.asarray(stations_m, dtype=float)
-        a = np.asarray(areas_m2, dtype=float)
-        valid = np.isfinite(s) & np.isfinite(a)
-        if np.count_nonzero(valid) < 2:
-            return float("nan")
-        s_valid = s[valid]
-        a_valid = a[valid]
-        order = np.argsort(s_valid)
-        return float(np.trapezoid(a_valid[order], s_valid[order]))
+        return integrate_profile_areas_to_volume(stations_m, areas_m2)
 
     @staticmethod
     def _cumulative_profile_volumes(stations_m: list[float], areas_m2: list[float]) -> list[float]:
-        n = min(len(stations_m), len(areas_m2))
-        if n == 0:
-            return []
-
-        s = np.asarray(stations_m[:n], dtype=float)
-        a = np.asarray(areas_m2[:n], dtype=float)
-        order = np.argsort(s)
-        s_sorted = s[order]
-        a_sorted = a[order]
-
-        cumulative_sorted = np.full(n, np.nan, dtype=float)
-        cumulative_sorted[0] = 0.0
-        for i in range(1, n):
-            s0 = s_sorted[i - 1]
-            s1 = s_sorted[i]
-            a0 = a_sorted[i - 1]
-            a1 = a_sorted[i]
-            prev = cumulative_sorted[i - 1]
-            if np.isfinite(prev) and np.isfinite(s0) and np.isfinite(s1) and np.isfinite(a0) and np.isfinite(a1):
-                dv = 0.5 * (a0 + a1) * (s1 - s0)
-                cumulative_sorted[i] = prev + dv
-
-        cumulative = np.full(n, np.nan, dtype=float)
-        cumulative[order] = cumulative_sorted
-        return [float(v) for v in cumulative]
+        return cumulative_profile_volumes(stations_m, areas_m2)
 
     @staticmethod
     def _open_path_in_browser(path: str) -> bool:
@@ -1652,6 +1802,14 @@ class KOFViewer(tk.Tk):
             return bool(webbrowser.open_new_tab(Path(path).resolve().as_uri()))
         except Exception:  # noqa: BLE001
             return False
+
+    def _resolved_report_theme(self) -> str:
+        selected = self.report_theme.get().strip().lower()
+        if selected == "auto":
+            return "dark" if self.theme_mode.get().strip().lower() == "dark" else "light"
+        if selected in {"light", "dark", "print"}:
+            return selected
+        return "light"
 
     def _ask_section_report_parameters(self) -> Optional[tuple[float, float, int]]:
         spacing_m = simpledialog.askfloat(
@@ -1683,7 +1841,7 @@ class KOFViewer(tk.Tk):
             return None
         return float(spacing_m), float(section_length_m), int(n_samples)
 
-    def _generate_section_report(self, out_root: str, *, open_in_browser: bool) -> Optional[str]:
+    def _prepare_section_report_request(self) -> Optional[dict[str, Any]]:
         top = self._find_file(self.top_var.get())
         bot = self._find_file(self.bottom_var.get())
         if top is None or bot is None:
@@ -1710,294 +1868,29 @@ class KOFViewer(tk.Tk):
         if baseline_len <= 0:
             messagebox.showerror("KOF Viewer", "Baseline section has zero length.")
             return None
-
-        stations = station_values(baseline_len, spacing_m)
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = os.path.join(out_root, f"section_report_{timestamp}")
-        profiles_dir = os.path.join(run_dir, "profiles")
-        os.makedirs(profiles_dir, exist_ok=True)
-
-        profile_rows: list[dict[str, object]] = []
-        plan_points: list[tuple[str, tuple[float, float]]] = []
-        section_raster = self._section_reference_raster()
-        section_intermediate = self._section_intermediate_surface()
-        area_top_surface, area_bottom_surface, area_top_name, area_bottom_name = self._section_area_pair(top, bot)
-
-        for idx, station in enumerate(stations, start=1):
-            profile_id = f"P{idx:04d}"
-            p0, p1, center = profile_segment_from_station(
-                b0,
-                b1,
-                float(station),
-                float(section_length_m),
-            )
-            sample = sample_profile(
-                top,
-                bot,
-                p0,
-                p1,
-                profile_id=profile_id,
-                station_m=float(station),
-                center=center,
-                n_samples=int(n_samples),
-                reference_surface=section_raster,
-                reference_name=section_raster.name if section_raster is not None else None,
-                secondary_reference_surface=section_intermediate,
-                secondary_reference_name=section_intermediate.name if section_intermediate is not None else None,
-                area_top_surface=area_top_surface,
-                area_bottom_surface=area_bottom_surface,
-                area_top_name=area_top_name,
-                area_bottom_name=area_bottom_name,
-            )
-
-            image_name = f"{profile_id}.png"
-            image_rel = os.path.join("profiles", image_name)
-            image_path = os.path.join(profiles_dir, image_name)
-            save_profile_plot_png(
-                image_path,
-                sample,
-                top_name=top.name,
-                bottom_name=bot.name,
-            )
-
-            profile_rows.append(
-                {
-                    "profile_id": profile_id,
-                    "station_m": sample.station_m,
-                    "length_m": sample.length_m,
-                    "valid_fraction": sample.valid_fraction,
-                    "area_net_m2": sample.area_net_m2,
-                    "area_cut_m2": sample.area_cut_m2,
-                    "area_fill_m2": sample.area_fill_m2,
-                    "area_upper_leg_m2": sample.area_upper_leg_m2,
-                    "area_upper_leg_cut_m2": sample.area_upper_leg_cut_m2,
-                    "area_upper_leg_fill_m2": sample.area_upper_leg_fill_m2,
-                    "area_lower_leg_m2": sample.area_lower_leg_m2,
-                    "area_lower_leg_cut_m2": sample.area_lower_leg_cut_m2,
-                    "area_lower_leg_fill_m2": sample.area_lower_leg_fill_m2,
-                    "image_rel": image_rel.replace("\\", "/"),
-                }
-            )
-            plan_points.append((profile_id, center))
-
-        stations_list = [float(r["station_m"]) for r in profile_rows]
-        area_net_list = [float(r["area_net_m2"]) for r in profile_rows]
-        area_cut_list = [float(r["area_cut_m2"]) for r in profile_rows]
-        area_fill_list = [float(r["area_fill_m2"]) for r in profile_rows]
-        net_volume_m3 = self._integrate_profile_areas_to_volume(stations_list, area_net_list)
-        cut_volume_m3 = self._integrate_profile_areas_to_volume(stations_list, area_cut_list)
-        fill_volume_m3 = self._integrate_profile_areas_to_volume(stations_list, area_fill_list)
-
-        upper_leg_values = [r.get("area_upper_leg_m2") for r in profile_rows]
-        lower_leg_values = [r.get("area_lower_leg_m2") for r in profile_rows]
-        upper_leg_cut_values = [r.get("area_upper_leg_cut_m2") for r in profile_rows]
-        upper_leg_fill_values = [r.get("area_upper_leg_fill_m2") for r in profile_rows]
-        lower_leg_cut_values = [r.get("area_lower_leg_cut_m2") for r in profile_rows]
-        lower_leg_fill_values = [r.get("area_lower_leg_fill_m2") for r in profile_rows]
-        upper_leg_volume_m3 = float("nan")
-        lower_leg_volume_m3 = float("nan")
-        upper_leg_cut_volume_m3 = float("nan")
-        upper_leg_fill_volume_m3 = float("nan")
-        lower_leg_cut_volume_m3 = float("nan")
-        lower_leg_fill_volume_m3 = float("nan")
-        if any(v not in (None, "") for v in upper_leg_values):
-            upper_leg_volume_m3 = self._integrate_profile_areas_to_volume(
-                stations_list,
-                [float(v) if v not in (None, "") else float("nan") for v in upper_leg_values],
-            )
-        if any(v not in (None, "") for v in lower_leg_values):
-            lower_leg_volume_m3 = self._integrate_profile_areas_to_volume(
-                stations_list,
-                [float(v) if v not in (None, "") else float("nan") for v in lower_leg_values],
-            )
-        if any(v not in (None, "") for v in upper_leg_cut_values):
-            upper_leg_cut_volume_m3 = self._integrate_profile_areas_to_volume(
-                stations_list,
-                [float(v) if v not in (None, "") else float("nan") for v in upper_leg_cut_values],
-            )
-        if any(v not in (None, "") for v in upper_leg_fill_values):
-            upper_leg_fill_volume_m3 = self._integrate_profile_areas_to_volume(
-                stations_list,
-                [float(v) if v not in (None, "") else float("nan") for v in upper_leg_fill_values],
-            )
-        if any(v not in (None, "") for v in lower_leg_cut_values):
-            lower_leg_cut_volume_m3 = self._integrate_profile_areas_to_volume(
-                stations_list,
-                [float(v) if v not in (None, "") else float("nan") for v in lower_leg_cut_values],
-            )
-        if any(v not in (None, "") for v in lower_leg_fill_values):
-            lower_leg_fill_volume_m3 = self._integrate_profile_areas_to_volume(
-                stations_list,
-                [float(v) if v not in (None, "") else float("nan") for v in lower_leg_fill_values],
-            )
-
-        upper_leg_area_list = [float(v) if v not in (None, "") else float("nan") for v in upper_leg_values]
-        lower_leg_area_list = [float(v) if v not in (None, "") else float("nan") for v in lower_leg_values]
-        upper_leg_cut_area_list = [float(v) if v not in (None, "") else float("nan") for v in upper_leg_cut_values]
-        upper_leg_fill_area_list = [float(v) if v not in (None, "") else float("nan") for v in upper_leg_fill_values]
-        lower_leg_cut_area_list = [float(v) if v not in (None, "") else float("nan") for v in lower_leg_cut_values]
-        lower_leg_fill_area_list = [float(v) if v not in (None, "") else float("nan") for v in lower_leg_fill_values]
-
-        cumulative_net_m3 = self._cumulative_profile_volumes(stations_list, area_net_list)
-        cumulative_cut_m3 = self._cumulative_profile_volumes(stations_list, area_cut_list)
-        cumulative_fill_m3 = self._cumulative_profile_volumes(stations_list, area_fill_list)
-        cumulative_upper_leg_m3 = self._cumulative_profile_volumes(stations_list, upper_leg_area_list)
-        cumulative_lower_leg_m3 = self._cumulative_profile_volumes(stations_list, lower_leg_area_list)
-        cumulative_upper_leg_cut_m3 = self._cumulative_profile_volumes(stations_list, upper_leg_cut_area_list)
-        cumulative_upper_leg_fill_m3 = self._cumulative_profile_volumes(stations_list, upper_leg_fill_area_list)
-        cumulative_lower_leg_cut_m3 = self._cumulative_profile_volumes(stations_list, lower_leg_cut_area_list)
-        cumulative_lower_leg_fill_m3 = self._cumulative_profile_volumes(stations_list, lower_leg_fill_area_list)
-
-        for i, row in enumerate(profile_rows):
-            row["volume_net_m3"] = cumulative_net_m3[i] if i < len(cumulative_net_m3) else float("nan")
-            row["volume_cut_m3"] = cumulative_cut_m3[i] if i < len(cumulative_cut_m3) else float("nan")
-            row["volume_fill_m3"] = cumulative_fill_m3[i] if i < len(cumulative_fill_m3) else float("nan")
-            row["volume_upper_leg_m3"] = cumulative_upper_leg_m3[i] if i < len(cumulative_upper_leg_m3) else float("nan")
-            row["volume_upper_leg_cut_m3"] = cumulative_upper_leg_cut_m3[i] if i < len(cumulative_upper_leg_cut_m3) else float("nan")
-            row["volume_upper_leg_fill_m3"] = cumulative_upper_leg_fill_m3[i] if i < len(cumulative_upper_leg_fill_m3) else float("nan")
-            row["volume_lower_leg_m3"] = cumulative_lower_leg_m3[i] if i < len(cumulative_lower_leg_m3) else float("nan")
-            row["volume_lower_leg_cut_m3"] = cumulative_lower_leg_cut_m3[i] if i < len(cumulative_lower_leg_cut_m3) else float("nan")
-            row["volume_lower_leg_fill_m3"] = cumulative_lower_leg_fill_m3[i] if i < len(cumulative_lower_leg_fill_m3) else float("nan")
-
-        plan_image_rel = "plan_view.png"
-        plan_image_path = os.path.join(run_dir, plan_image_rel)
-        plan_raster = self._top_visible_raster_layer()
-        save_plan_view_png(
-            plan_image_path,
-            files=[k for i, k in enumerate(self.files) if self._is_layer_visible(i)],
-            show_markers=bool(self.show_markers.get()),
-            show_lines=bool(self.show_lines.get()),
-            show_labels=bool(self.show_labels.get()),
-            show_triangulation=bool(self.show_triangulation.get()),
-            sections=self._sections,
-            baseline=baseline,
-            profile_points=plan_points,
-            raster_img=plan_raster.image if plan_raster is not None else None,
-            raster_extent=plan_raster.extent if plan_raster is not None else None,
-            raster_origin=plan_raster.origin if plan_raster is not None else "upper",
-            raster_alpha=float(plan_raster.alpha.get()) if plan_raster is not None else 1.0,
-        )
-
-        report_path = os.path.join(run_dir, "report.html")
-        mask_report_text = " | ".join(self._last_volume_per_mask_rows) if self._last_volume_per_mask_rows else "(not computed)"
-        metadata = {
-            "Top surface": top.name,
-            "Bottom surface": bot.name,
-            "Section area pair": f"{area_top_name} - {area_bottom_name}",
-            "Input files": ", ".join(k.name for k in self.files),
-            "Spacing (m)": f"{spacing_m:.2f}",
-            "Cross-section length (m)": f"{section_length_m:.2f}",
-            "Samples per profile": n_samples,
-            "Profile count": len(profile_rows),
-            "Baseline length (m)": f"{baseline_len:.2f}",
-            "Section orientation": "Left -> Right (looking toward higher station)",
-            "Volume net (m3)": f"{net_volume_m3:+,.2f}",
-            "Volume cut (m3)": f"{cut_volume_m3:,.2f}",
-            "Volume fill (m3)": f"{fill_volume_m3:,.2f}",
-            "Latest volume per-mask": mask_report_text,
+        return {
+            "top": top,
+            "bottom": bot,
+            "baseline": baseline,
+            "baseline_len": baseline_len,
+            "spacing_m": spacing_m,
+            "section_length_m": section_length_m,
+            "n_samples": n_samples,
+            "section_raster": self._section_reference_raster(),
+            "section_intermediate": self._section_intermediate_surface(),
+            "area_pair": self._section_area_pair(top, bot),
+            "visible_files": [k for i, k in enumerate(self.files) if self._is_layer_visible(i)],
+            "show_markers": bool(self.show_markers.get()),
+            "show_lines": bool(self.show_lines.get()),
+            "show_labels": bool(self.show_labels.get()),
+            "show_triangulation": bool(self.show_triangulation.get()),
+            "sections": list(self._sections),
+            "plan_raster": self._top_visible_raster_layer(),
+            "mask_rows": list(self._last_volume_per_mask_rows),
+            "report_template": self.report_template.get().strip().lower() or "standard",
+            "report_theme": self._resolved_report_theme(),
+            "input_file_names": [k.name for k in self.files],
         }
-        if np.isfinite(upper_leg_volume_m3):
-            upper_name = section_intermediate.name if section_intermediate is not None else "Intermediate"
-            metadata[f"Volume {top.name} - {upper_name} (m3)"] = f"{upper_leg_volume_m3:+,.2f}"
-            if np.isfinite(upper_leg_cut_volume_m3):
-                metadata[f"Volume {top.name} - {upper_name} cut (m3)"] = f"{upper_leg_cut_volume_m3:,.2f}"
-            if np.isfinite(upper_leg_fill_volume_m3):
-                metadata[f"Volume {top.name} - {upper_name} fill (m3)"] = f"{upper_leg_fill_volume_m3:,.2f}"
-        if np.isfinite(lower_leg_volume_m3):
-            lower_name = section_intermediate.name if section_intermediate is not None else "Intermediate"
-            metadata[f"Volume {lower_name} - {bot.name} (m3)"] = f"{lower_leg_volume_m3:+,.2f}"
-            if np.isfinite(lower_leg_cut_volume_m3):
-                metadata[f"Volume {lower_name} - {bot.name} cut (m3)"] = f"{lower_leg_cut_volume_m3:,.2f}"
-            if np.isfinite(lower_leg_fill_volume_m3):
-                metadata[f"Volume {lower_name} - {bot.name} fill (m3)"] = f"{lower_leg_fill_volume_m3:,.2f}"
-
-        write_html_report(
-            report_path,
-            title="KOF Section Report",
-            metadata=metadata,
-            plan_image_rel=plan_image_rel,
-            profile_rows=profile_rows,
-        )
-
-        manifest_path = os.path.join(run_dir, "report_manifest.json")
-        with open(manifest_path, "w", encoding="utf-8") as fh:
-            json.dump(
-                {
-                    "type": "kofvision.section_report",
-                    "version": 1,
-                    "generated_at": datetime.now().isoformat(timespec="seconds"),
-                    "top_surface": top.name,
-                    "bottom_surface": bot.name,
-                    "section_area_pair": {
-                        "top": area_top_name,
-                        "bottom": area_bottom_name,
-                    },
-                    "latest_volume_per_mask": self._last_volume_per_mask_rows,
-                    "input_files": [k.name for k in self.files],
-                    "spacing_m": spacing_m,
-                    "section_length_m": section_length_m,
-                    "samples_per_profile": n_samples,
-                    "baseline": {
-                        "start": [float(b0[0]), float(b0[1])],
-                        "end": [float(b1[0]), float(b1[1])],
-                        "length_m": baseline_len,
-                    },
-                    "orientation": {
-                        "section_axis": "left_to_right",
-                        "view_direction": "toward_higher_station",
-                    },
-                    "volume_summary_m3": {
-                        "net": net_volume_m3,
-                        "cut": cut_volume_m3,
-                        "fill": fill_volume_m3,
-                        "top_to_intermediate": upper_leg_volume_m3,
-                        "intermediate_to_bottom": lower_leg_volume_m3,
-                    },
-                    "profiles": profile_rows,
-                },
-                fh,
-                indent=2,
-            )
-
-        self._latest_section_report_path = report_path
-        if open_in_browser:
-            opened = self._open_path_in_browser(report_path)
-            if not opened:
-                messagebox.showwarning(
-                    "KOF Viewer",
-                    "Report exported, but failed to open web browser automatically.",
-                )
-
-        return run_dir
-
-    def _on_export_section_report(self) -> None:
-        out_root = filedialog.askdirectory(title="Choose report output folder")
-        if not out_root:
-            return
-        run_dir = self._generate_section_report(out_root, open_in_browser=True)
-        if run_dir is None:
-            return
-
-        messagebox.showinfo(
-            "KOF Viewer",
-            "Section report export completed.\n\n"
-            f"Output folder:\n{run_dir}\n\n"
-            f"Report opened in browser: {'yes' if self._latest_section_report_path else 'no'}\n"
-            "Baseline: latest drawn section line\n"
-            "Orientation: left -> right looking toward higher station",
-        )
-
-    def _on_open_section_report_browser(self) -> None:
-        out_root = tempfile.mkdtemp(prefix="kofvision_section_report_")
-        run_dir = self._generate_section_report(out_root, open_in_browser=True)
-        if run_dir is None:
-            return
-        messagebox.showinfo(
-            "KOF Viewer",
-            "Section report generated and opened in browser.\n\n"
-            f"Temporary folder:\n{run_dir}\n\n"
-            "Tip: use Export section report... to choose a permanent output folder.",
-        )
 
     def _on_open_raster(self) -> None:
         self._raster_manager.on_open_raster()
@@ -2173,12 +2066,28 @@ class KOFViewer(tk.Tk):
     def _on_clear_sections(self) -> None:
         if not self._sections:
             return
+        before = self._capture_edit_snapshot()
         self._close_section_windows()
         self._sections.clear()
         self._clear_active_section_marker(redraw=False)
         self._active_section_index = None
         self._refresh_section_controls()
         self._redraw()
+        self._record_undoable_edit("Clear sections", before)
+
+    def _append_section(
+        self,
+        section: tuple[tuple[float, float], tuple[float, float]],
+        *,
+        track_undo: bool = True,
+        undo_label: str = "Add section",
+    ) -> None:
+        before = self._capture_edit_snapshot() if track_undo else None
+        self._sections.append(section)
+        self._active_section_index = len(self._sections) - 1
+        self._refresh_section_controls()
+        if before is not None:
+            self._record_undoable_edit(undo_label, before)
 
     def _clear_active_section_marker(self, *, redraw: bool = True) -> None:
         self._active_section_marker_index = None
@@ -2285,6 +2194,13 @@ class KOFViewer(tk.Tk):
         for child in self.layers_inner.winfo_children():
             child.destroy()
 
+        filter_text = ""
+        if hasattr(self, "layer_filter_var"):
+            filter_text = self.layer_filter_var.get().strip().lower()
+
+        def _matches(label: str) -> bool:
+            return not filter_text or filter_text in label.lower()
+
         has_raster_layer = bool(self._raster_layers)
 
         if not self.files and not has_raster_layer and not self.landxml_files and not self._masks and not self._notes:
@@ -2292,12 +2208,13 @@ class KOFViewer(tk.Tk):
             return
 
         if has_raster_layer:
-            ttk.Checkbutton(
-                self.layers_inner,
-                text="Raster layers",
-                variable=self.show_raster,
-                command=self._redraw,
-            ).pack(anchor="w", pady=1)
+            if _matches("Raster layers"):
+                ttk.Checkbutton(
+                    self.layers_inner,
+                    text="Raster layers",
+                    variable=self.show_raster,
+                    command=self._redraw,
+                ).pack(anchor="w", pady=1)
             for idx in range(len(self._raster_layers) - 1, -1, -1):
                 layer = self._raster_layers[idx]
                 name = os.path.basename(layer.path)
@@ -2307,12 +2224,14 @@ class KOFViewer(tk.Tk):
                 if idx == len(self._raster_layers) - 1:
                     marks.append("top")
                 suffix = f" ({', '.join(marks)})" if marks else ""
-                ttk.Checkbutton(
-                    self.layers_inner,
-                    text=f"  Raster: {name}{suffix}",
-                    variable=layer.visible,
-                    command=self._redraw,
-                ).pack(anchor="w", pady=1)
+                raster_label = f"  Raster: {name}{suffix}"
+                if _matches(raster_label):
+                    ttk.Checkbutton(
+                        self.layers_inner,
+                        text=raster_label,
+                        variable=layer.visible,
+                        command=self._redraw,
+                    ).pack(anchor="w", pady=1)
             ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(2, 4))
 
         # Flat KOF entries.
@@ -2331,12 +2250,13 @@ class KOFViewer(tk.Tk):
                 n_pts = len(surface.all_points)
                 n_pl = len(surface.faces)
                 label = f"{surface.name} ({n_pts} pts, {n_pl} tri)"
-            ttk.Checkbutton(
-                self.layers_inner,
-                text=label,
-                variable=self.layer_vars[idx],
-                command=self._redraw,
-            ).pack(anchor="w", pady=1)
+            if _matches(label):
+                ttk.Checkbutton(
+                    self.layers_inner,
+                    text=label,
+                    variable=self.layer_vars[idx],
+                    command=self._redraw,
+                ).pack(anchor="w", pady=1)
 
         # Nested LandXML groups + child surfaces.
         if self.landxml_files:
@@ -2354,7 +2274,7 @@ class KOFViewer(tk.Tk):
                     text=f"LandXML: {lx.name} ({len(child_indices)} surfaces, {n_align} alignments, {n_sta} stations)",
                     variable=group_var,
                     command=lambda p=lx.path: self._on_toggle_landxml_group(p),
-                ).pack(anchor="w", pady=(1, 0))
+                ).pack(anchor="w", pady=(1, 0)) if _matches(lx.name) else None
 
                 for idx in child_indices:
                     surface = self.files[idx]
@@ -2363,12 +2283,13 @@ class KOFViewer(tk.Tk):
                     n_pts = len(surface.all_points)
                     n_tri = len(surface.faces)
                     label = f"    - {surface.layer_name} ({n_pts} pts, {n_tri} tri)"
-                    ttk.Checkbutton(
-                        self.layers_inner,
-                        text=label,
-                        variable=self.layer_vars[idx],
-                        command=lambda p=lx.path: self._on_toggle_landxml_child(p),
-                    ).pack(anchor="w", pady=1)
+                    if _matches(label):
+                        ttk.Checkbutton(
+                            self.layers_inner,
+                            text=label,
+                            variable=self.layer_vars[idx],
+                            command=lambda p=lx.path: self._on_toggle_landxml_child(p),
+                        ).pack(anchor="w", pady=1)
 
         if self._masks:
             ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(2, 4))
@@ -2378,6 +2299,8 @@ class KOFViewer(tk.Tk):
                 self._mask_visibility_vars.append(tk.BooleanVar(value=bool(self._masks[idx].visible)))
             for idx, mask in enumerate(self._masks):
                 self._mask_visibility_vars[idx].set(bool(mask.visible))
+                if not _matches(mask.name):
+                    continue
                 row = ttk.Frame(self.layers_inner)
                 row.pack(fill=tk.X, pady=1)
                 ttk.Checkbutton(
@@ -2407,6 +2330,8 @@ class KOFViewer(tk.Tk):
             for idx, note in enumerate(self._notes):
                 self._note_visibility_vars[idx].set(bool(note.visible))
                 label = note.title if note.title else self._note_default_title(idx)
+                if not _matches(label):
+                    continue
                 row = ttk.Frame(self.layers_inner)
                 row.pack(fill=tk.X, pady=1)
                 ttk.Checkbutton(
@@ -2711,38 +2636,7 @@ class KOFViewer(tk.Tk):
     def _combine_volume_results(
         results: list[VolumeResult | SplitVolumeResult],
     ) -> Optional[VolumeResult | SplitVolumeResult]:
-        if not results:
-            return None
-
-        def _combine_simple(items: list[VolumeResult]) -> VolumeResult:
-            first = items[0]
-            return VolumeResult(
-                top_name=first.top_name,
-                bottom_name=first.bottom_name,
-                cell_size=first.cell_size,
-                n_valid=int(sum(it.n_valid for it in items)),
-                net=float(sum(it.net for it in items)),
-                cut=float(sum(it.cut for it in items)),
-                fill=float(sum(it.fill for it in items)),
-                area=float(sum(it.area for it in items)),
-                y_min=min(it.y_min for it in items),
-                x_min=min(it.x_min for it in items),
-                y_max=max(it.y_max for it in items),
-                x_max=max(it.x_max for it in items),
-            )
-
-        if isinstance(results[0], SplitVolumeResult):
-            split_items = [r for r in results if isinstance(r, SplitVolumeResult)]
-            if len(split_items) != len(results):
-                return None
-            upper = _combine_simple([it.upper for it in split_items])
-            lower = _combine_simple([it.lower for it in split_items])
-            return SplitVolumeResult(upper=upper, lower=lower)
-
-        simple_items = [r for r in results if isinstance(r, VolumeResult)]
-        if len(simple_items) != len(results):
-            return None
-        return _combine_simple(simple_items)
+        return combine_volume_results(results)
 
     def _compute_volume_for_mask(
         self,
@@ -2753,15 +2647,233 @@ class KOFViewer(tk.Tk):
         mask_polygon: Optional[list[tuple[float, float]]],
         method: str,
     ) -> Optional[VolumeResult | SplitVolumeResult]:
-        if intermediate_surface is None:
-            return compute_volume(top_surface, bottom_surface, mask_polygon=mask_polygon, method=method)
-        return compute_volume_with_intermediate(
+        return compute_volume_for_mask(
             top_surface,
-            intermediate_surface,
             bottom_surface,
+            intermediate_surface,
             mask_polygon=mask_polygon,
             method=method,
         )
+
+    def _compute_volume_payload(
+        self,
+        *,
+        top_surface: SurfaceLike,
+        bottom_surface: SurfaceLike,
+        intermediate_surface: Optional[SurfaceLike],
+        mask_compute_polygons: list[list[tuple[float, float]]],
+        mask_indices: list[int],
+        effective_method: str,
+    ) -> dict[str, Any]:
+        per_mask_rows: list[str] = []
+        per_mask_result_rows: list[dict[str, Any]] = []
+
+        if not mask_compute_polygons:
+            result = self._compute_volume_for_mask(
+                top_surface,
+                bottom_surface,
+                intermediate_surface,
+                mask_polygon=None,
+                method=effective_method,
+            )
+        else:
+            partial_results: list[VolumeResult | SplitVolumeResult] = []
+            for poly in mask_compute_polygons:
+                partial = self._compute_volume_for_mask(
+                    top_surface,
+                    bottom_surface,
+                    intermediate_surface,
+                    mask_polygon=poly,
+                    method=effective_method,
+                )
+                if partial is not None:
+                    partial_results.append(partial)
+            result = self._combine_volume_results(partial_results)
+
+        if mask_indices:
+            for idx in mask_indices:
+                mask = self._masks[idx]
+                mask_result = self._compute_volume_for_mask(
+                    top_surface,
+                    bottom_surface,
+                    intermediate_surface,
+                    mask_polygon=list(mask.vertices),
+                    method=effective_method,
+                )
+                if mask_result is None:
+                    per_mask_rows.append(f"- {mask.name}: no overlap")
+                    per_mask_result_rows.append(
+                        {
+                            "mask_name": mask.name,
+                            "area_m2": "",
+                            "net_m3": "",
+                            "cut_m3": "",
+                            "fill_m3": "",
+                            "top_to_intermediate_m3": "",
+                            "top_to_intermediate_cut_m3": "",
+                            "top_to_intermediate_fill_m3": "",
+                            "intermediate_to_bottom_m3": "",
+                            "intermediate_to_bottom_cut_m3": "",
+                            "intermediate_to_bottom_fill_m3": "",
+                            "status": "no overlap",
+                        }
+                    )
+                    continue
+                if isinstance(mask_result, SplitVolumeResult):
+                    area_m2 = float(mask_result.upper.area)
+                    net_m3 = float(mask_result.net)
+                    cut_m3 = float(mask_result.cut)
+                    fill_m3 = float(mask_result.fill)
+                    upper_net_m3 = float(mask_result.upper.net)
+                    upper_cut_m3 = float(mask_result.upper.cut)
+                    upper_fill_m3 = float(mask_result.upper.fill)
+                    lower_net_m3 = float(mask_result.lower.net)
+                    lower_cut_m3 = float(mask_result.lower.cut)
+                    lower_fill_m3 = float(mask_result.lower.fill)
+                    per_mask_rows.append(
+                        f"- {mask.name}: area {area_m2:,.1f} m2 | "
+                        f"net {net_m3:+,.2f} m3 | "
+                        f"top-intermediate {upper_net_m3:+,.2f} | "
+                        f"intermediate-bottom {lower_net_m3:+,.2f}"
+                    )
+                    per_mask_result_rows.append(
+                        {
+                            "mask_name": mask.name,
+                            "area_m2": f"{area_m2:.6f}",
+                            "net_m3": f"{net_m3:.6f}",
+                            "cut_m3": f"{cut_m3:.6f}",
+                            "fill_m3": f"{fill_m3:.6f}",
+                            "top_to_intermediate_m3": f"{upper_net_m3:.6f}",
+                            "top_to_intermediate_cut_m3": f"{upper_cut_m3:.6f}",
+                            "top_to_intermediate_fill_m3": f"{upper_fill_m3:.6f}",
+                            "intermediate_to_bottom_m3": f"{lower_net_m3:.6f}",
+                            "intermediate_to_bottom_cut_m3": f"{lower_cut_m3:.6f}",
+                            "intermediate_to_bottom_fill_m3": f"{lower_fill_m3:.6f}",
+                            "status": "ok",
+                        }
+                    )
+                else:
+                    area_m2 = float(mask_result.area)
+                    net_m3 = float(mask_result.net)
+                    cut_m3 = float(mask_result.cut)
+                    fill_m3 = float(mask_result.fill)
+                    per_mask_rows.append(
+                        f"- {mask.name}: area {area_m2:,.1f} m2 | "
+                        f"net {net_m3:+,.2f} m3 | cut {cut_m3:,.2f} | fill {fill_m3:,.2f}"
+                    )
+                    per_mask_result_rows.append(
+                        {
+                            "mask_name": mask.name,
+                            "area_m2": f"{area_m2:.6f}",
+                            "net_m3": f"{net_m3:.6f}",
+                            "cut_m3": f"{cut_m3:.6f}",
+                            "fill_m3": f"{fill_m3:.6f}",
+                            "top_to_intermediate_m3": "",
+                            "top_to_intermediate_cut_m3": "",
+                            "top_to_intermediate_fill_m3": "",
+                            "intermediate_to_bottom_m3": "",
+                            "intermediate_to_bottom_cut_m3": "",
+                            "intermediate_to_bottom_fill_m3": "",
+                            "status": "ok",
+                        }
+                    )
+
+        return {
+            "result": result,
+            "per_mask_rows": per_mask_rows,
+            "per_mask_result_rows": per_mask_result_rows,
+        }
+
+    def _apply_volume_compute_payload(
+        self,
+        *,
+        payload: dict[str, Any],
+        mode: str,
+        effective_method: str,
+        scope: str,
+        scope_label: str,
+        mask_indices: list[int],
+    ) -> None:
+        result = payload.get("result")
+        per_mask_rows = list(payload.get("per_mask_rows", []))
+        per_mask_result_rows = list(payload.get("per_mask_result_rows", []))
+
+        if result is None:
+            messagebox.showerror(
+                "KOF Viewer",
+                "Could not compute volume. Check that both surfaces have >= 3 points and that their XY extents overlap.",
+            )
+            return
+
+        self.last_volume = result
+        self._last_volume_per_mask_rows = list(per_mask_rows)
+
+        if not per_mask_result_rows:
+            if isinstance(result, SplitVolumeResult):
+                per_mask_result_rows.append(
+                    {
+                        "mask_name": "(no mask)",
+                        "area_m2": f"{float(result.upper.area):.6f}",
+                        "net_m3": f"{float(result.net):.6f}",
+                        "cut_m3": f"{float(result.cut):.6f}",
+                        "fill_m3": f"{float(result.fill):.6f}",
+                        "top_to_intermediate_m3": f"{float(result.upper.net):.6f}",
+                        "top_to_intermediate_cut_m3": f"{float(result.upper.cut):.6f}",
+                        "top_to_intermediate_fill_m3": f"{float(result.upper.fill):.6f}",
+                        "intermediate_to_bottom_m3": f"{float(result.lower.net):.6f}",
+                        "intermediate_to_bottom_cut_m3": f"{float(result.lower.cut):.6f}",
+                        "intermediate_to_bottom_fill_m3": f"{float(result.lower.fill):.6f}",
+                        "status": "overall",
+                    }
+                )
+            else:
+                per_mask_result_rows.append(
+                    {
+                        "mask_name": "(no mask)",
+                        "area_m2": f"{float(result.area):.6f}",
+                        "net_m3": f"{float(result.net):.6f}",
+                        "cut_m3": f"{float(result.cut):.6f}",
+                        "fill_m3": f"{float(result.fill):.6f}",
+                        "top_to_intermediate_m3": "",
+                        "top_to_intermediate_cut_m3": "",
+                        "top_to_intermediate_fill_m3": "",
+                        "intermediate_to_bottom_m3": "",
+                        "intermediate_to_bottom_cut_m3": "",
+                        "intermediate_to_bottom_fill_m3": "",
+                        "status": "overall",
+                    }
+                )
+
+        self._last_mask_volume_results = list(per_mask_result_rows)
+        self._refresh_mask_result_actions()
+
+        mask_suffix = ""
+        if scope == "selected":
+            active = self._active_mask()
+            if active is not None:
+                mask_suffix = f" (mask: {active.name})"
+        elif mask_indices:
+            mask_suffix = f" (scope: {scope_label}, masks: {len(mask_indices)})"
+
+        if isinstance(result, SplitVolumeResult):
+            upper = result.upper
+            lower = result.lower
+            summary = (
+                f"{mode}/{effective_method} split: {upper.top_name}-{upper.bottom_name} "
+                f"Net {upper.net:+,.2f} m³; {lower.top_name}-{lower.bottom_name} "
+                f"Net {lower.net:+,.2f} m³; Total {result.net:+,.2f} m³{mask_suffix}"
+            )
+        else:
+            summary = (
+                f"{mode}/{effective_method}: Net {result.net:+,.2f} m³   (Cut {result.cut:,.2f} / "
+                f"Fill {result.fill:,.2f})   over {result.area:,.1f} m²{mask_suffix}"
+            )
+        if per_mask_rows:
+            summary = summary + "\n" + "\n".join(per_mask_rows)
+        self.volume_text.set(summary)
+        self._record_volume_history(summary)
+        if self.show_triangulation.get():
+            self._redraw()
 
     def _on_compute_volume(self) -> None:
         top = self._find_file(self.top_var.get())
@@ -2893,190 +3005,46 @@ class KOFViewer(tk.Tk):
             )
             return
 
-        try:
-            if not mask_compute_polygons:
-                result = self._compute_volume_for_mask(
-                    top_surface,
-                    bottom_surface,
-                    intermediate_surface,
-                    mask_polygon=None,
-                    method=effective_method,
-                )
-            else:
-                partial_results: list[VolumeResult | SplitVolumeResult] = []
-                for poly in mask_compute_polygons:
-                    partial = self._compute_volume_for_mask(
-                        top_surface,
-                        bottom_surface,
-                        intermediate_surface,
-                        mask_polygon=poly,
-                        method=effective_method,
-                    )
-                    if partial is not None:
-                        partial_results.append(partial)
-                result = self._combine_volume_results(partial_results)
+        if self._volume_task_running:
+            messagebox.showinfo("KOF Viewer", "Volume computation is already running.")
+            return
 
-            if mask_indices:
-                for idx in mask_indices:
-                    mask = self._masks[idx]
-                    mask_result = self._compute_volume_for_mask(
-                        top_surface,
-                        bottom_surface,
-                        intermediate_surface,
-                        mask_polygon=list(mask.vertices),
-                        method=effective_method,
-                    )
-                    if mask_result is None:
-                        per_mask_rows.append(f"- {mask.name}: no overlap")
-                        per_mask_result_rows.append(
-                            {
-                                "mask_name": mask.name,
-                                "area_m2": "",
-                                "net_m3": "",
-                                "cut_m3": "",
-                                "fill_m3": "",
-                                "top_to_intermediate_m3": "",
-                                "top_to_intermediate_cut_m3": "",
-                                "top_to_intermediate_fill_m3": "",
-                                "intermediate_to_bottom_m3": "",
-                                "intermediate_to_bottom_cut_m3": "",
-                                "intermediate_to_bottom_fill_m3": "",
-                                "status": "no overlap",
-                            }
-                        )
-                        continue
-                    if isinstance(mask_result, SplitVolumeResult):
-                        area_m2 = float(mask_result.upper.area)
-                        net_m3 = float(mask_result.net)
-                        cut_m3 = float(mask_result.cut)
-                        fill_m3 = float(mask_result.fill)
-                        upper_net_m3 = float(mask_result.upper.net)
-                        upper_cut_m3 = float(mask_result.upper.cut)
-                        upper_fill_m3 = float(mask_result.upper.fill)
-                        lower_net_m3 = float(mask_result.lower.net)
-                        lower_cut_m3 = float(mask_result.lower.cut)
-                        lower_fill_m3 = float(mask_result.lower.fill)
-                        per_mask_rows.append(
-                            f"- {mask.name}: area {area_m2:,.1f} m2 | "
-                            f"net {net_m3:+,.2f} m3 | "
-                            f"top-intermediate {upper_net_m3:+,.2f} | "
-                            f"intermediate-bottom {lower_net_m3:+,.2f}"
-                        )
-                        per_mask_result_rows.append(
-                            {
-                                "mask_name": mask.name,
-                                "area_m2": f"{area_m2:.6f}",
-                                "net_m3": f"{net_m3:.6f}",
-                                "cut_m3": f"{cut_m3:.6f}",
-                                "fill_m3": f"{fill_m3:.6f}",
-                                "top_to_intermediate_m3": f"{upper_net_m3:.6f}",
-                                "top_to_intermediate_cut_m3": f"{upper_cut_m3:.6f}",
-                                "top_to_intermediate_fill_m3": f"{upper_fill_m3:.6f}",
-                                "intermediate_to_bottom_m3": f"{lower_net_m3:.6f}",
-                                "intermediate_to_bottom_cut_m3": f"{lower_cut_m3:.6f}",
-                                "intermediate_to_bottom_fill_m3": f"{lower_fill_m3:.6f}",
-                                "status": "ok",
-                            }
-                        )
-                    else:
-                        area_m2 = float(mask_result.area)
-                        net_m3 = float(mask_result.net)
-                        cut_m3 = float(mask_result.cut)
-                        fill_m3 = float(mask_result.fill)
-                        per_mask_rows.append(
-                            f"- {mask.name}: area {area_m2:,.1f} m2 | "
-                            f"net {net_m3:+,.2f} m3 | cut {cut_m3:,.2f} | fill {fill_m3:,.2f}"
-                        )
-                        per_mask_result_rows.append(
-                            {
-                                "mask_name": mask.name,
-                                "area_m2": f"{area_m2:.6f}",
-                                "net_m3": f"{net_m3:.6f}",
-                                "cut_m3": f"{cut_m3:.6f}",
-                                "fill_m3": f"{fill_m3:.6f}",
-                                "top_to_intermediate_m3": "",
-                                "top_to_intermediate_cut_m3": "",
-                                "top_to_intermediate_fill_m3": "",
-                                "intermediate_to_bottom_m3": "",
-                                "intermediate_to_bottom_cut_m3": "",
-                                "intermediate_to_bottom_fill_m3": "",
-                                "status": "ok",
-                            }
-                        )
-        except ValueError as exc:
-            messagebox.showerror("KOF Viewer", str(exc))
-            return
-        if result is None:
-            messagebox.showerror(
-                "KOF Viewer",
-                "Could not compute volume. Check that both surfaces have "
-                ">= 3 points and that their XY extents overlap.",
+        self._volume_task_running = True
+        self.status.set("Computing volume in background...")
+
+        def _task() -> dict[str, Any]:
+            return self._compute_volume_payload(
+                top_surface=top_surface,
+                bottom_surface=bottom_surface,
+                intermediate_surface=intermediate_surface,
+                mask_compute_polygons=mask_compute_polygons,
+                mask_indices=mask_indices,
+                effective_method=effective_method,
             )
-            return
-        self.last_volume = result
-        self._last_volume_per_mask_rows = list(per_mask_rows)
-        if not per_mask_result_rows:
-            if isinstance(result, SplitVolumeResult):
-                per_mask_result_rows.append(
-                    {
-                        "mask_name": "(no mask)",
-                        "area_m2": f"{float(result.upper.area):.6f}",
-                        "net_m3": f"{float(result.net):.6f}",
-                        "cut_m3": f"{float(result.cut):.6f}",
-                        "fill_m3": f"{float(result.fill):.6f}",
-                        "top_to_intermediate_m3": f"{float(result.upper.net):.6f}",
-                        "top_to_intermediate_cut_m3": f"{float(result.upper.cut):.6f}",
-                        "top_to_intermediate_fill_m3": f"{float(result.upper.fill):.6f}",
-                        "intermediate_to_bottom_m3": f"{float(result.lower.net):.6f}",
-                        "intermediate_to_bottom_cut_m3": f"{float(result.lower.cut):.6f}",
-                        "intermediate_to_bottom_fill_m3": f"{float(result.lower.fill):.6f}",
-                        "status": "overall",
-                    }
-                )
-            else:
-                per_mask_result_rows.append(
-                    {
-                        "mask_name": "(no mask)",
-                        "area_m2": f"{float(result.area):.6f}",
-                        "net_m3": f"{float(result.net):.6f}",
-                        "cut_m3": f"{float(result.cut):.6f}",
-                        "fill_m3": f"{float(result.fill):.6f}",
-                        "top_to_intermediate_m3": "",
-                        "top_to_intermediate_cut_m3": "",
-                        "top_to_intermediate_fill_m3": "",
-                        "intermediate_to_bottom_m3": "",
-                        "intermediate_to_bottom_cut_m3": "",
-                        "intermediate_to_bottom_fill_m3": "",
-                        "status": "overall",
-                    }
-                )
-        self._last_mask_volume_results = list(per_mask_result_rows)
-        self._refresh_mask_result_actions()
-        mask_suffix = ""
-        if scope == "selected":
-            active = self._active_mask()
-            if active is not None:
-                mask_suffix = f" (mask: {active.name})"
-        elif mask_indices:
-            mask_suffix = f" (scope: {scope_label}, masks: {len(mask_indices)})"
-        if isinstance(result, SplitVolumeResult):
-            upper = result.upper
-            lower = result.lower
-            summary = (
-                f"{mode}/{effective_method} split: {upper.top_name}-{upper.bottom_name} "
-                f"Net {upper.net:+,.2f} m³; {lower.top_name}-{lower.bottom_name} "
-                f"Net {lower.net:+,.2f} m³; Total {result.net:+,.2f} m³{mask_suffix}"
+
+        def _on_success(payload: dict[str, Any]) -> None:
+            self._volume_task_running = False
+            self._apply_volume_compute_payload(
+                payload=payload,
+                mode=mode,
+                effective_method=effective_method,
+                scope=scope,
+                scope_label=scope_label,
+                mask_indices=mask_indices,
             )
-        else:
-            summary = (
-                f"{mode}/{effective_method}: Net {result.net:+,.2f} m³   (Cut {result.cut:,.2f} / "
-                f"Fill {result.fill:,.2f})   over {result.area:,.1f} m²{mask_suffix}"
-            )
-        if per_mask_rows:
-            summary = summary + "\n" + "\n".join(per_mask_rows)
-        self.volume_text.set(summary)
-        if self.show_triangulation.get():
-            self._redraw()
+            self._update_status()
+
+        def _on_error(exc: Exception) -> None:
+            self._volume_task_running = False
+            messagebox.showerror("KOF Viewer", f"Volume computation failed:\n{exc}")
+            self._update_status()
+
+        self._task_executor.submit(task=_task, on_success=_on_success, on_error=_on_error)
+
+    def _record_volume_history(self, summary: str) -> None:
+        entry = f"{datetime.now().strftime('%H:%M:%S')} | {summary}"
+        self.runtime_state.volume_history.append(entry)
+        self.runtime_state.volume_history = self.runtime_state.volume_history[-20:]
 
     def _on_boundary_change(self) -> None:
         try:
@@ -3186,21 +3154,35 @@ class KOFViewer(tk.Tk):
     def _note_default_title(index: int) -> str:
         return NoteTool.default_title(index)
 
-    def _append_note(self, title: str, text: str, y: float, x: float, visible: bool = True) -> None:
+    def _append_note(
+        self,
+        title: str,
+        text: str,
+        y: float,
+        x: float,
+        visible: bool = True,
+        *,
+        track_undo: bool = True,
+        undo_label: str = "Add note",
+    ) -> None:
         clean_title = title.strip()
         clean_text = text.strip()
         if not clean_title and not clean_text:
             return
+        before = self._capture_edit_snapshot() if track_undo else None
         if not clean_title:
             clean_title = self._note_default_title(len(self._notes))
         self._notes.append(NoteDefinition(title=clean_title, text=clean_text, y=float(y), x=float(x), visible=visible))
         self._note_visibility_vars.append(tk.BooleanVar(value=bool(visible)))
         self._active_note_index = len(self._notes) - 1
         self._refresh_layer_controls()
+        if before is not None:
+            self._record_undoable_edit(undo_label, before)
 
     def _delete_note_at_index(self, idx: int, *, ask_confirm: bool = True) -> bool:
         if idx < 0 or idx >= len(self._notes):
             return False
+        before = self._capture_edit_snapshot()
         note = self._notes[idx]
         if ask_confirm:
             if not messagebox.askyesno("Delete note", f"Delete note '{note.title}'?"):
@@ -3217,6 +3199,7 @@ class KOFViewer(tk.Tk):
         elif self._active_note_index > idx:
             self._active_note_index -= 1
         self._refresh_layer_controls()
+        self._record_undoable_edit("Delete note", before)
         return True
 
     def _note_is_visible(self, index: int) -> bool:
@@ -3345,6 +3328,7 @@ class KOFViewer(tk.Tk):
     def _finalize_line_measure(self, points: list[tuple[float, float]]) -> None:
         if len(points) != 2:
             return
+        before = self._capture_edit_snapshot()
         length_m = self._measure_line_length(points[0], points[1])
         self._measure_results.append(
             {
@@ -3357,10 +3341,12 @@ class KOFViewer(tk.Tk):
         self._end_measure_mode()
         self._redraw_2d()
         self.status.set(f"{label}: distance {length_m:,.2f} m")
+        self._record_undoable_edit("Add line measurement", before)
 
     def _finalize_polygon_measure(self, points: list[tuple[float, float]]) -> None:
         if len(points) < 3:
             return
+        before = self._capture_edit_snapshot()
         area_m2 = self._measure_polygon_area(points)
         perimeter_m = self._measure_polygon_perimeter(points)
         self._measure_results.append(
@@ -3375,18 +3361,22 @@ class KOFViewer(tk.Tk):
         self._end_measure_mode()
         self._redraw_2d()
         self.status.set(f"{label}: area {area_m2:,.2f} m2, perimeter {perimeter_m:,.2f} m")
+        self._record_undoable_edit("Add polygon measurement", before)
 
     def _on_measure_click(self, event) -> None:  # noqa: ANN001
         MeasureTool.on_click(self, event)
 
     def _on_clear_measurements(self) -> None:
         had_data = bool(self._measure_results)
+        before = self._capture_edit_snapshot() if had_data else None
         self._measure_results.clear()
         self._measure_click_points.clear()
         if self._measure_mode:
             self._end_measure_mode()
         if had_data:
             self._redraw_2d()
+            if before is not None:
+                self._record_undoable_edit("Clear measurements", before)
         else:
             self._update_status()
 
@@ -3402,6 +3392,7 @@ class KOFViewer(tk.Tk):
 
     def _on_clear_mask(self) -> None:
         had_mask = bool(self._masks)
+        before = self._capture_edit_snapshot() if had_mask else None
         self._masks.clear()
         self._mask_visibility_vars.clear()
         self._clear_cached_mask_volume_results()
@@ -3416,6 +3407,8 @@ class KOFViewer(tk.Tk):
             self.volume_text.set("Volume: (stale – recompute)")
         self._refresh_mask_controls()
         self._redraw()
+        if before is not None:
+            self._record_undoable_edit("Clear masks", before)
 
     def _on_mask_click(self, event) -> None:  # noqa: ANN001
         MaskTool.on_click(self, event)
@@ -3461,6 +3454,7 @@ class KOFViewer(tk.Tk):
         idx = self._active_mask_index
         if idx is None or idx < 0 or idx >= len(self._masks):
             return
+        before = self._capture_edit_snapshot()
         if self._mask_mode:
             self._end_mask_mode()
         del self._masks[idx]
@@ -3477,6 +3471,7 @@ class KOFViewer(tk.Tk):
             self.volume_text.set("Volume: (stale – recompute)")
         self._refresh_mask_controls()
         self._redraw()
+        self._record_undoable_edit("Delete selected mask", before)
 
     def _on_buffer_selected_mask(self) -> None:
         active = self._active_mask()
@@ -3524,7 +3519,12 @@ class KOFViewer(tk.Tk):
             messagebox.showerror("KOF Viewer", "Buffered mask is not a valid polygon.")
             return
 
-        self._append_mask(coords, name=f"{active.name} (buffer {distance:+.2f} m)")
+        self._append_mask(
+            coords,
+            name=f"{active.name} (buffer {distance:+.2f} m)",
+            track_undo=True,
+            undo_label="Buffer mask",
+        )
         if self.last_volume is not None:
             self.volume_text.set("Volume: (stale – recompute)")
         self._refresh_mask_controls()
@@ -3585,6 +3585,7 @@ class KOFViewer(tk.Tk):
         idx = self._active_section_index
         if idx is None or idx < 0 or idx >= len(self._sections):
             return
+        before = self._capture_edit_snapshot()
         label = self._section_label(idx)
         if not messagebox.askyesno("Delete section", f"Delete section {label}?"):
             return
@@ -3597,17 +3598,414 @@ class KOFViewer(tk.Tk):
             self._active_section_index = min(idx, len(self._sections) - 1)
         self._refresh_section_controls()
         self._redraw_2d()
+        self._record_undoable_edit("Delete section", before)
 
-    # --------------------------------------------------------------- Render
+    def _run_section_report(self, out_root: str, request: dict[str, Any]) -> dict[str, Any]:
+        top = request["top"]
+        bot = request["bottom"]
+        (b0, b1) = request["baseline"]
+        baseline_len = float(request["baseline_len"])
+        spacing_m = float(request["spacing_m"])
+        section_length_m = float(request["section_length_m"])
+        n_samples = int(request["n_samples"])
+        section_raster = request["section_raster"]
+        section_intermediate = request["section_intermediate"]
+        area_top_surface, area_bottom_surface, area_top_name, area_bottom_name = request["area_pair"]
+
+        stations = station_values(baseline_len, spacing_m)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir = os.path.join(out_root, f"section_report_{timestamp}")
+        profiles_dir = os.path.join(run_dir, "profiles")
+        os.makedirs(profiles_dir, exist_ok=True)
+
+        profile_rows: list[dict[str, object]] = []
+        plan_points: list[tuple[str, tuple[float, float]]] = []
+
+        for idx, station in enumerate(stations, start=1):
+            profile_id = f"P{idx:04d}"
+            p0, p1, center = profile_segment_from_station(
+                b0,
+                b1,
+                float(station),
+                float(section_length_m),
+            )
+            sample = sample_profile(
+                top,
+                bot,
+                p0,
+                p1,
+                profile_id=profile_id,
+                station_m=float(station),
+                center=center,
+                n_samples=int(n_samples),
+                reference_surface=section_raster,
+                reference_name=section_raster.name if section_raster is not None else None,
+                secondary_reference_surface=section_intermediate,
+                secondary_reference_name=section_intermediate.name if section_intermediate is not None else None,
+                area_top_surface=area_top_surface,
+                area_bottom_surface=area_bottom_surface,
+                area_top_name=area_top_name,
+                area_bottom_name=area_bottom_name,
+            )
+
+            image_name = f"{profile_id}.png"
+            image_rel = os.path.join("profiles", image_name)
+            image_path = os.path.join(profiles_dir, image_name)
+            save_profile_plot_png(
+                image_path,
+                sample,
+                top_name=top.name,
+                bottom_name=bot.name,
+            )
+
+            profile_rows.append(
+                {
+                    "profile_id": profile_id,
+                    "station_m": sample.station_m,
+                    "length_m": sample.length_m,
+                    "valid_fraction": sample.valid_fraction,
+                    "area_net_m2": sample.area_net_m2,
+                    "area_cut_m2": sample.area_cut_m2,
+                    "area_fill_m2": sample.area_fill_m2,
+                    "area_upper_leg_m2": sample.area_upper_leg_m2,
+                    "area_upper_leg_cut_m2": sample.area_upper_leg_cut_m2,
+                    "area_upper_leg_fill_m2": sample.area_upper_leg_fill_m2,
+                    "area_lower_leg_m2": sample.area_lower_leg_m2,
+                    "area_lower_leg_cut_m2": sample.area_lower_leg_cut_m2,
+                    "area_lower_leg_fill_m2": sample.area_lower_leg_fill_m2,
+                    "image_rel": image_rel.replace("\\", "/"),
+                }
+            )
+            plan_points.append((profile_id, center))
+
+        stations_list = [float(r["station_m"]) for r in profile_rows]
+        area_net_list = [float(r["area_net_m2"]) for r in profile_rows]
+        area_cut_list = [float(r["area_cut_m2"]) for r in profile_rows]
+        area_fill_list = [float(r["area_fill_m2"]) for r in profile_rows]
+        net_volume_m3 = self._integrate_profile_areas_to_volume(stations_list, area_net_list)
+        cut_volume_m3 = self._integrate_profile_areas_to_volume(stations_list, area_cut_list)
+        fill_volume_m3 = self._integrate_profile_areas_to_volume(stations_list, area_fill_list)
+
+        upper_leg_values = [r.get("area_upper_leg_m2") for r in profile_rows]
+        lower_leg_values = [r.get("area_lower_leg_m2") for r in profile_rows]
+        upper_leg_cut_values = [r.get("area_upper_leg_cut_m2") for r in profile_rows]
+        upper_leg_fill_values = [r.get("area_upper_leg_fill_m2") for r in profile_rows]
+        lower_leg_cut_values = [r.get("area_lower_leg_cut_m2") for r in profile_rows]
+        lower_leg_fill_values = [r.get("area_lower_leg_fill_m2") for r in profile_rows]
+        upper_leg_volume_m3 = float("nan")
+        lower_leg_volume_m3 = float("nan")
+        upper_leg_cut_volume_m3 = float("nan")
+        upper_leg_fill_volume_m3 = float("nan")
+        lower_leg_cut_volume_m3 = float("nan")
+        lower_leg_fill_volume_m3 = float("nan")
+        if any(v not in (None, "") for v in upper_leg_values):
+            upper_leg_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in upper_leg_values],
+            )
+        if any(v not in (None, "") for v in lower_leg_values):
+            lower_leg_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in lower_leg_values],
+            )
+        if any(v not in (None, "") for v in upper_leg_cut_values):
+            upper_leg_cut_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in upper_leg_cut_values],
+            )
+        if any(v not in (None, "") for v in upper_leg_fill_values):
+            upper_leg_fill_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in upper_leg_fill_values],
+            )
+        if any(v not in (None, "") for v in lower_leg_cut_values):
+            lower_leg_cut_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in lower_leg_cut_values],
+            )
+        if any(v not in (None, "") for v in lower_leg_fill_values):
+            lower_leg_fill_volume_m3 = self._integrate_profile_areas_to_volume(
+                stations_list,
+                [float(v) if v not in (None, "") else float("nan") for v in lower_leg_fill_values],
+            )
+
+        apply_cumulative_profile_volumes(profile_rows)
+
+        plan_image_rel = "plan_view.png"
+        plan_image_path = os.path.join(run_dir, plan_image_rel)
+        plan_raster = request["plan_raster"]
+        save_plan_view_png(
+            plan_image_path,
+            files=request["visible_files"],
+            show_markers=bool(request["show_markers"]),
+            show_lines=bool(request["show_lines"]),
+            show_labels=bool(request["show_labels"]),
+            show_triangulation=bool(request["show_triangulation"]),
+            sections=request["sections"],
+            baseline=(b0, b1),
+            profile_points=plan_points,
+            raster_img=plan_raster.image if plan_raster is not None else None,
+            raster_extent=plan_raster.extent if plan_raster is not None else None,
+            raster_origin=plan_raster.origin if plan_raster is not None else "upper",
+            raster_alpha=float(plan_raster.alpha.get()) if plan_raster is not None else 1.0,
+        )
+
+        report_path = os.path.join(run_dir, "report.html")
+        mask_rows = request.get("mask_rows") or []
+        mask_report_text = " | ".join(mask_rows) if mask_rows else "(not computed)"
+        metadata = {
+            "Top surface": top.name,
+            "Bottom surface": bot.name,
+            "Section area pair": f"{area_top_name} - {area_bottom_name}",
+            "Input files": ", ".join(request["input_file_names"]),
+            "Spacing (m)": f"{spacing_m:.2f}",
+            "Cross-section length (m)": f"{section_length_m:.2f}",
+            "Samples per profile": n_samples,
+            "Profile count": len(profile_rows),
+            "Baseline length (m)": f"{baseline_len:.2f}",
+            "Section orientation": "Left -> Right (looking toward higher station)",
+            "Volume net (m3)": f"{net_volume_m3:+,.2f}",
+            "Volume cut (m3)": f"{cut_volume_m3:,.2f}",
+            "Volume fill (m3)": f"{fill_volume_m3:,.2f}",
+            "Latest volume per-mask": mask_report_text,
+        }
+        if np.isfinite(upper_leg_volume_m3):
+            upper_name = section_intermediate.name if section_intermediate is not None else "Intermediate"
+            metadata[f"Volume {top.name} - {upper_name} (m3)"] = f"{upper_leg_volume_m3:+,.2f}"
+            if np.isfinite(upper_leg_cut_volume_m3):
+                metadata[f"Volume {top.name} - {upper_name} cut (m3)"] = f"{upper_leg_cut_volume_m3:,.2f}"
+            if np.isfinite(upper_leg_fill_volume_m3):
+                metadata[f"Volume {top.name} - {upper_name} fill (m3)"] = f"{upper_leg_fill_volume_m3:,.2f}"
+        if np.isfinite(lower_leg_volume_m3):
+            lower_name = section_intermediate.name if section_intermediate is not None else "Intermediate"
+            metadata[f"Volume {lower_name} - {bot.name} (m3)"] = f"{lower_leg_volume_m3:+,.2f}"
+            if np.isfinite(lower_leg_cut_volume_m3):
+                metadata[f"Volume {lower_name} - {bot.name} cut (m3)"] = f"{lower_leg_cut_volume_m3:,.2f}"
+            if np.isfinite(lower_leg_fill_volume_m3):
+                metadata[f"Volume {lower_name} - {bot.name} fill (m3)"] = f"{lower_leg_fill_volume_m3:,.2f}"
+
+        write_html_report(
+            report_path,
+            title="KOF Section Report",
+            metadata=metadata,
+            plan_image_rel=plan_image_rel,
+            profile_rows=profile_rows,
+            template_name=request["report_template"],
+            theme_name=request["report_theme"],
+        )
+
+        manifest_path = os.path.join(run_dir, "report_manifest.json")
+        with open(manifest_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "type": "kofvision.section_report",
+                    "version": 1,
+                    "generated_at": datetime.now().isoformat(timespec="seconds"),
+                    "top_surface": top.name,
+                    "bottom_surface": bot.name,
+                    "section_area_pair": {
+                        "top": area_top_name,
+                        "bottom": area_bottom_name,
+                    },
+                    "latest_volume_per_mask": mask_rows,
+                    "input_files": request["input_file_names"],
+                    "spacing_m": spacing_m,
+                    "section_length_m": section_length_m,
+                    "samples_per_profile": n_samples,
+                    "baseline": {
+                        "start": [float(b0[0]), float(b0[1])],
+                        "end": [float(b1[0]), float(b1[1])],
+                        "length_m": baseline_len,
+                    },
+                    "orientation": {
+                        "section_axis": "left_to_right",
+                        "view_direction": "toward_higher_station",
+                    },
+                    "report_format": {
+                        "template": request["report_template"],
+                        "theme": request["report_theme"],
+                    },
+                    "volume_summary_m3": {
+                        "net": net_volume_m3,
+                        "cut": cut_volume_m3,
+                        "fill": fill_volume_m3,
+                        "top_to_intermediate": upper_leg_volume_m3,
+                        "intermediate_to_bottom": lower_leg_volume_m3,
+                    },
+                    "profiles": profile_rows,
+                },
+                fh,
+                indent=2,
+            )
+
+        return {"run_dir": run_dir, "report_path": report_path}
+
+    def _generate_section_report(self, out_root: str, *, open_in_browser: bool) -> Optional[str]:
+        request = self._prepare_section_report_request()
+        if request is None:
+            return None
+        result = self._run_section_report(out_root, request)
+        run_dir = str(result["run_dir"])
+        report_path = str(result["report_path"])
+        self._latest_section_report_path = report_path
+        if open_in_browser:
+            opened = self._open_path_in_browser(report_path)
+            if not opened:
+                messagebox.showwarning(
+                    "KOF Viewer",
+                    "Report exported, but failed to open web browser automatically.",
+                )
+        return run_dir
+
+    def _start_section_report_async(self, out_root: str, *, open_in_browser: bool, temporary_folder: bool) -> None:
+        if self._report_task_running:
+            messagebox.showinfo("KOF Viewer", "Section report generation is already running.")
+            return
+        request = self._prepare_section_report_request()
+        if request is None:
+            return
+
+        self._report_task_running = True
+        self.status.set("Generating section report in background...")
+
+        def _task() -> dict[str, Any]:
+            return self._run_section_report(out_root, request)
+
+        def _on_success(result: dict[str, Any]) -> None:
+            self._report_task_running = False
+            run_dir = str(result["run_dir"])
+            report_path = str(result["report_path"])
+            self._latest_section_report_path = report_path
+            opened = True
+            if open_in_browser:
+                opened = self._open_path_in_browser(report_path)
+
+            if temporary_folder:
+                messagebox.showinfo(
+                    "KOF Viewer",
+                    "Section report generated.\n\n"
+                    f"Temporary folder:\n{run_dir}\n\n"
+                    f"Report opened in browser: {'yes' if opened else 'no'}\n\n"
+                    "Tip: use Export section report... to choose a permanent output folder.",
+                )
+            else:
+                messagebox.showinfo(
+                    "KOF Viewer",
+                    "Section report export completed.\n\n"
+                    f"Output folder:\n{run_dir}\n\n"
+                    f"Report opened in browser: {'yes' if opened else 'no'}\n"
+                    "Baseline: latest drawn section line\n"
+                    "Orientation: left -> right looking toward higher station",
+                )
+            self._update_status()
+
+        def _on_error(exc: Exception) -> None:
+            self._report_task_running = False
+            messagebox.showerror("KOF Viewer", f"Section report generation failed:\n{exc}")
+            self._update_status()
+
+        self._task_executor.submit(task=_task, on_success=_on_success, on_error=_on_error)
+
+    def _on_export_section_report(self) -> None:
+        out_root = filedialog.askdirectory(title="Choose report output folder")
+        if not out_root:
+            return
+        self._start_section_report_async(out_root, open_in_browser=True, temporary_folder=False)
+
+    def _on_open_section_report_browser(self) -> None:
+        out_root = tempfile.mkdtemp(prefix="kofvision_section_report_")
+        self._start_section_report_async(out_root, open_in_browser=True, temporary_folder=True)
+
     def _redraw(self) -> None:
         self._redraw_2d()
         self._redraw_3d()
         self._update_status()
 
     def _redraw_2d(self) -> None:
+        section_checksum = tuple(
+            (float(p0[0]), float(p0[1]), float(p1[0]), float(p1[1]))
+            for (p0, p1) in self._sections
+        )
+        mask_checksum = tuple(
+            (
+                m.name,
+                bool(m.visible),
+                tuple((float(pt[0]), float(pt[1])) for pt in m.vertices),
+            )
+            for m in self._masks
+        )
+        measurement_checksum = tuple(
+            tuple(sorted((str(k), repr(v)) for k, v in row.items()))
+            for row in self._measure_results
+        )
+        note_checksum = tuple(
+            (n.title, n.text, float(n.y), float(n.x), bool(n.visible))
+            for n in self._notes
+        )
+        layer_visibility_checksum = tuple(bool(var.get()) for var in self.layer_vars)
+        landxml_group_checksum = tuple(
+            (path, bool(var.get()))
+            for path, var in sorted(self._landxml_group_vars.items(), key=lambda kv: kv[0])
+        )
+        raster_checksum = tuple(
+            (
+                layer.path,
+                bool(layer.visible.get()),
+                float(layer.alpha.get()),
+            )
+            for layer in self._raster_layers
+        )
+        view_extent = tuple(float(v) for v in self._view_extent_2d) if self._view_extent_2d is not None else None
+        signature = (
+            self.theme_mode.get(),
+            len(self.files),
+            len(self.landxml_files),
+            len(self._sections),
+            len(self._masks),
+            len(self._measure_results),
+            len(self._notes),
+            bool(self.show_labels.get()),
+            bool(self.show_stations.get()),
+            bool(self.show_markers.get()),
+            bool(self.show_lines.get()),
+            bool(self.show_triangulation.get()),
+            bool(self.show_tin_fill.get()),
+            bool(self.show_raster.get()),
+            int(self.max_labels.get()) if hasattr(self, "max_labels") else 0,
+            self._section_mode,
+            self._mask_mode,
+            self._mask_edit_mode,
+            self._measure_mode,
+            self._note_mode,
+            len(self._section_click_points),
+            len(self._mask_click_points),
+            len(self._measure_click_points),
+            layer_visibility_checksum,
+            landxml_group_checksum,
+            raster_checksum,
+            view_extent,
+            section_checksum,
+            mask_checksum,
+            measurement_checksum,
+            note_checksum,
+        )
+        if signature == self.runtime_state.last_render_2d_signature:
+            return
+        self.runtime_state.last_render_2d_signature = signature
         render_2d(self, FILE_COLORS)
 
     def _redraw_3d(self) -> None:
+        signature = (
+            self.theme_mode.get(),
+            len(self.files),
+            bool(self.show_markers.get()),
+            bool(self.show_lines.get()),
+            bool(self.show_labels.get()),
+            bool(self.show_triangulation.get()),
+        )
+        if signature == self.runtime_state.last_render_3d_signature:
+            return
+        self.runtime_state.last_render_3d_signature = signature
         render_3d(self, FILE_COLORS)
 
     def _equalize_3d_aspect(self) -> None:
@@ -3643,6 +4041,20 @@ class KOFViewer(tk.Tk):
             pass
 
     def _update_status(self) -> None:
+        if hasattr(self, "mode_badge"):
+            mode_text = "idle"
+            if self._section_mode:
+                mode_text = "section"
+            elif self._mask_mode:
+                mode_text = "mask"
+            elif self._mask_edit_mode:
+                mode_text = "mask-edit"
+            elif self._measure_mode:
+                mode_text = "measure"
+            elif self._note_mode:
+                mode_text = "note"
+            self.mode_badge.configure(text=f"Mode: {mode_text}")
+
         if self._section_mode:
             return
         if self._mask_mode:
