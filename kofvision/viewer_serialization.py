@@ -7,11 +7,28 @@ from typing import Any, Callable
 from kofvision.viewer_state import reset_for_project_load
 
 PROJECT_TYPE = "kofvision.project"
-PROJECT_VERSION = 1
+PROJECT_VERSION = 2
+SUPPORTED_PROJECT_VERSIONS = {1, PROJECT_VERSION}
 
 
 class ProjectPayloadError(ValueError):
     """Raised when project payload metadata is invalid."""
+
+
+def migrate_project_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Migrate older payloads to the latest schema version."""
+    version = int(payload.get("version", 0))
+    if version == PROJECT_VERSION:
+        return payload
+
+    if version == 1:
+        upgraded = dict(payload)
+        upgraded.setdefault("volume_history", [])
+        upgraded.setdefault("saved_preferences", {})
+        upgraded["version"] = PROJECT_VERSION
+        return upgraded
+
+    raise ProjectPayloadError(f"Unsupported project version: {payload.get('version')}")
 
 
 def build_project_payload(viewer: Any) -> dict[str, Any]:
@@ -77,6 +94,17 @@ def build_project_payload(viewer: Any) -> dict[str, Any]:
             if len(mask.vertices) >= 3
         ],
         "active_mask": viewer.active_mask_var.get(),
+        "volume_history": list(getattr(getattr(viewer, "runtime_state", None), "volume_history", [])),
+        "saved_preferences": {
+            "theme": viewer.theme_mode.get(),
+            "volume_method": viewer.volume_method.get(),
+            "station_interval_m": float(viewer.station_interval_m.get()),
+            "station_label_format": viewer.station_label_format.get(),
+            "show_labels": bool(viewer.show_labels.get()),
+            "show_markers": bool(viewer.show_markers.get()),
+            "show_lines": bool(viewer.show_lines.get()),
+            "show_triangulation": bool(viewer.show_triangulation.get()),
+        },
         "notes": [
             {
                 "title": note.title,
@@ -95,9 +123,10 @@ def validate_project_payload(payload: Any) -> dict[str, Any]:
         raise ProjectPayloadError("Invalid project file type.")
     if payload.get("type") != PROJECT_TYPE:
         raise ProjectPayloadError("Invalid project file type.")
-    if int(payload.get("version", 0)) != PROJECT_VERSION:
+    version = int(payload.get("version", 0))
+    if version not in SUPPORTED_PROJECT_VERSIONS:
         raise ProjectPayloadError(f"Unsupported project version: {payload.get('version')}")
-    return payload
+    return migrate_project_payload(payload)
 
 
 def apply_project_payload(
@@ -266,6 +295,31 @@ def apply_project_payload(
     scope = str(payload.get("mask_compute_scope", ""))
     if scope in allowed_mask_scopes:
         viewer.mask_compute_scope.set(scope)
+
+    history = payload.get("volume_history")
+    if isinstance(history, list):
+        if hasattr(viewer, "runtime_state"):
+            viewer.runtime_state.volume_history = [str(item) for item in history if isinstance(item, str)]
+
+    prefs = payload.get("saved_preferences")
+    if isinstance(prefs, dict):
+        theme = str(prefs.get("theme", "")).strip().lower()
+        if theme in {"dark", "light"}:
+            viewer.theme_mode.set(theme)
+        method = str(prefs.get("volume_method", "")).strip().lower()
+        if method in {"raster", "triangles"}:
+            viewer.volume_method.set(method)
+        fmt = str(prefs.get("station_label_format", "")).strip().lower()
+        if fmt in {"plain", "chainage"}:
+            viewer.station_label_format.set(fmt)
+        try:
+            viewer.station_interval_m.set(float(prefs.get("station_interval_m", viewer.station_interval_m.get())))
+        except (TypeError, ValueError):
+            pass
+        viewer.show_labels.set(bool(prefs.get("show_labels", viewer.show_labels.get())))
+        viewer.show_markers.set(bool(prefs.get("show_markers", viewer.show_markers.get())))
+        viewer.show_lines.set(bool(prefs.get("show_lines", viewer.show_lines.get())))
+        viewer.show_triangulation.set(bool(prefs.get("show_triangulation", viewer.show_triangulation.get())))
 
     viewer._refresh_file_selectors()
     viewer._refresh_intermediate_raster_selector()
