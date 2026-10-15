@@ -41,3 +41,15 @@ def test_validate_project_payload_rejects_wrong_version() -> None:
         assert "Unsupported project version" in str(exc)
     else:
         raise AssertionError("Expected ProjectPayloadError")
+
+
+def test_validate_project_payload_migrates_v1_payload() -> None:
+    payload = {
+        "type": PROJECT_TYPE,
+        "version": 1,
+        "source_files": [],
+    }
+    validated = validate_project_payload(payload)
+    assert validated["version"] == PROJECT_VERSION
+    assert "volume_history" in validated
+    assert "saved_preferences" in validated
