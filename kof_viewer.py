@@ -87,7 +87,7 @@ from kofvision.viewer_serialization import (
     validate_project_payload,
 )
 from kofvision.viewer_state import clear_cached_mask_volume_results, reset_for_clear
-from kofvision.viewer_ui import configure_viewer_styles
+from kofvision.viewer_ui import DARK_COLORS, configure_viewer_styles
 from kofvision.viewer_tools import (
     MaskEditTool,
     MaskTool,
@@ -188,7 +188,8 @@ class _HoverTooltip:
             tip,
             text=self.text,
             justify=tk.LEFT,
-            background="#ffffe0",
+            background=DARK_COLORS["bg_surface"],
+            foreground=DARK_COLORS["fg_primary"],
             relief=tk.SOLID,
             borderwidth=1,
             padx=6,
@@ -446,7 +447,7 @@ class KOFViewer(tk.Tk):
         ttk.Label(
             top,
             text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute, Ctrl+Shift+N note",
-            foreground="#4a5a70",
+            foreground=DARK_COLORS["fg_muted"],
         ).pack(side=tk.RIGHT, padx=(8, 0))
 
     def _add_collapsible_panel(
@@ -890,6 +891,7 @@ class KOFViewer(tk.Tk):
         ttk.Label(controls_header, text="Panels", style="PanelHeader.TLabel").pack(side=tk.LEFT)
 
         self.controls_canvas = tk.Canvas(self.controls_frame, highlightthickness=0, borderwidth=0)
+        self.controls_canvas.configure(background=DARK_COLORS["bg_surface"])
         self.controls_scrollbar = ttk.Scrollbar(
             self.controls_frame,
             orient=tk.VERTICAL,
