@@ -8,6 +8,7 @@ from typing import Any, Optional, Protocol
 
 import numpy as np
 from matplotlib.figure import Figure
+from kofvision.report_templates import render_report_html
 
 FILE_COLORS = [
     "#1f77b4", "#d62728", "#2ca02c", "#9467bd", "#ff7f0e",
@@ -430,6 +431,8 @@ def write_html_report(
     metadata: dict[str, Any],
     plan_image_rel: str,
     profile_rows: list[dict[str, Any]],
+    template_name: str = "standard",
+    theme_name: str = "light",
 ) -> None:
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -445,11 +448,6 @@ def write_html_report(
         if signed:
             return f"{number:+,.2f}"
         return f"{number:,.2f}"
-
-    meta_items = "\n".join(
-        f"<li><strong>{html.escape(str(k))}</strong>: {html.escape(str(v))}</li>"
-        for k, v in metadata.items()
-    )
 
     table_rows = []
     profile_sections = []
@@ -516,69 +514,16 @@ def write_html_report(
             "</section>"
         )
 
-    html_text = f"""<!doctype html>
-<html lang='en'>
-<head>
-  <meta charset='utf-8' />
-  <meta name='viewport' content='width=device-width, initial-scale=1' />
-  <title>{html.escape(title)}</title>
-  <style>
-    body {{ font-family: Segoe UI, Arial, sans-serif; margin: 18px; color: #1f2a30; }}
-    h1, h2 {{ margin-bottom: 0.4rem; }}
-    .meta li {{ margin: 0.2rem 0; }}
-    table {{ border-collapse: collapse; width: 100%; margin: 1rem 0 1.5rem; }}
-    th, td {{ border: 1px solid #d6dee3; padding: 0.4rem 0.5rem; text-align: right; }}
-    th:first-child, td:first-child {{ text-align: left; }}
-    th {{ background: #f3f7f9; }}
-    img {{ max-width: 100%; height: auto; border: 1px solid #d6dee3; }}
-    .profile {{ margin: 1.2rem 0 1.8rem; }}
-  </style>
-</head>
-<body>
-  <h1>{html.escape(title)}</h1>
-  <p>Generated: {html.escape(generated)}</p>
-  <h2>Metadata</h2>
-  <ul class='meta'>
-    {meta_items}
-  </ul>
-
-  <h2>Plan View</h2>
-  <img src='{html.escape(plan_image_rel)}' alt='Plan view with baseline and profiles' />
-
-  <h2>Profile Summary</h2>
-  <table>
-    <thead>
-      <tr>
-        <th>Profile</th>
-        <th>Station (m)</th>
-        <th>Length (m)</th>
-        <th>Valid</th>
-        <th>Area Net (m2)</th>
-        <th>Cut (m2)</th>
-        <th>Fill (m2)</th>
-        <th>Top-Intermediate (m2)</th>
-        <th>Intermediate-Bottom (m2)</th>
-        <th>Vol Net (m3)</th>
-        <th>Vol Cut (m3)</th>
-        <th>Vol Fill (m3)</th>
-        <th>Vol Top-Intermediate (m3)</th>
-                <th>Vol Top-Intermediate Cut (m3)</th>
-                <th>Vol Top-Intermediate Fill (m3)</th>
-        <th>Vol Intermediate-Bottom (m3)</th>
-                <th>Vol Intermediate-Bottom Cut (m3)</th>
-                <th>Vol Intermediate-Bottom Fill (m3)</th>
-      </tr>
-    </thead>
-    <tbody>
-      {''.join(table_rows)}
-    </tbody>
-  </table>
-
-  <h2>Profiles</h2>
-  {''.join(profile_sections)}
-</body>
-</html>
-"""
+        html_text = render_report_html(
+                title=title,
+                generated=generated,
+                metadata=metadata,
+                plan_image_rel=plan_image_rel,
+                table_rows_html="".join(table_rows),
+                profile_sections_html="".join(profile_sections),
+                template_name=template_name,
+                theme_name=theme_name,
+        )
 
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(html_text)
