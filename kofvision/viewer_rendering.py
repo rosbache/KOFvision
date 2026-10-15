@@ -21,91 +21,107 @@ def initialize_3d_axes(ax: Any) -> None:
     ax.set_zlabel("Elevation (H)")
 
 
-def render_2d(viewer: Any, file_colors: list[str]) -> None:
-    initialize_2d_axes(viewer.ax2d)
+def _draw_rasters(viewer: Any) -> None:
+    if not (viewer.show_raster.get() and viewer._raster_layers):
+        return
+    for layer in viewer._raster_layers:
+        if not layer.visible.get():
+            continue
+        viewer.ax2d.imshow(
+            layer.image,
+            extent=layer.extent,
+            origin=layer.origin,
+            alpha=float(layer.alpha.get()),
+            zorder=0,
+        )
 
-    if viewer.show_raster.get() and viewer._raster_layers:
-        for layer in viewer._raster_layers:
-            if not layer.visible.get():
-                continue
-            viewer.ax2d.imshow(
-                layer.image,
-                extent=layer.extent,
-                origin=layer.origin,
-                alpha=float(layer.alpha.get()),
-                zorder=0,
-            )
 
-    for idx, kof in enumerate(viewer.files):
+def _draw_surface_layers(viewer: Any, file_colors: list[str]) -> None:
+    for idx, surface in enumerate(viewer.files):
         if not viewer._is_layer_visible(idx):
             continue
         color = file_colors[idx % len(file_colors)]
-        if isinstance(kof, KOFFile):
-            labeled = False
-            for block in kof.blocks:
-                if not block.points:
-                    continue
-                xs = [p.y for p in block.points]
-                ys = [p.x for p in block.points]
-                label = kof.name if not labeled else None
-                labeled = True
-                if block.is_polyline and viewer.show_lines.get() and len(block.points) >= 2:
-                    viewer.ax2d.plot(xs, ys, "-", color=color, linewidth=1.2, label=label)
-                    if viewer.show_markers.get():
-                        viewer.ax2d.plot(xs, ys, "o", color=color, markersize=3)
-                else:
-                    marker = "o" if viewer.show_markers.get() else "."
-                    viewer.ax2d.plot(xs, ys, marker, color=color, markersize=4, linestyle="None", label=label)
-
-                if viewer.show_labels.get():
-                    for point in block.points:
-                        viewer.ax2d.annotate(
-                            point.pkt,
-                            (point.y, point.x),
-                            fontsize=7,
-                            xytext=(3, 3),
-                            textcoords="offset points",
-                            color=color,
-                        )
+        if isinstance(surface, KOFFile):
+            _draw_kof_surface(viewer, surface, color)
         else:
-            if viewer.show_markers.get() and kof.ensure_triangulation() and kof._xy is not None:
-                viewer.ax2d.plot(
-                    kof._xy[:, 0],
-                    kof._xy[:, 1],
-                    "o",
+            _draw_landxml_surface_points(viewer, surface, color)
+        _draw_surface_triangulation(viewer, surface, color)
+
+
+def _draw_kof_surface(viewer: Any, surface: KOFFile, color: str) -> None:
+    labeled = False
+    for block in surface.blocks:
+        if not block.points:
+            continue
+        xs = [p.y for p in block.points]
+        ys = [p.x for p in block.points]
+        label = surface.name if not labeled else None
+        labeled = True
+        if block.is_polyline and viewer.show_lines.get() and len(block.points) >= 2:
+            viewer.ax2d.plot(xs, ys, "-", color=color, linewidth=1.2, label=label)
+            if viewer.show_markers.get():
+                viewer.ax2d.plot(xs, ys, "o", color=color, markersize=3)
+        else:
+            marker = "o" if viewer.show_markers.get() else "."
+            viewer.ax2d.plot(xs, ys, marker, color=color, markersize=4, linestyle="None", label=label)
+
+        if viewer.show_labels.get():
+            for point in block.points:
+                viewer.ax2d.annotate(
+                    point.pkt,
+                    (point.y, point.x),
+                    fontsize=7,
+                    xytext=(3, 3),
+                    textcoords="offset points",
                     color=color,
-                    markersize=2,
-                    linestyle="None",
-                    label=kof.name,
                 )
 
-        draw_tin_faces = isinstance(kof, LandXMLSurface) and len(kof.faces) > 0 and viewer.show_lines.get()
-        if (viewer.show_triangulation.get() or draw_tin_faces) and kof.ensure_triangulation():
-            kept = kof.kept_simplices
-            if kept is not None and len(kept) > 0:
-                if draw_tin_faces and viewer.show_tin_fill.get() and kof._xy is not None:
-                    face_vals = np.zeros(len(kept), dtype=float)
-                    viewer.ax2d.tripcolor(
-                        kof._xy[:, 0],
-                        kof._xy[:, 1],
-                        face_vals,
-                        triangles=kept,
-                        shading="flat",
-                        vmin=0.0,
-                        vmax=1.0,
-                        color=color,
-                        alpha=float(viewer.tin_fill_alpha.get()),
-                        zorder=1,
-                    )
-                viewer.ax2d.triplot(
-                    kof._xy[:, 0],
-                    kof._xy[:, 1],
-                    kept,
-                    color=color,
-                    linewidth=0.45,
-                    alpha=0.75,
-                )
 
+def _draw_landxml_surface_points(viewer: Any, surface: Any, color: str) -> None:
+    if viewer.show_markers.get() and surface.ensure_triangulation() and surface._xy is not None:
+        viewer.ax2d.plot(
+            surface._xy[:, 0],
+            surface._xy[:, 1],
+            "o",
+            color=color,
+            markersize=2,
+            linestyle="None",
+            label=surface.name,
+        )
+
+
+def _draw_surface_triangulation(viewer: Any, surface: Any, color: str) -> None:
+    draw_tin_faces = isinstance(surface, LandXMLSurface) and len(surface.faces) > 0 and viewer.show_lines.get()
+    if not ((viewer.show_triangulation.get() or draw_tin_faces) and surface.ensure_triangulation()):
+        return
+    kept = surface.kept_simplices
+    if kept is None or len(kept) == 0:
+        return
+    if draw_tin_faces and viewer.show_tin_fill.get() and surface._xy is not None:
+        face_vals = np.zeros(len(kept), dtype=float)
+        viewer.ax2d.tripcolor(
+            surface._xy[:, 0],
+            surface._xy[:, 1],
+            face_vals,
+            triangles=kept,
+            shading="flat",
+            vmin=0.0,
+            vmax=1.0,
+            color=color,
+            alpha=float(viewer.tin_fill_alpha.get()),
+            zorder=1,
+        )
+    viewer.ax2d.triplot(
+        surface._xy[:, 0],
+        surface._xy[:, 1],
+        kept,
+        color=color,
+        linewidth=0.45,
+        alpha=0.75,
+    )
+
+
+def _draw_alignments_and_stations(viewer: Any, file_colors: list[str]) -> None:
     for lidx, landxml in enumerate(viewer.landxml_files):
         color = file_colors[(len(viewer.files) + lidx) % len(file_colors)]
         labeled = False
@@ -135,6 +151,8 @@ def render_2d(viewer: Any, file_colors: list[str]) -> None:
                         color=color,
                     )
 
+
+def _apply_2d_view(viewer: Any) -> None:
     if viewer.equal_aspect.get():
         viewer.ax2d.set_aspect("equal", adjustable="datalim")
     else:
@@ -145,6 +163,8 @@ def render_2d(viewer: Any, file_colors: list[str]) -> None:
         viewer.ax2d.set_xlim(xmin, xmax)
         viewer.ax2d.set_ylim(ymin, ymax)
 
+
+def _draw_sections(viewer: Any) -> None:
     for idx, ((y0, x0), (y1, x1)) in enumerate(viewer._sections):
         label = viewer._section_label(idx)
         viewer.ax2d.plot([y0, y1], [x0, x1], "-", color="black", linewidth=1.6, zorder=5)
@@ -170,44 +190,52 @@ def render_2d(viewer: Any, file_colors: list[str]) -> None:
             zorder=7,
         )
 
+
+def _draw_active_section_marker(viewer: Any) -> None:
     if (
-        viewer._active_section_marker_index is not None
-        and viewer._active_section_marker_chainage_m is not None
-        and 0 <= viewer._active_section_marker_index < len(viewer._sections)
+        viewer._active_section_marker_index is None
+        or viewer._active_section_marker_chainage_m is None
+        or not (0 <= viewer._active_section_marker_index < len(viewer._sections))
     ):
-        (y0, x0), (y1, x1) = viewer._sections[viewer._active_section_marker_index]
-        dy = y1 - y0
-        dx = x1 - x0
-        length = float(np.hypot(dy, dx))
-        if length > 0:
-            chainage = min(max(viewer._active_section_marker_chainage_m, 0.0), length)
-            t = chainage / length
-            py = y0 + (dy * t)
-            px = x0 + (dx * t)
+        return
 
-            xmin, xmax = viewer.ax2d.get_xlim()
-            ymin, ymax = viewer.ax2d.get_ylim()
-            span = max(abs(xmax - xmin), abs(ymax - ymin), 1e-9)
-            tick_half_len = max(0.5, span * 0.012)
-            perp_y = -dx / length
-            perp_x = dy / length
-            y_tick0 = py - (perp_y * tick_half_len)
-            x_tick0 = px - (perp_x * tick_half_len)
-            y_tick1 = py + (perp_y * tick_half_len)
-            x_tick1 = px + (perp_x * tick_half_len)
+    (y0, x0), (y1, x1) = viewer._sections[viewer._active_section_marker_index]
+    dy = y1 - y0
+    dx = x1 - x0
+    length = float(np.hypot(dy, dx))
+    if length <= 0:
+        return
 
-            viewer.ax2d.plot([y_tick0, y_tick1], [x_tick0, x_tick1], "-", color="#b00020", linewidth=2.0, zorder=16)
-            viewer.ax2d.plot([py], [px], "o", color="#b00020", markersize=6, zorder=17)
-            viewer.ax2d.annotate(
-                f"s={chainage:,.2f} m",
-                (py, px),
-                fontsize=8,
-                color="#b00020",
-                xytext=(8, -12),
-                textcoords="offset points",
-                zorder=18,
-            )
+    chainage = min(max(viewer._active_section_marker_chainage_m, 0.0), length)
+    t = chainage / length
+    py = y0 + (dy * t)
+    px = x0 + (dx * t)
 
+    xmin, xmax = viewer.ax2d.get_xlim()
+    ymin, ymax = viewer.ax2d.get_ylim()
+    span = max(abs(xmax - xmin), abs(ymax - ymin), 1e-9)
+    tick_half_len = max(0.5, span * 0.012)
+    perp_y = -dx / length
+    perp_x = dy / length
+    y_tick0 = py - (perp_y * tick_half_len)
+    x_tick0 = px - (perp_x * tick_half_len)
+    y_tick1 = py + (perp_y * tick_half_len)
+    x_tick1 = px + (perp_x * tick_half_len)
+
+    viewer.ax2d.plot([y_tick0, y_tick1], [x_tick0, x_tick1], "-", color="#b00020", linewidth=2.0, zorder=16)
+    viewer.ax2d.plot([py], [px], "o", color="#b00020", markersize=6, zorder=17)
+    viewer.ax2d.annotate(
+        f"s={chainage:,.2f} m",
+        (py, px),
+        fontsize=8,
+        color="#b00020",
+        xytext=(8, -12),
+        textcoords="offset points",
+        zorder=18,
+    )
+
+
+def _draw_masks(viewer: Any, file_colors: list[str]) -> None:
     for idx, mask in enumerate(viewer._masks):
         if not viewer._mask_is_visible(idx):
             continue
@@ -233,13 +261,18 @@ def render_2d(viewer: Any, file_colors: list[str]) -> None:
             zorder=11,
         )
 
-    if viewer._mask_mode and viewer._mask_click_points:
-        arr = np.asarray(viewer._mask_click_points, dtype=float)
-        viewer.ax2d.plot(arr[:, 0], arr[:, 1], "--", color="#cc8a00", linewidth=1.3, zorder=11)
-        viewer.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#cc8a00", markersize=4, zorder=12)
-        if len(arr) >= 2:
-            viewer.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]], ":", color="#cc8a00", linewidth=1.0, zorder=11)
 
+def _draw_active_mask_preview(viewer: Any) -> None:
+    if not (viewer._mask_mode and viewer._mask_click_points):
+        return
+    arr = np.asarray(viewer._mask_click_points, dtype=float)
+    viewer.ax2d.plot(arr[:, 0], arr[:, 1], "--", color="#cc8a00", linewidth=1.3, zorder=11)
+    viewer.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#cc8a00", markersize=4, zorder=12)
+    if len(arr) >= 2:
+        viewer.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]], ":", color="#cc8a00", linewidth=1.0, zorder=11)
+
+
+def _draw_measurements(viewer: Any) -> None:
     for idx, item in enumerate(viewer._measure_results):
         kind = item.get("kind", "")
         points = item.get("points", [])
@@ -271,10 +304,10 @@ def render_2d(viewer: Any, file_colors: list[str]) -> None:
             viewer.ax2d.plot(closed[:, 0], closed[:, 1], "-", color=color, linewidth=1.6, zorder=12)
             viewer.ax2d.plot(arr[:, 0], arr[:, 1], "o", color=color, markersize=3.5, zorder=13)
             area = float(item.get("area_m2", viewer._measure_polygon_area([(float(p[0]), float(p[1])) for p in arr])))
-            peri = float(item.get("perimeter_m", viewer._measure_polygon_perimeter([(float(p[0]), float(p[1])) for p in arr])))
+            perimeter = float(item.get("perimeter_m", viewer._measure_polygon_perimeter([(float(p[0]), float(p[1])) for p in arr])))
             center = (float(np.mean(arr[:, 0])), float(np.mean(arr[:, 1])))
             viewer.ax2d.annotate(
-                f"{label}: {area:,.2f} m2 | {peri:,.2f} m",
+                f"{label}: {area:,.2f} m2 | {perimeter:,.2f} m",
                 center,
                 fontsize=8,
                 color=color,
@@ -283,14 +316,19 @@ def render_2d(viewer: Any, file_colors: list[str]) -> None:
                 zorder=14,
             )
 
-    if viewer._measure_mode and viewer._measure_click_points:
-        arr = np.asarray(viewer._measure_click_points, dtype=float)
-        kind = viewer._current_measure_mode_key()
-        viewer.ax2d.plot(arr[:, 0], arr[:, 1], "--", color="#0b7285", linewidth=1.4, zorder=14)
-        viewer.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#0b7285", markersize=4, zorder=15)
-        if kind == "polygon" and len(arr) >= 2:
-            viewer.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]], ":", color="#0b7285", linewidth=1.0, zorder=14)
 
+def _draw_active_measurement_preview(viewer: Any) -> None:
+    if not (viewer._measure_mode and viewer._measure_click_points):
+        return
+    arr = np.asarray(viewer._measure_click_points, dtype=float)
+    kind = viewer._current_measure_mode_key()
+    viewer.ax2d.plot(arr[:, 0], arr[:, 1], "--", color="#0b7285", linewidth=1.4, zorder=14)
+    viewer.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#0b7285", markersize=4, zorder=15)
+    if kind == "polygon" and len(arr) >= 2:
+        viewer.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]], ":", color="#0b7285", linewidth=1.0, zorder=14)
+
+
+def _draw_notes(viewer: Any) -> None:
     for idx, note in enumerate(viewer._notes):
         if not note.visible:
             continue
@@ -329,52 +367,67 @@ def render_2d(viewer: Any, file_colors: list[str]) -> None:
             zorder=21,
         )
 
+
+def _draw_2d_legend_or_empty_state(viewer: Any) -> None:
     if viewer.files or viewer.landxml_files:
         viewer.ax2d.legend(loc="best", fontsize=8)
-    else:
-        viewer.ax2d.text(
-            0.5,
-            0.5,
-            "Open a .kof or .xml file to begin",
-            transform=viewer.ax2d.transAxes,
-            ha="center",
-            va="center",
-            color="gray",
-        )
+        return
+    viewer.ax2d.text(
+        0.5,
+        0.5,
+        "Open a .kof or .xml file to begin",
+        transform=viewer.ax2d.transAxes,
+        ha="center",
+        va="center",
+        color="gray",
+    )
 
+
+def render_2d(viewer: Any, file_colors: list[str]) -> None:
+    initialize_2d_axes(viewer.ax2d)
+    _draw_rasters(viewer)
+    _draw_surface_layers(viewer, file_colors)
+    _draw_alignments_and_stations(viewer, file_colors)
+    _apply_2d_view(viewer)
+    _draw_sections(viewer)
+    _draw_active_section_marker(viewer)
+    _draw_masks(viewer, file_colors)
+    _draw_active_mask_preview(viewer)
+    _draw_measurements(viewer)
+    _draw_active_measurement_preview(viewer)
+    _draw_notes(viewer)
+    _draw_2d_legend_or_empty_state(viewer)
     viewer.fig2d.tight_layout()
     viewer.canvas2d.draw_idle()
 
 
-def render_3d(viewer: Any, file_colors: list[str]) -> None:
-    initialize_3d_axes(viewer.ax3d)
-
-    for idx, kof in enumerate(viewer.files):
+def _draw_3d_surface_layers(viewer: Any, file_colors: list[str]) -> None:
+    for idx, surface in enumerate(viewer.files):
         if not viewer._is_layer_visible(idx):
             continue
         color = file_colors[idx % len(file_colors)]
         labeled = False
-        if viewer.show_triangulation.get() and hasattr(kof, "ensure_triangulation") and kof.ensure_triangulation():
-            kept = kof.kept_simplices
+        if viewer.show_triangulation.get() and hasattr(surface, "ensure_triangulation") and surface.ensure_triangulation():
+            kept = surface.kept_simplices
             if kept is not None and len(kept) > 0:
                 viewer.ax3d.plot_trisurf(
-                    kof._xy[:, 0],
-                    kof._xy[:, 1],
-                    kof._z,
+                    surface._xy[:, 0],
+                    surface._xy[:, 1],
+                    surface._z,
                     triangles=kept,
                     color=color,
                     alpha=0.35,
                     linewidth=0.2,
                     edgecolor=color,
                 )
-        if isinstance(kof, KOFFile):
-            for block in kof.blocks:
+        if isinstance(surface, KOFFile):
+            for block in surface.blocks:
                 if not block.points:
                     continue
                 xs = [p.y for p in block.points]
                 ys = [p.x for p in block.points]
                 zs = [p.h for p in block.points]
-                label = kof.name if not labeled else None
+                label = surface.name if not labeled else None
                 labeled = True
                 if block.is_polyline and viewer.show_lines.get() and len(block.points) >= 2:
                     viewer.ax3d.plot(xs, ys, zs, "-", color=color, linewidth=1.2, label=label)
@@ -388,22 +441,29 @@ def render_3d(viewer: Any, file_colors: list[str]) -> None:
                     for point in block.points:
                         viewer.ax3d.text(point.y, point.x, point.h, point.pkt, fontsize=7, color=color)
         else:
-            if kof.ensure_triangulation() and kof._xy is not None and kof._z is not None and viewer.show_markers.get():
-                viewer.ax3d.scatter(kof._xy[:, 0], kof._xy[:, 1], kof._z, color=color, s=10, label=kof.name)
+            if surface.ensure_triangulation() and surface._xy is not None and surface._z is not None and viewer.show_markers.get():
+                viewer.ax3d.scatter(surface._xy[:, 0], surface._xy[:, 1], surface._z, color=color, s=10, label=surface.name)
 
+
+def _draw_3d_legend_or_empty_state(viewer: Any) -> None:
     if viewer.files:
         viewer.ax3d.legend(loc="best", fontsize=8)
         viewer._equalize_3d_aspect()
-    else:
-        viewer.ax3d.text2D(
-            0.5,
-            0.5,
-            "Open a surface-enabled file to begin",
-            transform=viewer.ax3d.transAxes,
-            ha="center",
-            va="center",
-            color="gray",
-        )
+        return
+    viewer.ax3d.text2D(
+        0.5,
+        0.5,
+        "Open a surface-enabled file to begin",
+        transform=viewer.ax3d.transAxes,
+        ha="center",
+        va="center",
+        color="gray",
+    )
 
+
+def render_3d(viewer: Any, file_colors: list[str]) -> None:
+    initialize_3d_axes(viewer.ax3d)
+    _draw_3d_surface_layers(viewer, file_colors)
+    _draw_3d_legend_or_empty_state(viewer)
     viewer.fig3d.tight_layout()
     viewer.canvas3d.draw_idle()
