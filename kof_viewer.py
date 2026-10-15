@@ -1234,7 +1234,8 @@ class KOFViewer(tk.Tk):
         self.status = tk.StringVar(value="No file loaded.")
         bar = ttk.Frame(self, padding=(6, 2))
         bar.pack(side=tk.BOTTOM, fill=tk.X)
-        ttk.Label(bar, textvariable=self.status, anchor=tk.W).pack(fill=tk.X)
+        ttk.Label(bar, textvariable=self.status, anchor=tk.W).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(bar, text=f"KOFvision v{__version__}", style="Muted.TLabel", anchor=tk.E).pack(side=tk.RIGHT)
 
     # -------------------------------------------------------------- Actions
     def _on_pick_local_xsd(self) -> None:
