@@ -21,6 +21,10 @@ def reset_for_clear(viewer: Any) -> None:
     viewer._landxml_group_vars.clear()
     viewer._view_extent_2d = None
     viewer._latest_section_report_path = None
+    if hasattr(viewer, "runtime_state"):
+        viewer.runtime_state.volume_history.clear()
+        viewer.runtime_state.last_render_2d_signature = None
+        viewer.runtime_state.last_render_3d_signature = None
     viewer.last_volume = None
     viewer.volume_text.set("Volume: (not computed)")
     viewer._measure_results.clear()
@@ -75,6 +79,10 @@ def reset_for_project_load(viewer: Any) -> None:
     viewer._active_raster_index = None
     viewer._elevation_raster_index = None
     viewer._latest_section_report_path = None
+    if hasattr(viewer, "runtime_state"):
+        viewer.runtime_state.volume_history.clear()
+        viewer.runtime_state.last_render_2d_signature = None
+        viewer.runtime_state.last_render_3d_signature = None
     if viewer._measure_mode:
         viewer._end_measure_mode()
     if viewer._note_mode:
