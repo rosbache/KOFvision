@@ -99,6 +99,7 @@ from kofvision.viewer_ui import (
     normalize_theme_name,
 )
 from kofvision.viewer_tools import (
+    DitchTool,
     MaskEditTool,
     MaskTool,
     MeasureTool,
@@ -119,6 +120,13 @@ from kofvision.validation import safe_float
 from kofvision.volume_controller import combine_volume_results, compute_volume_for_mask
 from kofvision.viewer_runtime_state import ViewerRuntimeState
 from kofvision.viewer_undo import EditSnapshot, UndoRedoManager
+from kofvision.ditch import (
+    DitchLayerCatalog,
+    DitchRule,
+    apply_ditch_rules_to_profile,
+    ditch_rules_to_payload,
+    parse_ditch_rules,
+)
 
 try:
     import customtkinter as ctk
@@ -304,6 +312,12 @@ class KOFViewer(tk.Tk):
         self._active_section_marker_chainage_m: Optional[float] = None
         self._active_section_index: Optional[int] = None
         self.active_section_var = tk.StringVar(value="")
+        self._ditch_mode = False
+        self._ditch_click_points: list[tuple[float, float]] = []
+        self._ditch_cid: Optional[int] = None
+        self._ditch_centerlines: list[tuple[tuple[float, float], tuple[float, float]]] = []
+        self._active_ditch_centerline_index: Optional[int] = None
+        self.active_ditch_centerline_var = tk.StringVar(value="")
 
         # Polygon mask state for volume limitation in 2D.
         self._mask_mode = False
@@ -316,6 +330,8 @@ class KOFViewer(tk.Tk):
         self._mask_visibility_checks: list[tk.Widget] = []
         self._last_volume_per_mask_rows: list[str] = []
         self._last_mask_volume_results: list[dict[str, Any]] = []
+        self._ditch_rules: list[DitchRule] = []
+        self._ditch_layer_catalog = DitchLayerCatalog()
 
         # Mask edit state (drag vertices for selected mask).
         self._mask_edit_mode = False
@@ -402,10 +418,12 @@ class KOFViewer(tk.Tk):
     def _capture_edit_snapshot(self) -> EditSnapshot:
         return EditSnapshot(
             sections=copy.deepcopy(self._sections),
+            ditch_centerlines=copy.deepcopy(self._ditch_centerlines),
             masks=copy.deepcopy(self._masks),
             notes=copy.deepcopy(self._notes),
             measurements=copy.deepcopy(self._measure_results),
             active_section_index=self._active_section_index,
+            active_ditch_centerline_index=self._active_ditch_centerline_index,
             active_mask_index=self._active_mask_index,
             active_note_index=self._active_note_index,
         )
@@ -413,10 +431,12 @@ class KOFViewer(tk.Tk):
     def _apply_edit_snapshot(self, snapshot: EditSnapshot) -> None:
         self._close_section_windows()
         self._sections = copy.deepcopy(snapshot.sections)
+        self._ditch_centerlines = copy.deepcopy(snapshot.ditch_centerlines)
         self._masks = copy.deepcopy(snapshot.masks)
         self._notes = copy.deepcopy(snapshot.notes)
         self._measure_results = copy.deepcopy(snapshot.measurements)
         self._active_section_index = snapshot.active_section_index
+        self._active_ditch_centerline_index = snapshot.active_ditch_centerline_index
         self._active_mask_index = snapshot.active_mask_index
         self._active_note_index = snapshot.active_note_index
 
@@ -431,6 +451,7 @@ class KOFViewer(tk.Tk):
             self.volume_text.set("Volume: (stale – recompute)")
         self._refresh_mask_controls()
         self._refresh_section_controls()
+        self._refresh_ditch_controls()
         self._refresh_layer_controls()
         self._redraw()
 
@@ -532,6 +553,7 @@ class KOFViewer(tk.Tk):
         self.bind_all("<Control-Shift-R>", lambda _e: self._invoke_shortcut(self._on_reset_view))
         self.bind_all("<Control-Shift-V>", lambda _e: self._invoke_shortcut(self._on_compute_volume))
         self.bind_all("<Control-Shift-S>", lambda _e: self._invoke_shortcut(self._on_toggle_section))
+        self.bind_all("<Control-Shift-L>", lambda _e: self._invoke_shortcut(self._on_toggle_ditch_centerline))
         self.bind_all("<Control-Shift-M>", lambda _e: self._invoke_shortcut(self._on_toggle_mask))
         self.bind_all("<Control-Shift-D>", lambda _e: self._invoke_shortcut(self._on_toggle_measure))
         self.bind_all("<Control-Shift-N>", lambda _e: self._invoke_shortcut(self._on_toggle_note_mode))
@@ -633,6 +655,10 @@ class KOFViewer(tk.Tk):
         self.section_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.section_btn, "Shortcut: Ctrl+Shift+S")
 
+        self.ditch_btn = self._make_toolbar_button(top, text="Draw ditch", command=self._on_toggle_ditch_centerline)
+        self.ditch_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.ditch_btn, "Shortcut: Ctrl+Shift+L")
+
         self.mask_btn = self._make_toolbar_button(top, text="Draw mask", command=self._on_toggle_mask)
         self.mask_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.mask_btn, "Shortcut: Ctrl+Shift+M")
@@ -681,7 +707,7 @@ class KOFViewer(tk.Tk):
 
         ttk.Label(
             top,
-            text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute, Ctrl+Shift+N note",
+            text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute, Ctrl+Shift+L ditch, Ctrl+Shift+N note",
             style="Muted.TLabel",
         ).pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -1043,6 +1069,28 @@ class KOFViewer(tk.Tk):
         ttk.Button(sections_panel, text="Save sections...", command=self._on_save_sections_json).pack(fill=tk.X, pady=2)
         ttk.Button(sections_panel, text="Load sections...", command=self._on_load_sections_json).pack(fill=tk.X, pady=2)
 
+        ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
+        ttk.Label(sections_panel, text="Selected ditch centerline:").pack(anchor="w", pady=(2, 0))
+        self.ditch_centerline_combo = ttk.Combobox(
+            sections_panel,
+            textvariable=self.active_ditch_centerline_var,
+            values=[],
+            state="readonly",
+            width=26,
+        )
+        self.ditch_centerline_combo.pack(fill=tk.X, pady=(2, 2))
+        self.ditch_centerline_combo.bind("<<ComboboxSelected>>", self._on_ditch_centerline_select)
+        ditch_btn_row = ttk.Frame(sections_panel)
+        ditch_btn_row.pack(fill=tk.X, pady=(0, 2))
+        self.ditch_zoom_btn = ttk.Button(ditch_btn_row, text="Zoom selected ditch", command=self._on_zoom_selected_ditch)
+        self.ditch_zoom_btn.pack(side=tk.LEFT)
+        self.ditch_delete_btn = ttk.Button(ditch_btn_row, text="Delete selected ditch", command=self._on_delete_selected_ditch)
+        self.ditch_delete_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.ditch_clear_btn = ttk.Button(sections_panel, text="Clear ditch centerlines", command=self._on_clear_ditch_centerlines)
+        self.ditch_clear_btn.pack(fill=tk.X, pady=(0, 2))
+        self.ditch_config_btn = ttk.Button(sections_panel, text="Ditch setup...", command=self._on_open_ditch_setup)
+        self.ditch_config_btn.pack(fill=tk.X, pady=2)
+
         ttk.Label(sections_panel, text="Report template:").pack(anchor="w", pady=(2, 0))
         self.report_template_combo = ttk.Combobox(
             sections_panel,
@@ -1116,6 +1164,7 @@ class KOFViewer(tk.Tk):
         self._on_intermediate_type_change()
         self._refresh_mask_controls()
         self._refresh_section_controls()
+        self._refresh_ditch_controls()
 
     def _build_body(self) -> None:
         body = ttk.Frame(self)
@@ -1391,6 +1440,7 @@ class KOFViewer(tk.Tk):
         self._undo.clear()
         self._refresh_mask_controls()
         self._refresh_section_controls()
+        self._refresh_ditch_controls()
         self._refresh_mask_result_actions()
         self._refresh_file_selectors()
         self._refresh_layer_controls()
@@ -1875,10 +1925,10 @@ class KOFViewer(tk.Tk):
         if top is bot:
             messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
             return None
-        if not self._sections:
+        if not self._sections and not self._ditch_centerlines:
             messagebox.showinfo(
                 "KOF Viewer",
-                "Draw at least one section line first. The latest line is used as baseline.",
+                "Draw at least one ditch centerline or section line first.",
             )
             return None
 
@@ -1887,7 +1937,10 @@ class KOFViewer(tk.Tk):
             return None
         spacing_m, section_length_m, n_samples = params
 
-        baseline = self._sections[-1]
+        baseline = self._selected_baseline()
+        if baseline is None:
+            messagebox.showerror("KOF Viewer", "No baseline available.")
+            return None
         (b0, b1) = baseline
         baseline_len = float(np.hypot(b1[0] - b0[0], b1[1] - b0[1]))
         if baseline_len <= 0:
@@ -3625,6 +3678,310 @@ class KOFViewer(tk.Tk):
         self._redraw_2d()
         self._record_undoable_edit("Delete section", before)
 
+    @staticmethod
+    def _ditch_label(index: int) -> str:
+        return f"D{index + 1:02d}"
+
+    def _refresh_ditch_controls(self) -> None:
+        if hasattr(self, "ditch_centerline_combo"):
+            names = [self._ditch_label(i) for i in range(len(self._ditch_centerlines))]
+            self.ditch_centerline_combo.configure(values=names)
+            if (
+                self._active_ditch_centerline_index is not None
+                and 0 <= self._active_ditch_centerline_index < len(names)
+            ):
+                self.active_ditch_centerline_var.set(names[self._active_ditch_centerline_index])
+            else:
+                self.active_ditch_centerline_var.set("")
+        has_active = (
+            self._active_ditch_centerline_index is not None
+            and 0 <= self._active_ditch_centerline_index < len(self._ditch_centerlines)
+        )
+        has_any = bool(self._ditch_centerlines)
+        if hasattr(self, "ditch_zoom_btn"):
+            self.ditch_zoom_btn.configure(state="normal" if has_active else "disabled")
+        if hasattr(self, "ditch_delete_btn"):
+            self.ditch_delete_btn.configure(state="normal" if has_active else "disabled")
+        if hasattr(self, "ditch_clear_btn"):
+            self.ditch_clear_btn.configure(state="normal" if has_any else "disabled")
+
+    def _on_ditch_centerline_select(self, _event=None) -> None:  # noqa: ANN001
+        selected = self.active_ditch_centerline_var.get().strip()
+        for idx in range(len(self._ditch_centerlines)):
+            if self._ditch_label(idx) == selected:
+                self._active_ditch_centerline_index = idx
+                self._refresh_ditch_controls()
+                self._redraw_2d()
+                return
+
+    def _append_ditch_centerline(
+        self,
+        centerline: tuple[tuple[float, float], tuple[float, float]],
+        *,
+        track_undo: bool = True,
+        undo_label: str = "Draw ditch centerline",
+    ) -> None:
+        before = self._capture_edit_snapshot() if track_undo else None
+        self._ditch_centerlines.append(centerline)
+        self._active_ditch_centerline_index = len(self._ditch_centerlines) - 1
+        self._refresh_ditch_controls()
+        self._redraw_2d()
+        if before is not None:
+            self._record_undoable_edit(undo_label, before)
+
+    def _on_zoom_selected_ditch(self) -> None:
+        idx = self._active_ditch_centerline_index
+        if idx is None or idx < 0 or idx >= len(self._ditch_centerlines):
+            return
+        (y0, x0), (y1, x1) = self._ditch_centerlines[idx]
+        self._zoom_to_bounds((min(y0, y1), max(y0, y1), min(x0, x1), max(x0, x1)))
+        self.notebook.select(0)
+        self._redraw_2d()
+
+    def _on_delete_selected_ditch(self) -> None:
+        idx = self._active_ditch_centerline_index
+        if idx is None or idx < 0 or idx >= len(self._ditch_centerlines):
+            return
+        before = self._capture_edit_snapshot()
+        label = self._ditch_label(idx)
+        if not messagebox.askyesno("Delete ditch centerline", f"Delete ditch centerline {label}?"):
+            return
+        del self._ditch_centerlines[idx]
+        if not self._ditch_centerlines:
+            self._active_ditch_centerline_index = None
+        else:
+            self._active_ditch_centerline_index = min(idx, len(self._ditch_centerlines) - 1)
+        self._refresh_ditch_controls()
+        self._redraw_2d()
+        self._record_undoable_edit("Delete ditch centerline", before)
+
+    def _on_clear_ditch_centerlines(self) -> None:
+        if not self._ditch_centerlines:
+            return
+        before = self._capture_edit_snapshot()
+        if not messagebox.askyesno("Clear ditch centerlines", "Delete all ditch centerlines?"):
+            return
+        self._ditch_centerlines.clear()
+        self._active_ditch_centerline_index = None
+        self._refresh_ditch_controls()
+        self._redraw_2d()
+        self._record_undoable_edit("Clear ditch centerlines", before)
+
+    def _on_toggle_ditch_centerline(self) -> None:
+        DitchTool.toggle(self)
+
+    def _end_ditch_mode(self) -> None:
+        DitchTool.end(self)
+
+    def _on_ditch_click(self, event) -> None:  # noqa: ANN001
+        DitchTool.on_click(self, event)
+
+    def _selected_baseline(self) -> Optional[tuple[tuple[float, float], tuple[float, float]]]:
+        idx = self._active_ditch_centerline_index
+        if idx is not None and 0 <= idx < len(self._ditch_centerlines):
+            return self._ditch_centerlines[idx]
+        if self._ditch_centerlines:
+            idx = len(self._ditch_centerlines) - 1
+            self._active_ditch_centerline_index = idx
+            self._refresh_ditch_controls()
+            return self._ditch_centerlines[idx]
+        if self._sections:
+            return self._sections[-1]
+        return None
+
+    def _on_open_ditch_setup(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("Ditch setup")
+        dialog.transient(self)
+        dialog.grab_set()
+        dialog.resizable(True, True)
+
+        local_rules = parse_ditch_rules(ditch_rules_to_payload(self._ditch_rules))
+        local_catalog = DitchLayerCatalog.from_payload(self._ditch_layer_catalog.to_payload())
+        surface_names = [surface.name for surface in self.files]
+        surface_choices = [""] + surface_names
+
+        root = ttk.Frame(dialog, padding=10)
+        root.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(root, text="Rules (code label can be 1.1, -2.1, etc.):").pack(anchor="w")
+        rules_list = tk.Listbox(root, height=7)
+        rules_list.pack(fill=tk.X, pady=(2, 8))
+
+        form = ttk.Frame(root)
+        form.pack(fill=tk.X)
+
+        ttk.Label(form, text="Code").grid(row=0, column=0, sticky="w")
+        ttk.Label(form, text="Side").grid(row=0, column=1, sticky="w")
+        ttk.Label(form, text="Dist (m)").grid(row=0, column=2, sticky="w")
+        ttk.Label(form, text="Slope").grid(row=0, column=3, sticky="w")
+        ttk.Label(form, text="Profile start").grid(row=0, column=4, sticky="w")
+        ttk.Label(form, text="Profile end").grid(row=0, column=5, sticky="w")
+
+        code_var = tk.StringVar(value="1.1")
+        side_var = tk.StringVar(value="+1")
+        dist_var = tk.StringVar(value="2.0")
+        slope_var = tk.StringVar(value="-1.0")
+        start_var = tk.StringVar(value="1")
+        end_var = tk.StringVar(value="10")
+        stop_mat_var = tk.StringVar(value="")
+        stop_slot_var = tk.StringVar(value="0")
+
+        ttk.Entry(form, textvariable=code_var, width=8).grid(row=1, column=0, padx=(0, 4), sticky="we")
+        ttk.Combobox(form, textvariable=side_var, values=["+1", "-1"], state="readonly", width=5).grid(row=1, column=1, padx=(0, 4), sticky="we")
+        ttk.Entry(form, textvariable=dist_var, width=8).grid(row=1, column=2, padx=(0, 4), sticky="we")
+        ttk.Entry(form, textvariable=slope_var, width=8).grid(row=1, column=3, padx=(0, 4), sticky="we")
+        ttk.Entry(form, textvariable=start_var, width=8).grid(row=1, column=4, padx=(0, 4), sticky="we")
+        ttk.Entry(form, textvariable=end_var, width=8).grid(row=1, column=5, sticky="we")
+
+        stop_row = ttk.Frame(root)
+        stop_row.pack(fill=tk.X, pady=(6, 2))
+        ttk.Label(stop_row, text="Stop material").pack(side=tk.LEFT)
+        ttk.Combobox(
+            stop_row,
+            textvariable=stop_mat_var,
+            values=["", "rock", "moist", "constructiontc"],
+            state="readonly",
+            width=16,
+        ).pack(side=tk.LEFT, padx=(6, 6))
+        ttk.Label(stop_row, text="Stop slot (0-9)").pack(side=tk.LEFT)
+        ttk.Spinbox(stop_row, from_=0, to=9, textvariable=stop_slot_var, width=4).pack(side=tk.LEFT, padx=(6, 0))
+
+        assignment_row = ttk.Frame(root)
+        assignment_row.pack(fill=tk.X, pady=(8, 2))
+        assign_material_var = tk.StringVar(value="rock")
+        assign_slot_var = tk.StringVar(value="0")
+        assign_surface_var = tk.StringVar(value="")
+        ttk.Label(assignment_row, text="Layer mapping:").pack(side=tk.LEFT)
+        ttk.Combobox(assignment_row, textvariable=assign_material_var, values=["rock", "moist", "constructiontc"], state="readonly", width=14).pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Spinbox(assignment_row, from_=0, to=9, textvariable=assign_slot_var, width=4).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Combobox(assignment_row, textvariable=assign_surface_var, values=surface_choices, width=44).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        mapping_list = tk.Listbox(root, height=7)
+        mapping_list.pack(fill=tk.BOTH, expand=True, pady=(2, 6))
+
+        def _refresh_rules_list() -> None:
+            rules_list.delete(0, tk.END)
+            for rule in local_rules:
+                stop_label = f", stop={rule.stop_material}:{rule.stop_slot}" if rule.stop_material is not None else ""
+                rules_list.insert(
+                    tk.END,
+                    f"{rule.code_label} side={rule.side:+d} dist={rule.distance_m:.2f} slope={rule.slope:.3f} p={rule.profile_start}-{rule.profile_end}{stop_label}",
+                )
+
+        def _refresh_mapping_list() -> None:
+            mapping_list.delete(0, tk.END)
+            for material in ("rock", "moist", "constructiontc"):
+                slots = local_catalog.slots.get(material, [None] * 10)
+                for slot, name in enumerate(slots[:10]):
+                    if name:
+                        mapping_list.insert(tk.END, f"{material}[{slot}] -> {name}")
+            if mapping_list.size() == 0:
+                mapping_list.insert(tk.END, "(no mappings)")
+
+        def _selected_rule_index() -> Optional[int]:
+            sel = rules_list.curselection()
+            if not sel:
+                return None
+            idx = int(sel[0])
+            if idx < 0 or idx >= len(local_rules):
+                return None
+            return idx
+
+        def _build_rule_from_form() -> Optional[DitchRule]:
+            code_label = code_var.get().strip()
+            if not code_label:
+                messagebox.showwarning("Ditch setup", "Code label is required.")
+                return None
+            try:
+                side = -1 if side_var.get().strip().startswith("-") else 1
+                distance_m = float(dist_var.get())
+                slope = float(slope_var.get())
+                profile_start = max(1, int(start_var.get()))
+                profile_end = max(profile_start, int(end_var.get()))
+            except (TypeError, ValueError):
+                messagebox.showwarning("Ditch setup", "Distance, slope and profile range must be numeric.")
+                return None
+            if not np.isfinite(distance_m) or distance_m <= 0:
+                messagebox.showwarning("Ditch setup", "Distance must be > 0.")
+                return None
+            stop_material = stop_mat_var.get().strip() or None
+            stop_slot = None
+            if stop_material is not None:
+                try:
+                    stop_slot = int(stop_slot_var.get())
+                except (TypeError, ValueError):
+                    messagebox.showwarning("Ditch setup", "Stop slot must be an integer in 0-9.")
+                    return None
+                if stop_slot < 0 or stop_slot > 9:
+                    messagebox.showwarning("Ditch setup", "Stop slot must be in 0-9.")
+                    return None
+            return DitchRule(
+                code_label=code_label,
+                side=side,
+                distance_m=float(distance_m),
+                slope=float(slope),
+                profile_start=int(profile_start),
+                profile_end=int(profile_end),
+                stop_material=stop_material,
+                stop_slot=stop_slot,
+            )
+
+        def _on_add_or_update_rule() -> None:
+            rule = _build_rule_from_form()
+            if rule is None:
+                return
+            idx = _selected_rule_index()
+            if idx is None:
+                local_rules.append(rule)
+            else:
+                local_rules[idx] = rule
+            _refresh_rules_list()
+
+        def _on_remove_rule() -> None:
+            idx = _selected_rule_index()
+            if idx is None:
+                return
+            del local_rules[idx]
+            _refresh_rules_list()
+
+        def _on_assign_mapping() -> None:
+            material = assign_material_var.get().strip()
+            if material not in {"rock", "moist", "constructiontc"}:
+                return
+            try:
+                slot = int(assign_slot_var.get())
+            except (TypeError, ValueError):
+                messagebox.showwarning("Ditch setup", "Slot must be in 0-9.")
+                return
+            if slot < 0 or slot > 9:
+                messagebox.showwarning("Ditch setup", "Slot must be in 0-9.")
+                return
+            surface_name = assign_surface_var.get().strip() or None
+            local_catalog.slots[material][slot] = surface_name
+            _refresh_mapping_list()
+
+        rule_btn_row = ttk.Frame(root)
+        rule_btn_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Button(rule_btn_row, text="Add/Update rule", command=_on_add_or_update_rule).pack(side=tk.LEFT)
+        ttk.Button(rule_btn_row, text="Remove selected rule", command=_on_remove_rule).pack(side=tk.LEFT, padx=(4, 0))
+        ttk.Button(rule_btn_row, text="Assign layer mapping", command=_on_assign_mapping).pack(side=tk.RIGHT)
+
+        def _on_save() -> None:
+            self._ditch_rules = parse_ditch_rules(ditch_rules_to_payload(local_rules))
+            self._ditch_layer_catalog = DitchLayerCatalog.from_payload(local_catalog.to_payload())
+            self._refresh_ditch_controls()
+            dialog.destroy()
+
+        footer = ttk.Frame(root)
+        footer.pack(fill=tk.X)
+        ttk.Button(footer, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
+        ttk.Button(footer, text="Save", command=_on_save).pack(side=tk.RIGHT, padx=(0, 6))
+
+        _refresh_rules_list()
+        _refresh_mapping_list()
+        self.wait_window(dialog)
+
     def _run_section_report(self, out_root: str, request: dict[str, Any]) -> dict[str, Any]:
         top = request["top"]
         bot = request["bottom"]
@@ -3645,6 +4002,9 @@ class KOFViewer(tk.Tk):
 
         profile_rows: list[dict[str, object]] = []
         plan_points: list[tuple[str, tuple[float, float]]] = []
+        surface_lookup = {surface.name: surface for surface in self.files}
+        applied_ditch_rule_codes: set[str] = set()
+        hit_stop_layers: set[str] = set()
 
         for idx, station in enumerate(stations, start=1):
             profile_id = f"P{idx:04d}"
@@ -3682,6 +4042,15 @@ class KOFViewer(tk.Tk):
                 top_name=top.name,
                 bottom_name=bot.name,
             )
+            ditch_adjust = apply_ditch_rules_to_profile(
+                sample,
+                idx,
+                self._ditch_rules,
+                self._ditch_layer_catalog,
+                surface_lookup,
+            )
+            applied_ditch_rule_codes.update(ditch_adjust.applied_rule_codes)
+            hit_stop_layers.update(ditch_adjust.hit_stop_layers)
 
             profile_rows.append(
                 {
@@ -3689,15 +4058,17 @@ class KOFViewer(tk.Tk):
                     "station_m": sample.station_m,
                     "length_m": sample.length_m,
                     "valid_fraction": sample.valid_fraction,
-                    "area_net_m2": sample.area_net_m2,
-                    "area_cut_m2": sample.area_cut_m2,
-                    "area_fill_m2": sample.area_fill_m2,
+                    "area_net_m2": ditch_adjust.area_net_m2,
+                    "area_cut_m2": ditch_adjust.area_cut_m2,
+                    "area_fill_m2": ditch_adjust.area_fill_m2,
                     "area_upper_leg_m2": sample.area_upper_leg_m2,
                     "area_upper_leg_cut_m2": sample.area_upper_leg_cut_m2,
                     "area_upper_leg_fill_m2": sample.area_upper_leg_fill_m2,
                     "area_lower_leg_m2": sample.area_lower_leg_m2,
                     "area_lower_leg_cut_m2": sample.area_lower_leg_cut_m2,
                     "area_lower_leg_fill_m2": sample.area_lower_leg_fill_m2,
+                    "ditch_rules": list(ditch_adjust.applied_rule_codes),
+                    "ditch_stop_hits": list(ditch_adjust.hit_stop_layers),
                     "image_rel": image_rel.replace("\\", "/"),
                 }
             )
@@ -3793,6 +4164,8 @@ class KOFViewer(tk.Tk):
             "Volume cut (m3)": f"{cut_volume_m3:,.2f}",
             "Volume fill (m3)": f"{fill_volume_m3:,.2f}",
             "Latest volume per-mask": mask_report_text,
+            "Ditch rules active": ", ".join(sorted(applied_ditch_rule_codes)) if applied_ditch_rule_codes else "none",
+            "Ditch stop-layer hits": ", ".join(sorted(hit_stop_layers)) if hit_stop_layers else "none",
         }
         if np.isfinite(upper_leg_volume_m3):
             upper_name = section_intermediate.name if section_intermediate is not None else "Intermediate"
@@ -3856,6 +4229,24 @@ class KOFViewer(tk.Tk):
                         "fill": fill_volume_m3,
                         "top_to_intermediate": upper_leg_volume_m3,
                         "intermediate_to_bottom": lower_leg_volume_m3,
+                    },
+                    "ditch": {
+                        "rules": [
+                            {
+                                "code_label": rule.code_label,
+                                "side": int(rule.side),
+                                "distance_m": float(rule.distance_m),
+                                "slope": float(rule.slope),
+                                "profile_start": int(rule.profile_start),
+                                "profile_end": int(rule.profile_end),
+                                "stop_material": rule.stop_material,
+                                "stop_slot": rule.stop_slot,
+                            }
+                            for rule in self._ditch_rules
+                        ],
+                        "layer_catalog": self._ditch_layer_catalog.to_payload(),
+                        "active_rule_codes": sorted(applied_ditch_rule_codes),
+                        "stop_layer_hits": sorted(hit_stop_layers),
                     },
                     "profiles": profile_rows,
                 },
