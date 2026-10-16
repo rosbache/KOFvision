@@ -10,6 +10,11 @@ Project payload ownership for save/load.
 - Validate payload metadata (`type`, `version`).
 - Apply payload back onto runtime state.
 - Migrate legacy payload versions forward.
+- Persist and restore ditch configuration:
+	- ditch centerlines
+	- active ditch centerline index
+	- ditch rules
+	- ditch layer catalog mappings
 
 ## Why It Exists
 

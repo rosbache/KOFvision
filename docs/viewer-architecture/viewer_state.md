@@ -9,6 +9,8 @@ State transition helpers for bulk reset operations.
 - Clear state for "new/clear" flow.
 - Clear state for project-load flow.
 - Clear cached per-mask volume result structures.
+- Clear ditch runtime state (active draw mode, centerline selection).
+- Reset ditch configuration state (rules and layer catalog) to defaults on clear/load reset.
 - Reset non-persisted runtime state (`ViewerRuntimeState`) signatures/history.
 
 ## Design Notes

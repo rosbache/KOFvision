@@ -39,3 +39,9 @@
 - Report math helpers -> `report_service.py`
 - Volume compute helpers -> `volume_controller.py`
 - Preferences persistence -> `preferences.py`
+
+## Ditch Workflow Notes
+
+- The coordinator owns ditch setup dialogs and selected ditch centerline state.
+- Section report baseline selection prefers selected ditch centerline when present.
+- Ditch rule configuration and layer mappings are persisted through project serialization.

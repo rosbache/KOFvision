@@ -7,6 +7,7 @@ Interactive 2D tool state machines.
 ## Tools
 
 - `SectionTool`
+- `DitchTool`
 - `MaskTool`
 - `MaskEditTool`
 - `MeasureTool`
@@ -25,6 +26,7 @@ Interactive 2D tool state machines.
 - Note dialog helpers.
 - Note map-click routing and pick logic.
 - Mask-edit press/motion/release handlers.
+- Ditch centerline draw/cancel/finalize interaction flow.
 
 ## Design Notes
 

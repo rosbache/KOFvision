@@ -19,6 +19,7 @@ The 2D renderer is split into explicit passes:
 - alignments and stations
 - view/aspect application
 - sections and active section marker
+- ditch centerlines and active ditch preview
 - masks and mask preview
 - measurements and measurement preview
 - notes

@@ -24,7 +24,7 @@ This folder documents the modularized viewer architecture introduced to split th
 - `kofvision/raster_management.py`
   - Raster layer lifecycle, ordering, alpha, elevation-raster selection.
 - `kofvision/viewer_tools.py`
-  - Interactive tool behavior (section, mask, mask edit, measure, notes).
+  - Interactive tool behavior (section, ditch centerline, mask, mask edit, measure, notes).
 - `kofvision/viewer_rendering.py`
   - 2D/3D rendering entrypoints plus split draw-pass functions.
 - `kofvision/viewer_ui.py`
@@ -62,6 +62,7 @@ When adding features:
 - Put interaction state transitions in `viewer_tools.py`.
 - Put raster list and selection logic in `raster_management.py`.
 - Put payload structure changes in `viewer_serialization.py`.
+- Put ditch centerline and ditch rule persistence in `viewer_serialization.py`.
 - Put plotting changes in `viewer_rendering.py`.
 - Put undo stack behavior in `viewer_undo.py`.
 - Put long-running background job wrappers in `task_executor.py`.
