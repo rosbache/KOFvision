@@ -7,6 +7,7 @@ from tkinter import messagebox
 
 TOOL_NONE = "none"
 TOOL_SECTION = "section"
+TOOL_DITCH = "ditch"
 TOOL_MASK = "mask"
 TOOL_MASK_EDIT = "mask_edit"
 TOOL_MEASURE = "measure"
@@ -33,6 +34,8 @@ class ToolDispatcher:
 class SectionTool:
     @staticmethod
     def toggle(viewer) -> None:  # noqa: ANN001
+        if getattr(viewer, "_ditch_mode", False):
+            viewer._end_ditch_mode()
         if viewer._mask_mode:
             viewer._end_mask_mode()
         if viewer._measure_mode:
@@ -112,6 +115,71 @@ class SectionTool:
         viewer._redraw_2d()
         if top is not None and bot is not None:
             viewer._open_section_window_at_index(len(viewer._sections) - 1, top=top, bottom=bot)
+
+
+class DitchTool:
+    @staticmethod
+    def toggle(viewer) -> None:  # noqa: ANN001
+        if viewer._section_mode:
+            viewer._end_section_mode()
+        if viewer._mask_mode:
+            viewer._end_mask_mode()
+        if viewer._mask_edit_mode:
+            viewer._end_mask_edit_mode()
+        if viewer._measure_mode:
+            viewer._end_measure_mode()
+        if viewer._note_mode:
+            viewer._end_note_mode()
+        if viewer._ditch_mode:
+            viewer._end_ditch_mode()
+            return
+
+        if hasattr(viewer, "_deactivate_2d_nav_mode"):
+            viewer._deactivate_2d_nav_mode()
+
+        viewer._ditch_mode = True
+        viewer._tool_dispatch.activate(TOOL_DITCH)
+        viewer._ditch_click_points = []
+        viewer.ditch_btn.configure(text="Cancel ditch")
+        viewer.notebook.select(0)
+        viewer.status.set("Ditch mode: click two points for centerline (right-click or Esc to cancel).")
+        viewer._ditch_cid = viewer.canvas2d.mpl_connect("button_press_event", viewer._on_ditch_click)
+        viewer.bind("<Escape>", lambda _e: viewer._end_ditch_mode())
+
+    @staticmethod
+    def end(viewer) -> None:  # noqa: ANN001
+        viewer._ditch_mode = False
+        viewer._tool_dispatch.clear(TOOL_DITCH)
+        if viewer._ditch_cid is not None:
+            viewer.canvas2d.mpl_disconnect(viewer._ditch_cid)
+            viewer._ditch_cid = None
+        viewer.ditch_btn.configure(text="Draw ditch")
+        viewer.unbind("<Escape>")
+        viewer._ditch_click_points = []
+        viewer._update_status()
+
+    @staticmethod
+    def on_click(viewer, event) -> None:  # noqa: ANN001
+        if event.inaxes is not viewer.ax2d:
+            return
+        if event.button == 3:
+            viewer._end_ditch_mode()
+            return
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        viewer._ditch_click_points.append((float(event.xdata), float(event.ydata)))
+        if len(viewer._ditch_click_points) == 1:
+            viewer.status.set("Ditch mode: click second endpoint.")
+            viewer._redraw_2d()
+            return
+
+        (y0, x0), (y1, x1) = viewer._ditch_click_points[:2]
+        viewer._append_ditch_centerline(((y0, x0), (y1, x1)), track_undo=True, undo_label="Draw ditch centerline")
+        viewer._end_ditch_mode()
+        viewer._redraw_2d()
 
 
 class NoteTool:
@@ -266,6 +334,8 @@ class NoteTool:
 
     @staticmethod
     def toggle(viewer) -> None:  # noqa: ANN001
+        if getattr(viewer, "_ditch_mode", False):
+            viewer._end_ditch_mode()
         if viewer._section_mode:
             viewer._end_section_mode()
         if viewer._mask_mode:
@@ -341,6 +411,8 @@ class NoteTool:
 class MeasureTool:
     @staticmethod
     def toggle(viewer) -> None:  # noqa: ANN001
+        if getattr(viewer, "_ditch_mode", False):
+            viewer._end_ditch_mode()
         if viewer._section_mode:
             viewer._end_section_mode()
         if viewer._mask_mode:
@@ -434,6 +506,8 @@ class MeasureTool:
 class MaskTool:
     @staticmethod
     def toggle(viewer) -> None:  # noqa: ANN001
+        if getattr(viewer, "_ditch_mode", False):
+            viewer._end_ditch_mode()
         if viewer._section_mode:
             viewer._end_section_mode()
         if viewer._measure_mode:
@@ -521,6 +595,8 @@ class MaskTool:
 class MaskEditTool:
     @staticmethod
     def toggle(viewer) -> None:  # noqa: ANN001
+        if getattr(viewer, "_ditch_mode", False):
+            viewer._end_ditch_mode()
         if viewer._section_mode:
             viewer._end_section_mode()
         if viewer._measure_mode:
