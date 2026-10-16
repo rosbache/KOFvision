@@ -7,10 +7,12 @@ from typing import Any, Callable
 @dataclass
 class EditSnapshot:
     sections: list[tuple[tuple[float, float], tuple[float, float]]]
+    ditch_centerlines: list[tuple[tuple[float, float], tuple[float, float]]]
     masks: list[Any]
     notes: list[Any]
     measurements: list[dict[str, Any]]
     active_section_index: int | None
+    active_ditch_centerline_index: int | None
     active_mask_index: int | None
     active_note_index: int | None
 
