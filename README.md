@@ -47,8 +47,11 @@ The main app is implemented in `kof_viewer.py`.
 	- optional raster reference profile (when raster volume mode is active)
 	- shaded cut/fill regions
 	- net/cut/fill cross-section area
+- Draw one or more ditch centerlines in 2D and use them as section-report baselines
+- Configure ditch rules with side, distance, slope, profile range, and optional stop-layer constraints
 - Save and load polygon masks as JSON
 - Save and load section lines as JSON
+- Save and load ditch centerlines/rules in project files
 - Export a section-report package:
 	- profile images at fixed spacing along a baseline (for example every 1 m)
 	- plan-view image with baseline and profile numbers
@@ -115,6 +118,7 @@ KOFvision now uses a hybrid layout aimed at faster access to common actions and 
 	- Reset view
 	- Compute volume
 	- Draw section
+	- Draw ditch
 	- Draw mask
 - Left panel:
 	- Layer visibility (KOF, LandXML, and raster layers)
@@ -138,6 +142,7 @@ The right panel supports collapse/expand per section and vertical scrolling for 
 - Ctrl+Shift+R: Reset 2D view
 - Ctrl+Shift+V: Compute volume
 - Ctrl+Shift+S: Toggle Draw section mode
+- Ctrl+Shift+L: Toggle Draw ditch mode
 - Ctrl+Shift+M: Toggle Draw mask mode
 
 ## Tests
@@ -175,6 +180,87 @@ For full packaging and distribution details, see `docs/pyinstaller-windows.md`.
 8. Click Compute volume (top bar or in Volume setup panel).
 9. Read net/cut/fill (or split results) in the Volume setup panel summary.
 10. Click Draw section and pick two points in 2D to open a section profile window.
+
+## Ditch Tool
+
+The ditch workflow lets you define centerline-driven profile modifications before report volume integration.
+
+### Quick Start
+
+1. Click Draw ditch in the top bar (or press Ctrl+Shift+L).
+2. Click two points in 2D to define a ditch centerline.
+3. Open the Sections and mask panel and click Ditch setup....
+4. Add one or more ditch rules and save.
+5. Export section report. The selected ditch centerline is used as baseline.
+
+### Rule Fields
+
+- Code label: rule identifier (for example `1.1`, `-2.1`).
+	- It is a label, not geometry by itself.
+- Side:
+	- `+1` = right side of centerline
+	- `-1` = left side of centerline
+- Dist (m): horizontal extension distance from previous branch point.
+- Slope: applied along rule distance.
+- Profile start / Profile end: profile index range where rule applies.
+	- Profile indexing is 1-based (`P0001` is index 1).
+- Stop material (optional): `rock`, `moist`, or `constructiontc`.
+- Stop slot (optional): layer slot `0..9` for selected stop material.
+
+### Layer Mapping (Stop Rules)
+
+In Ditch setup, assign surface names to material slots:
+
+- `rock[0..9]`
+- `moist[0..9]`
+- `constructiontc[0..9]`
+
+If a rule has a stop material/slot and mapped surface, extension is clipped at that stop surface.
+
+### Chained Surfaces
+
+Multiple ditch rules on the same side are chained in order.
+
+- First rule starts from centerline elevation.
+- Next rule starts from where previous rule ended.
+
+This supports multi-step ditch shapes (for example first leg then second leg).
+
+### Profile Range Examples
+
+- Rule set A for profiles 1-10.
+- Rule set B for profiles 11-20.
+
+Use separate rules with different profile ranges to switch geometry by profile segment.
+
+### Ditch Setup Cheat Sheet
+
+Use this compact table as a quick preset reference when filling in Ditch setup.
+
+![Ditch setup cheat sheet diagram](docs/images/ditch-setup-cheat-sheet.svg)
+
+Figure: Centerline-based presets for common side slopes (1:1, 1:1.5, 1:2) and profile-range usage.
+
+| Shape target | Side | Dist (m) | Slope | Profile start-end | Code label example | Notes |
+|---|---:|---:|---:|---:|---|---|
+| 1:1 side slope | `+1` | `2.0` | `-1.0` | `1-10` | `1.1` | Right side branch, drops 1 m per 1 m horizontal |
+| 1:1 side slope | `-1` | `2.0` | `-1.0` | `1-10` | `-1.1` | Left side branch, mirrored |
+| 1:1.5 side slope | `+1` | `3.0` | `-0.667` | `1-10` | `1.5` | Approx. 1 m down per 1.5 m horizontal |
+| 1:1.5 side slope | `-1` | `3.0` | `-0.667` | `1-10` | `-1.5` | Left side mirror |
+| 1:2 side slope | `+1` | `4.0` | `-0.5` | `1-10` | `2.1` | Approx. 1 m down per 2 m horizontal |
+| 1:2 side slope | `-1` | `4.0` | `-0.5` | `1-10` | `-2.1` | Left side mirror |
+
+Two-rule V-ditch example (both sides active):
+
+| Code | Side | Dist (m) | Slope | Profiles |
+|---|---:|---:|---:|---:|
+| `1.1` | `+1` | `2.0` | `-1.0` | `1-10` |
+| `-1.1` | `-1` | `2.0` | `-1.0` | `1-10` |
+
+Optional stop-layer values for any row above:
+
+- Stop material: `rock`, `moist`, or `constructiontc`
+- Stop slot: `0..9` (must be mapped in Layer mapping)
 
 ## Volume Calculation Methods
 
@@ -270,7 +356,8 @@ Use Export section report... in the right-side Sections and mask panel.
 
 Current behavior:
 
-1. Uses the latest drawn section line as report baseline.
+1. Uses the selected ditch centerline as report baseline when available.
+   - If no ditch centerline exists, falls back to latest section line.
 2. Prompts for:
 	- profile spacing in meters (for example 1.0)
 	- cross-section length in meters
@@ -281,6 +368,8 @@ Current behavior:
 	- `profiles/P0001.png`, `profiles/P0002.png`, ...
 	- `report.html`
 	- `report_manifest.json`
+
+The report metadata/manifest also includes active ditch rule configuration and stop-layer hits.
 
 The HTML report includes plan view, profile summary table, and all profile images with profile IDs and station distances.
 
