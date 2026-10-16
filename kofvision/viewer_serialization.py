@@ -4,6 +4,7 @@ import os
 from datetime import datetime
 from typing import Any, Callable
 
+from kofvision.ditch import DitchLayerCatalog, ditch_rules_to_payload, parse_ditch_rules
 from kofvision.viewer_state import reset_for_project_load
 
 PROJECT_TYPE = "kofvision.project"
@@ -84,6 +85,14 @@ def build_project_payload(viewer: Any) -> dict[str, Any]:
             }
             for start, end in viewer._sections
         ],
+        "ditch_centerlines": [
+            {
+                "start": [float(start[0]), float(start[1])],
+                "end": [float(end[0]), float(end[1])],
+            }
+            for start, end in getattr(viewer, "_ditch_centerlines", [])
+        ],
+        "active_ditch_centerline_index": getattr(viewer, "_active_ditch_centerline_index", None),
         "masks": [
             {
                 "name": mask.name,
@@ -115,6 +124,8 @@ def build_project_payload(viewer: Any) -> dict[str, Any]:
             }
             for note in viewer._notes
         ],
+        "ditch_rules": ditch_rules_to_payload(getattr(viewer, "_ditch_rules", [])),
+        "ditch_layer_catalog": getattr(viewer, "_ditch_layer_catalog", DitchLayerCatalog()).to_payload(),
     }
 
 
@@ -219,6 +230,34 @@ def apply_project_payload(
             viewer._sections.append((p0, p1))
     viewer._active_section_index = 0 if viewer._sections else None
 
+    ditch_centerlines_raw = payload.get("ditch_centerlines")
+    if isinstance(ditch_centerlines_raw, list):
+        for item in ditch_centerlines_raw:
+            if not isinstance(item, dict):
+                continue
+            start = item.get("start")
+            end = item.get("end")
+            if not isinstance(start, (list, tuple)) or not isinstance(end, (list, tuple)):
+                continue
+            if len(start) != 2 or len(end) != 2:
+                continue
+            try:
+                p0 = (float(start[0]), float(start[1]))
+                p1 = (float(end[0]), float(end[1]))
+            except (TypeError, ValueError):
+                continue
+            viewer._ditch_centerlines.append((p0, p1))
+    active_ditch = payload.get("active_ditch_centerline_index")
+    if isinstance(active_ditch, int) and 0 <= active_ditch < len(viewer._ditch_centerlines):
+        viewer._active_ditch_centerline_index = active_ditch
+    else:
+        viewer._active_ditch_centerline_index = (len(viewer._ditch_centerlines) - 1) if viewer._ditch_centerlines else None
+    if hasattr(viewer, "active_ditch_centerline_var"):
+        if viewer._active_ditch_centerline_index is not None and hasattr(viewer, "_ditch_label"):
+            viewer.active_ditch_centerline_var.set(viewer._ditch_label(viewer._active_ditch_centerline_index))
+        else:
+            viewer.active_ditch_centerline_var.set("")
+
     masks_raw = payload.get("masks")
     if isinstance(masks_raw, list):
         for item in masks_raw:
@@ -264,6 +303,9 @@ def apply_project_payload(
                 continue
             visible = bool(item.get("visible", True))
             viewer._append_note(title=title, text=text, y=y, x=x, visible=visible)
+
+    viewer._ditch_rules = parse_ditch_rules(payload.get("ditch_rules"))
+    viewer._ditch_layer_catalog = DitchLayerCatalog.from_payload(payload.get("ditch_layer_catalog"))
 
     names = [surface.name for surface in viewer.files]
     top_name = str(payload.get("top_surface", ""))
@@ -326,6 +368,8 @@ def apply_project_payload(
     viewer._refresh_raster_selector()
     viewer._refresh_mask_controls()
     viewer._refresh_section_controls()
+    if hasattr(viewer, "_refresh_ditch_controls"):
+        viewer._refresh_ditch_controls()
     viewer._refresh_layer_controls()
     viewer._on_intermediate_type_change()
     viewer._redraw()
