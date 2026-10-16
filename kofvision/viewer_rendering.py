@@ -211,7 +211,36 @@ def _draw_sections(viewer: Any) -> None:
             textcoords="offset points",
             zorder=7,
         )
+
+
+def _draw_ditch_centerlines(viewer: Any) -> None:
+    ditch_color = viewer._theme.get("mpl_section_line", "#1f2937")
+    for idx, ((y0, x0), (y1, x1)) in enumerate(viewer._ditch_centerlines):
+        is_active = idx == viewer._active_ditch_centerline_index
+        label = viewer._ditch_label(idx)
+        color = "#8b5e00" if is_active else ditch_color
+        width = 2.2 if is_active else 1.3
+        viewer.ax2d.plot([y0, y1], [x0, x1], "--", color=color, linewidth=width, zorder=7)
+        viewer.ax2d.plot([y0, y1], [x0, x1], "^", color=color, markersize=4, zorder=8)
         viewer.ax2d.annotate(
+            label,
+            (y0, x0),
+            fontsize=8,
+            fontweight="bold" if is_active else "normal",
+            color=color,
+            xytext=(6, -10),
+            textcoords="offset points",
+            zorder=9,
+        )
+
+
+def _draw_active_ditch_preview(viewer: Any) -> None:
+    if not (viewer._ditch_mode and viewer._ditch_click_points):
+        return
+    arr = np.asarray(viewer._ditch_click_points, dtype=float)
+    viewer.ax2d.plot(arr[:, 0], arr[:, 1], "--", color="#8b5e00", linewidth=1.3, zorder=13)
+    viewer.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#8b5e00", markersize=4, zorder=14)
+    viewer.ax2d.annotate(
             f"{label}'",
             (y1, x1),
             fontsize=9,
@@ -424,7 +453,9 @@ def render_2d(viewer: Any, file_colors: list[str]) -> None:
     _draw_alignments_and_stations(viewer, file_colors)
     _apply_2d_view(viewer)
     _draw_sections(viewer)
+    _draw_ditch_centerlines(viewer)
     _draw_active_section_marker(viewer)
+    _draw_active_ditch_preview(viewer)
     _draw_masks(viewer, file_colors)
     _draw_active_mask_preview(viewer)
     _draw_measurements(viewer)
