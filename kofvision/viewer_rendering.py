@@ -334,6 +334,41 @@ def _draw_active_mask_preview(viewer: Any) -> None:
         viewer.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]], ":", color="#cc8a00", linewidth=1.0, zorder=11)
 
 
+def _draw_pits(viewer: Any) -> None:
+    for idx, pit in enumerate(getattr(viewer, "_pit_polygons", [])):
+        if not viewer._pit_is_visible(idx):
+            continue
+        if len(pit.vertices) < 3:
+            continue
+        arr = np.asarray(pit.vertices, dtype=float)
+        closed = np.vstack([arr, arr[0]])
+        is_active = idx == viewer._active_pit_index
+        color = "#8b1e3f" if is_active else "#b23a48"
+        viewer.ax2d.fill(closed[:, 0], closed[:, 1], color=color, alpha=0.08 if not is_active else 0.14, zorder=10)
+        viewer.ax2d.plot(closed[:, 0], closed[:, 1], "-", color=color, linewidth=2.1 if is_active else 1.2, zorder=11)
+        viewer.ax2d.plot(arr[:, 0], arr[:, 1], "o", color=color, markersize=4, zorder=12)
+        viewer.ax2d.annotate(
+            f"{pit.name} ({pit.target_z:.2f} m)",
+            (arr[0, 0], arr[0, 1]),
+            fontsize=8,
+            color=color,
+            xytext=(6, -10),
+            textcoords="offset points",
+            fontweight="bold" if is_active else "normal",
+            zorder=13,
+        )
+
+
+def _draw_active_pit_preview(viewer: Any) -> None:
+    if not (getattr(viewer, "_pit_mode", False) and getattr(viewer, "_pit_click_points", [])):
+        return
+    arr = np.asarray(viewer._pit_click_points, dtype=float)
+    viewer.ax2d.plot(arr[:, 0], arr[:, 1], "--", color="#b23a48", linewidth=1.3, zorder=14)
+    viewer.ax2d.plot(arr[:, 0], arr[:, 1], "o", color="#b23a48", markersize=4, zorder=15)
+    if len(arr) >= 2:
+        viewer.ax2d.plot([arr[-1, 0], arr[0, 0]], [arr[-1, 1], arr[0, 1]], ":", color="#b23a48", linewidth=1.0, zorder=14)
+
+
 def _draw_measurements(viewer: Any) -> None:
     for idx, item in enumerate(viewer._measure_results):
         kind = item.get("kind", "")
@@ -458,6 +493,8 @@ def render_2d(viewer: Any, file_colors: list[str]) -> None:
     _draw_active_ditch_preview(viewer)
     _draw_masks(viewer, file_colors)
     _draw_active_mask_preview(viewer)
+    _draw_pits(viewer)
+    _draw_active_pit_preview(viewer)
     _draw_measurements(viewer)
     _draw_active_measurement_preview(viewer)
     _draw_notes(viewer)
