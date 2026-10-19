@@ -5,11 +5,12 @@ from datetime import datetime
 from typing import Any, Callable
 
 from kofvision.ditch import DitchLayerCatalog, ditch_rules_to_payload, parse_ditch_rules
+from kofvision.pit import parse_pit_polygons, parse_pit_settings, pit_polygons_to_payload, pit_settings_to_payload
 from kofvision.viewer_state import reset_for_project_load
 
 PROJECT_TYPE = "kofvision.project"
-PROJECT_VERSION = 2
-SUPPORTED_PROJECT_VERSIONS = {1, PROJECT_VERSION}
+PROJECT_VERSION = 3
+SUPPORTED_PROJECT_VERSIONS = {1, 2, PROJECT_VERSION}
 
 
 class ProjectPayloadError(ValueError):
@@ -19,13 +20,22 @@ class ProjectPayloadError(ValueError):
 def migrate_project_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Migrate older payloads to the latest schema version."""
     version = int(payload.get("version", 0))
+    upgraded = dict(payload)
     if version == PROJECT_VERSION:
         return payload
 
     if version == 1:
-        upgraded = dict(payload)
         upgraded.setdefault("volume_history", [])
         upgraded.setdefault("saved_preferences", {})
+        upgraded.setdefault("pit_polygons", [])
+        upgraded.setdefault("pit_settings", {})
+        upgraded.setdefault("active_pit", "")
+        version = 2
+
+    if version == 2:
+        upgraded.setdefault("pit_polygons", [])
+        upgraded.setdefault("pit_settings", {})
+        upgraded.setdefault("active_pit", "")
         upgraded["version"] = PROJECT_VERSION
         return upgraded
 
@@ -102,7 +112,10 @@ def build_project_payload(viewer: Any) -> dict[str, Any]:
             for mask in viewer._masks
             if len(mask.vertices) >= 3
         ],
+        "pit_polygons": pit_polygons_to_payload(getattr(viewer, "_pit_polygons", [])),
+        "pit_settings": pit_settings_to_payload(getattr(viewer, "_pit_settings", parse_pit_settings(None))),
         "active_mask": viewer.active_mask_var.get(),
+        "active_pit": viewer.active_pit_var.get() if hasattr(viewer, "active_pit_var") else "",
         "volume_history": list(getattr(getattr(viewer, "runtime_state", None), "volume_history", [])),
         "saved_preferences": {
             "theme": viewer.theme_mode.get(),
@@ -286,6 +299,23 @@ def apply_project_payload(
             if mask.name == active_mask:
                 viewer._set_active_mask_index(idx)
                 break
+
+    viewer._pit_polygons = parse_pit_polygons(payload.get("pit_polygons"))
+    viewer._pit_settings = parse_pit_settings(payload.get("pit_settings"))
+    if hasattr(viewer, "_pit_visibility_vars"):
+        viewer._pit_visibility_vars = []
+    viewer._active_pit_index = None
+    active_pit = str(payload.get("active_pit", "")).strip()
+    if active_pit:
+        for idx, polygon in enumerate(viewer._pit_polygons):
+            if polygon.name == active_pit:
+                viewer._active_pit_index = idx
+                break
+    if hasattr(viewer, "active_pit_var"):
+        if viewer._active_pit_index is not None:
+            viewer.active_pit_var.set(viewer._pit_polygons[viewer._active_pit_index].name)
+        else:
+            viewer.active_pit_var.set("")
 
     notes_raw = payload.get("notes")
     if isinstance(notes_raw, list):
