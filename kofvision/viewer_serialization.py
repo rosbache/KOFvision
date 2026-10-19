@@ -36,6 +36,7 @@ def migrate_project_payload(payload: dict[str, Any]) -> dict[str, Any]:
         upgraded.setdefault("pit_polygons", [])
         upgraded.setdefault("pit_settings", {})
         upgraded.setdefault("active_pit", "")
+        upgraded.setdefault("pit_compute_scope", "selected")
         upgraded["version"] = PROJECT_VERSION
         return upgraded
 
@@ -88,6 +89,7 @@ def build_project_payload(viewer: Any) -> dict[str, Any]:
         "intermediate_raster": viewer.intermediate_raster_var.get(),
         "intermediate_constant_z": float(viewer.intermediate_constant_z.get()),
         "mask_compute_scope": viewer.mask_compute_scope.get(),
+        "pit_compute_scope": viewer.pit_compute_scope.get() if hasattr(viewer, "pit_compute_scope") else "selected",
         "sections": [
             {
                 "start": [float(start[0]), float(start[1])],
@@ -368,6 +370,10 @@ def apply_project_payload(
     if scope in allowed_mask_scopes:
         viewer.mask_compute_scope.set(scope)
 
+    pit_scope = str(payload.get("pit_compute_scope", "")).strip()
+    if hasattr(viewer, "pit_compute_scope") and pit_scope:
+        viewer.pit_compute_scope.set(pit_scope)
+
     history = payload.get("volume_history")
     if isinstance(history, list):
         if hasattr(viewer, "runtime_state"):
@@ -397,6 +403,8 @@ def apply_project_payload(
     viewer._refresh_intermediate_raster_selector()
     viewer._refresh_raster_selector()
     viewer._refresh_mask_controls()
+    if hasattr(viewer, "_refresh_pit_controls"):
+        viewer._refresh_pit_controls()
     viewer._refresh_section_controls()
     if hasattr(viewer, "_refresh_ditch_controls"):
         viewer._refresh_ditch_controls()
