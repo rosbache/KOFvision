@@ -305,6 +305,7 @@ class KOFViewer(tk.Tk):
         self.pit_compute_scope = tk.StringVar(value=PIT_SCOPE_LABELS["selected"])
         self.pit_target_z_var = tk.DoubleVar(value=0.0)
         self.pit_edge_slope_var = tk.DoubleVar(value=1.0)
+        self.pit_vertical_wall_var = tk.BooleanVar(value=False)
         self.pit_stop_material_var = tk.StringVar(value="")
         self.pit_stop_slot_var = tk.StringVar(value="0")
         self.measure_mode = tk.StringVar(value=MEASURE_MODE_LABELS["line"])
@@ -1255,6 +1256,14 @@ class KOFViewer(tk.Tk):
         self.pit_edge_slope_spin.bind("<Return>", lambda _e: self._on_pit_settings_change())
         self.pit_edge_slope_spin.bind("<FocusOut>", lambda _e: self._on_pit_settings_change())
 
+        self.pit_vertical_wall_check = ttk.Checkbutton(
+            pit_panel,
+            text="Vertical walls (no side slope)",
+            variable=self.pit_vertical_wall_var,
+            command=self._on_pit_settings_change,
+        )
+        self.pit_vertical_wall_check.pack(anchor="w", pady=(0, 4))
+
         stop_row = ttk.Frame(pit_panel)
         stop_row.pack(fill=tk.X, pady=(0, 4))
         ttk.Label(stop_row, text="Stop layer:").pack(side=tk.LEFT)
@@ -1826,6 +1835,7 @@ class KOFViewer(tk.Tk):
             slope = 1.0
         if not np.isfinite(slope):
             slope = 1.0
+        vertical_wall = bool(self.pit_vertical_wall_var.get())
         material = self.pit_stop_material_var.get().strip().lower()
         if material not in {"rock", "moist"}:
             material = None
@@ -1835,7 +1845,12 @@ class KOFViewer(tk.Tk):
             slot = None
         if slot is not None and (slot < 0 or slot > 9):
             slot = None
-        self._pit_settings = PitSettings(edge_slope=float(slope), stop_material=material, stop_slot=slot)
+        self._pit_settings = PitSettings(
+            edge_slope=float(slope),
+            vertical_wall=vertical_wall,
+            stop_material=material,
+            stop_slot=slot,
+        )
 
     def _refresh_pit_controls(self) -> None:
         if hasattr(self, "pit_combo"):
@@ -1884,8 +1899,13 @@ class KOFViewer(tk.Tk):
             self.pit_target_z_var.set(float(active.target_z))
 
         self.pit_edge_slope_var.set(float(self._pit_settings.edge_slope))
+        self.pit_vertical_wall_var.set(bool(self._pit_settings.vertical_wall))
         self.pit_stop_material_var.set(self._pit_settings.stop_material or "")
         self.pit_stop_slot_var.set(str(self._pit_settings.stop_slot if self._pit_settings.stop_slot is not None else 0))
+        if hasattr(self, "pit_edge_slope_spin"):
+            self.pit_edge_slope_spin.configure(
+                state="disabled" if self.pit_vertical_wall_var.get() else "normal",
+            )
         self._refresh_layer_controls()
 
     def _mask_is_visible(self, index: int) -> bool:
@@ -4826,6 +4846,7 @@ class KOFViewer(tk.Tk):
             "Latest volume per-mask": mask_report_text,
             "Pit polygons": int(request.get("pit_count", 0)),
             "Pit scope": str(request.get("pit_scope", "selected")),
+            "Pit vertical walls": "yes" if self._pit_settings.vertical_wall else "no",
             "Pit edge slope (m/m)": f"{self._pit_settings.edge_slope:.3f}",
             "Pit stop layer": (
                 f"{self._pit_settings.stop_material}:{self._pit_settings.stop_slot}"

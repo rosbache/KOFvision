@@ -28,6 +28,7 @@ class PitPolygon:
 @dataclass
 class PitSettings:
     edge_slope: float = 1.0
+    vertical_wall: bool = False
     stop_material: Optional[str] = None
     stop_slot: Optional[int] = None
 
@@ -84,6 +85,7 @@ def parse_pit_polygons(payload: object) -> list[PitPolygon]:
 def pit_settings_to_payload(settings: PitSettings) -> dict[str, Any]:
     return {
         "edge_slope": float(settings.edge_slope),
+        "vertical_wall": bool(settings.vertical_wall),
         "stop_material": settings.stop_material,
         "stop_slot": settings.stop_slot,
     }
@@ -100,6 +102,8 @@ def parse_pit_settings(payload: object) -> PitSettings:
     if not np.isfinite(edge_slope):
         edge_slope = 1.0
 
+    vertical_wall = bool(payload.get("vertical_wall", False))
+
     stop_material_raw = str(payload.get("stop_material", "")).strip().lower()
     stop_material = stop_material_raw if stop_material_raw in _MATERIALS else None
 
@@ -115,6 +119,7 @@ def parse_pit_settings(payload: object) -> PitSettings:
 
     return PitSettings(
         edge_slope=float(edge_slope),
+        vertical_wall=vertical_wall,
         stop_material=stop_material,
         stop_slot=stop_slot,
     )
@@ -175,7 +180,9 @@ class TheoreticalPitSurface:
 
     The interior of each polygon is fixed to its own target elevation.
     Outside polygon boundaries, elevation rises linearly away from each edge
-    using edge_slope (m/m). Multiple polygons combine as lowest-Z-wins.
+    using edge_slope (m/m), unless vertical_wall=True, which keeps values
+    undefined outside pits so volumes are limited to pit interiors.
+    Multiple polygons combine as lowest-Z-wins.
     """
 
     def __init__(
@@ -221,6 +228,7 @@ class TheoreticalPitSurface:
             return result
 
         slope_abs = abs(float(self._settings.edge_slope))
+        vertical_wall = bool(self._settings.vertical_wall)
         py = y_arr.reshape(-1)
         px = x_arr.reshape(-1)
         out = result.reshape(-1)
@@ -230,13 +238,21 @@ class TheoreticalPitSurface:
             inside = path.contains_points(np.column_stack((py, px)), radius=1e-12)
             dist = _distance_to_polygon_edges(py, px, polygon.vertices)
 
-            candidate = np.full(py.shape, float(polygon.target_z), dtype=float)
-            if slope_abs > 0:
-                candidate = candidate + slope_abs * dist
+            if vertical_wall:
+                candidate = np.where(inside, float(polygon.target_z), np.nan)
+            else:
+                candidate = np.full(py.shape, float(polygon.target_z), dtype=float)
+                if slope_abs > 0:
+                    candidate = candidate + slope_abs * dist
+                # Force exact interior target height independent of edge distance.
+                candidate = np.where(inside, float(polygon.target_z), candidate)
 
-            # Force exact interior target height independent of edge distance.
-            candidate = np.where(inside, float(polygon.target_z), candidate)
-            out[:] = np.where(np.isnan(out), candidate, np.minimum(out, candidate))
+            candidate_finite = np.isfinite(candidate)
+            out_nan = np.isnan(out)
+            write_new = out_nan & candidate_finite
+            out[write_new] = candidate[write_new]
+            merge_mask = (~out_nan) & candidate_finite
+            out[merge_mask] = np.minimum(out[merge_mask], candidate[merge_mask])
 
         if self._stop_surface is not None:
             z_stop = self._stop_surface.interpolate(y_arr, x_arr).reshape(-1)
