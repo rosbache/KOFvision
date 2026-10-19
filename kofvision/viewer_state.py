@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from kofvision.ditch import DitchLayerCatalog
+from kofvision.pit import PitSettings
 
 
 def clear_cached_mask_volume_results(viewer: Any) -> None:
@@ -44,6 +45,11 @@ def reset_for_clear(viewer: Any) -> None:
     viewer._active_mask_index = None
     viewer.active_mask_var.set("")
     viewer._mask_click_points.clear()
+    viewer._pit_polygons.clear()
+    viewer._pit_visibility_vars.clear()
+    viewer._active_pit_index = None
+    viewer.active_pit_var.set("")
+    viewer._pit_settings = PitSettings()
     viewer._notes.clear()
     viewer._note_visibility_vars.clear()
     viewer._active_note_index = None
@@ -83,6 +89,11 @@ def reset_for_project_load(viewer: Any) -> None:
     viewer._mask_visibility_vars.clear()
     viewer._active_mask_index = None
     viewer.active_mask_var.set("")
+    viewer._pit_polygons.clear()
+    viewer._pit_visibility_vars.clear()
+    viewer._active_pit_index = None
+    viewer.active_pit_var.set("")
+    viewer._pit_settings = PitSettings()
     viewer._notes.clear()
     viewer._note_visibility_vars.clear()
     viewer._active_note_index = None
