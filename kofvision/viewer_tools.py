@@ -10,6 +10,8 @@ TOOL_SECTION = "section"
 TOOL_DITCH = "ditch"
 TOOL_MASK = "mask"
 TOOL_MASK_EDIT = "mask_edit"
+TOOL_PIT = "pit"
+TOOL_PIT_EDIT = "pit_edit"
 TOOL_MEASURE = "measure"
 TOOL_NOTE = "note"
 
@@ -38,6 +40,10 @@ class SectionTool:
             viewer._end_ditch_mode()
         if viewer._mask_mode:
             viewer._end_mask_mode()
+        if getattr(viewer, "_pit_mode", False):
+            viewer._end_pit_mode()
+        if getattr(viewer, "_pit_edit_mode", False):
+            viewer._end_pit_edit_mode()
         if viewer._measure_mode:
             viewer._end_measure_mode()
         if viewer._note_mode:
@@ -124,6 +130,10 @@ class DitchTool:
             viewer._end_section_mode()
         if viewer._mask_mode:
             viewer._end_mask_mode()
+        if getattr(viewer, "_pit_mode", False):
+            viewer._end_pit_mode()
+        if getattr(viewer, "_pit_edit_mode", False):
+            viewer._end_pit_edit_mode()
         if viewer._mask_edit_mode:
             viewer._end_mask_edit_mode()
         if viewer._measure_mode:
@@ -340,6 +350,10 @@ class NoteTool:
             viewer._end_section_mode()
         if viewer._mask_mode:
             viewer._end_mask_mode()
+        if getattr(viewer, "_pit_mode", False):
+            viewer._end_pit_mode()
+        if getattr(viewer, "_pit_edit_mode", False):
+            viewer._end_pit_edit_mode()
         if viewer._mask_edit_mode:
             viewer._end_mask_edit_mode()
         if viewer._measure_mode:
@@ -417,6 +431,10 @@ class MeasureTool:
             viewer._end_section_mode()
         if viewer._mask_mode:
             viewer._end_mask_mode()
+        if getattr(viewer, "_pit_mode", False):
+            viewer._end_pit_mode()
+        if getattr(viewer, "_pit_edit_mode", False):
+            viewer._end_pit_edit_mode()
         if viewer._mask_edit_mode:
             viewer._end_mask_edit_mode()
         if viewer._note_mode:
@@ -512,6 +530,10 @@ class MaskTool:
             viewer._end_section_mode()
         if viewer._measure_mode:
             viewer._end_measure_mode()
+        if getattr(viewer, "_pit_mode", False):
+            viewer._end_pit_mode()
+        if getattr(viewer, "_pit_edit_mode", False):
+            viewer._end_pit_edit_mode()
         if viewer._mask_edit_mode:
             viewer._end_mask_edit_mode()
         if viewer._note_mode:
@@ -601,6 +623,10 @@ class MaskEditTool:
             viewer._end_section_mode()
         if viewer._measure_mode:
             viewer._end_measure_mode()
+        if getattr(viewer, "_pit_mode", False):
+            viewer._end_pit_mode()
+        if getattr(viewer, "_pit_edit_mode", False):
+            viewer._end_pit_edit_mode()
         if viewer._mask_mode:
             viewer._end_mask_mode()
         if viewer._note_mode:
@@ -692,3 +718,200 @@ class MaskEditTool:
             return
         if event.button == 1:
             viewer._mask_drag_vertex_index = None
+
+
+class PitTool:
+    @staticmethod
+    def toggle(viewer) -> None:  # noqa: ANN001
+        if getattr(viewer, "_ditch_mode", False):
+            viewer._end_ditch_mode()
+        if viewer._section_mode:
+            viewer._end_section_mode()
+        if viewer._measure_mode:
+            viewer._end_measure_mode()
+        if viewer._mask_mode:
+            viewer._end_mask_mode()
+        if viewer._mask_edit_mode:
+            viewer._end_mask_edit_mode()
+        if viewer._note_mode:
+            viewer._end_note_mode()
+        if viewer._pit_edit_mode:
+            viewer._end_pit_edit_mode()
+        if viewer._pit_mode:
+            viewer._end_pit_mode()
+            viewer._redraw_2d()
+            return
+
+        if hasattr(viewer, "_deactivate_2d_nav_mode"):
+            viewer._deactivate_2d_nav_mode()
+
+        viewer._pit_mode = True
+        viewer._tool_dispatch.activate(TOOL_PIT)
+        viewer._pit_click_points = []
+        viewer.pit_btn.configure(text="Cancel pit")
+        viewer.notebook.select(0)
+        viewer.status.set(
+            "Pit mode: left-click to add polygon vertices. "
+            "Right-click (or double-click) to close. Esc to cancel."
+        )
+        viewer._pit_cid = viewer.canvas2d.mpl_connect("button_press_event", viewer._on_pit_click)
+        viewer.bind("<Escape>", lambda _e: viewer._cancel_pit_mode())
+
+    @staticmethod
+    def cancel(viewer) -> None:  # noqa: ANN001
+        viewer._pit_click_points = []
+        viewer._end_pit_mode()
+        viewer._redraw_2d()
+
+    @staticmethod
+    def end(viewer) -> None:  # noqa: ANN001
+        viewer._pit_mode = False
+        viewer._tool_dispatch.clear(TOOL_PIT)
+        if viewer._pit_cid is not None:
+            viewer.canvas2d.mpl_disconnect(viewer._pit_cid)
+            viewer._pit_cid = None
+        viewer.pit_btn.configure(text="Draw pit")
+        viewer.unbind("<Escape>")
+        viewer._update_status()
+
+    @staticmethod
+    def on_click(viewer, event) -> None:  # noqa: ANN001
+        if event.inaxes is not viewer.ax2d:
+            return
+        if event.button == 3:
+            if len(viewer._pit_click_points) >= 3:
+                viewer._append_pit_polygon(viewer._pit_click_points)
+                viewer._pit_click_points = []
+                viewer._end_pit_mode()
+                if viewer.last_volume is not None:
+                    viewer.volume_text.set("Volume: (stale – recompute)")
+                viewer._refresh_pit_controls()
+                viewer._redraw()
+            else:
+                viewer._cancel_pit_mode()
+            return
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+
+        viewer._pit_click_points.append((event.xdata, event.ydata))
+        if event.dblclick and len(viewer._pit_click_points) >= 3:
+            viewer._append_pit_polygon(viewer._pit_click_points)
+            viewer._pit_click_points = []
+            viewer._end_pit_mode()
+            if viewer.last_volume is not None:
+                viewer.volume_text.set("Volume: (stale – recompute)")
+            viewer._refresh_pit_controls()
+            viewer._redraw()
+            return
+
+        viewer.status.set(
+            f"Pit mode: {len(viewer._pit_click_points)} vertex/vertices. "
+            "Left-click to add more, right-click or double-click to close."
+        )
+        viewer._redraw_2d()
+
+
+class PitEditTool:
+    @staticmethod
+    def toggle(viewer) -> None:  # noqa: ANN001
+        if getattr(viewer, "_ditch_mode", False):
+            viewer._end_ditch_mode()
+        if viewer._section_mode:
+            viewer._end_section_mode()
+        if viewer._measure_mode:
+            viewer._end_measure_mode()
+        if viewer._mask_mode:
+            viewer._end_mask_mode()
+        if viewer._mask_edit_mode:
+            viewer._end_mask_edit_mode()
+        if viewer._pit_mode:
+            viewer._end_pit_mode()
+        if viewer._note_mode:
+            viewer._end_note_mode()
+        if viewer._pit_edit_mode:
+            viewer._end_pit_edit_mode()
+            viewer._redraw_2d()
+            return
+
+        active = viewer._active_pit()
+        if active is None or len(active.vertices) < 3:
+            messagebox.showinfo("KOF Viewer", "Select a closed pit polygon before editing.")
+            return
+
+        viewer._pit_edit_mode = True
+        viewer._tool_dispatch.activate(TOOL_PIT_EDIT)
+        viewer._pit_drag_vertex_index = None
+        viewer._pit_changed_since_last_compute = False
+        viewer.pit_edit_btn.configure(text="Finish pit edit")
+        viewer.notebook.select(0)
+        viewer.status.set("Pit edit: drag vertices on selected pit polygon. Right-click or Esc to finish.")
+        viewer._pit_edit_press_cid = viewer.canvas2d.mpl_connect("button_press_event", viewer._on_pit_edit_press)
+        viewer._pit_edit_motion_cid = viewer.canvas2d.mpl_connect("motion_notify_event", viewer._on_pit_edit_motion)
+        viewer._pit_edit_release_cid = viewer.canvas2d.mpl_connect("button_release_event", viewer._on_pit_edit_release)
+        viewer.bind("<Escape>", lambda _e: viewer._end_pit_edit_mode())
+
+    @staticmethod
+    def end(viewer) -> None:  # noqa: ANN001
+        viewer._pit_edit_mode = False
+        viewer._tool_dispatch.clear(TOOL_PIT_EDIT)
+        if viewer._pit_edit_press_cid is not None:
+            viewer.canvas2d.mpl_disconnect(viewer._pit_edit_press_cid)
+            viewer._pit_edit_press_cid = None
+        if viewer._pit_edit_motion_cid is not None:
+            viewer.canvas2d.mpl_disconnect(viewer._pit_edit_motion_cid)
+            viewer._pit_edit_motion_cid = None
+        if viewer._pit_edit_release_cid is not None:
+            viewer.canvas2d.mpl_disconnect(viewer._pit_edit_release_cid)
+            viewer._pit_edit_release_cid = None
+        viewer._pit_drag_vertex_index = None
+        viewer.pit_edit_btn.configure(text="Edit selected pit")
+        viewer.unbind("<Escape>")
+        if viewer._pit_changed_since_last_compute and viewer.last_volume is not None:
+            viewer.volume_text.set("Volume: (stale – recompute)")
+        viewer._pit_changed_since_last_compute = False
+        viewer._refresh_pit_controls()
+        viewer._update_status()
+
+    @staticmethod
+    def on_press(viewer, event) -> None:  # noqa: ANN001
+        if not viewer._pit_edit_mode or event.inaxes is not viewer.ax2d:
+            return
+        if event.button == 3:
+            viewer._end_pit_edit_mode()
+            viewer._redraw_2d()
+            return
+        if event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        active = viewer._active_pit()
+        if active is None:
+            return
+        idx = viewer._pick_vertex_index(active.vertices, (event.xdata, event.ydata))
+        if idx is not None:
+            viewer._pit_drag_vertex_index = idx
+
+    @staticmethod
+    def on_motion(viewer, event) -> None:  # noqa: ANN001
+        if not viewer._pit_edit_mode:
+            return
+        idx = viewer._pit_drag_vertex_index
+        if idx is None:
+            return
+        if event.inaxes is not viewer.ax2d or event.xdata is None or event.ydata is None:
+            return
+        active = viewer._active_pit()
+        if active is None or idx < 0 or idx >= len(active.vertices):
+            return
+        active.vertices[idx] = (float(event.xdata), float(event.ydata))
+        viewer._pit_changed_since_last_compute = True
+        viewer._redraw_2d()
+
+    @staticmethod
+    def on_release(viewer, event) -> None:  # noqa: ANN001
+        if not viewer._pit_edit_mode:
+            return
+        if event.button == 1:
+            viewer._pit_drag_vertex_index = None
