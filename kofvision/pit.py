@@ -186,9 +186,29 @@ class TheoreticalPitSurface:
         stop_surface: Optional[SurfaceLike] = None,
         only_visible: bool = True,
     ) -> None:
+        self.name = "Pit surface"
         self._polygons = [p for p in polygons if len(p.vertices) >= 3 and (p.visible or not only_visible)]
         self._settings = settings
         self._stop_surface = stop_surface
+
+    def xy_bounds(self) -> Optional[tuple[float, float, float, float]]:
+        if not self._polygons:
+            return None
+        y_min = float("inf")
+        x_min = float("inf")
+        y_max = float("-inf")
+        x_max = float("-inf")
+        for polygon in self._polygons:
+            arr = np.asarray(polygon.vertices, dtype=float)
+            if arr.size == 0:
+                continue
+            y_min = min(y_min, float(np.min(arr[:, 0])))
+            x_min = min(x_min, float(np.min(arr[:, 1])))
+            y_max = max(y_max, float(np.max(arr[:, 0])))
+            x_max = max(x_max, float(np.max(arr[:, 1])))
+        if not np.isfinite(y_min) or not np.isfinite(x_min) or not np.isfinite(y_max) or not np.isfinite(x_max):
+            return None
+        return (y_min, x_min, y_max, x_max)
 
     def interpolate(self, y: np.ndarray, x: np.ndarray) -> np.ndarray:
         y_arr = np.asarray(y, dtype=float)
