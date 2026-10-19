@@ -105,6 +105,8 @@ from kofvision.viewer_tools import (
     MaskTool,
     MeasureTool,
     NoteTool,
+    PitEditTool,
+    PitTool,
     SectionTool,
     ToolDispatcher,
 )
@@ -129,6 +131,7 @@ from kofvision.ditch import (
     parse_ditch_rules,
 )
 from kofvision.pit import PitPolygon, PitSettings
+from kofvision.pit import TheoreticalPitSurface, resolve_stop_surface
 
 try:
     import customtkinter as ctk
@@ -151,6 +154,7 @@ VOLUME_MODE_LABELS: dict[str, str] = {
     "top_minus_raster": "Top KOF - Raster",
     "raster_minus_bottom": "Raster - Bottom KOF",
     "raster_minus_top": "Raster - Top KOF",
+    "top_minus_pit": "Top KOF - Pit",
 }
 VOLUME_LABEL_TO_MODE: dict[str, str] = {v: k for k, v in VOLUME_MODE_LABELS.items()}
 
@@ -159,8 +163,16 @@ INTERMEDIATE_TYPE_LABELS: dict[str, str] = {
     "kof": "KOF layer",
     "raster": "Raster layer",
     "constant": "Constant Z",
+    "pit": "Pit surface",
 }
 INTERMEDIATE_LABEL_TO_TYPE: dict[str, str] = {v: k for k, v in INTERMEDIATE_TYPE_LABELS.items()}
+
+PIT_SCOPE_LABELS: dict[str, str] = {
+    "selected": "Selected pit",
+    "visible": "Visible pits",
+    "all": "All pits",
+}
+PIT_LABEL_TO_SCOPE: dict[str, str] = {v: k for k, v in PIT_SCOPE_LABELS.items()}
 
 MASK_SCOPE_LABELS: dict[str, str] = {
     "selected": "Selected mask",
@@ -290,6 +302,11 @@ class KOFViewer(tk.Tk):
         self.xsd_allow_network = tk.BooleanVar(value=True)
         self.xsd_local_schema_path = tk.StringVar(value="")
         self.mask_compute_scope = tk.StringVar(value=MASK_SCOPE_LABELS["selected"])
+        self.pit_compute_scope = tk.StringVar(value=PIT_SCOPE_LABELS["selected"])
+        self.pit_target_z_var = tk.DoubleVar(value=0.0)
+        self.pit_edge_slope_var = tk.DoubleVar(value=1.0)
+        self.pit_stop_material_var = tk.StringVar(value="")
+        self.pit_stop_slot_var = tk.StringVar(value="0")
         self.measure_mode = tk.StringVar(value=MEASURE_MODE_LABELS["line"])
         self.max_labels = tk.IntVar(value=400)
         self.report_template = tk.StringVar(value="standard")
@@ -335,6 +352,7 @@ class KOFViewer(tk.Tk):
         self._active_pit_index: Optional[int] = None
         self.active_pit_var = tk.StringVar(value="")
         self._pit_settings = PitSettings()
+        self._pit_visibility_checks: list[tk.Widget] = []
         self._last_volume_per_mask_rows: list[str] = []
         self._last_mask_volume_results: list[dict[str, Any]] = []
         self._ditch_rules: list[DitchRule] = []
@@ -347,6 +365,17 @@ class KOFViewer(tk.Tk):
         self._mask_edit_release_cid: Optional[int] = None
         self._mask_drag_vertex_index: Optional[int] = None
         self._mask_changed_since_last_compute = False
+
+        # Pit polygon state for theoretical construction surfaces.
+        self._pit_mode = False
+        self._pit_click_points: list[tuple[float, float]] = []
+        self._pit_cid: Optional[int] = None
+        self._pit_edit_mode = False
+        self._pit_edit_press_cid: Optional[int] = None
+        self._pit_edit_motion_cid: Optional[int] = None
+        self._pit_edit_release_cid: Optional[int] = None
+        self._pit_drag_vertex_index: Optional[int] = None
+        self._pit_changed_since_last_compute = False
 
         # 2D measurement state.
         self._measure_mode = False
@@ -464,6 +493,7 @@ class KOFViewer(tk.Tk):
         if self.last_volume is not None:
             self.volume_text.set("Volume: (stale – recompute)")
         self._refresh_mask_controls()
+        self._refresh_pit_controls()
         self._refresh_section_controls()
         self._refresh_ditch_controls()
         self._refresh_layer_controls()
@@ -569,6 +599,7 @@ class KOFViewer(tk.Tk):
         self.bind_all("<Control-Shift-S>", lambda _e: self._invoke_shortcut(self._on_toggle_section))
         self.bind_all("<Control-Shift-L>", lambda _e: self._invoke_shortcut(self._on_toggle_ditch_centerline))
         self.bind_all("<Control-Shift-M>", lambda _e: self._invoke_shortcut(self._on_toggle_mask))
+        self.bind_all("<Control-Shift-P>", lambda _e: self._invoke_shortcut(self._on_toggle_pit))
         self.bind_all("<Control-Shift-D>", lambda _e: self._invoke_shortcut(self._on_toggle_measure))
         self.bind_all("<Control-Shift-N>", lambda _e: self._invoke_shortcut(self._on_toggle_note_mode))
 
@@ -677,6 +708,10 @@ class KOFViewer(tk.Tk):
         self.mask_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.mask_btn, "Shortcut: Ctrl+Shift+M")
 
+        self.pit_btn = self._make_toolbar_button(top, text="Draw pit", command=self._on_toggle_pit)
+        self.pit_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.pit_btn, "Shortcut: Ctrl+Shift+P")
+
         self.measure_btn = self._make_toolbar_button(top, text="Measure", command=self._on_toggle_measure)
         self.measure_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.measure_btn, "Shortcut: Ctrl+Shift+D")
@@ -721,7 +756,7 @@ class KOFViewer(tk.Tk):
 
         ttk.Label(
             top,
-            text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute, Ctrl+Shift+L ditch, Ctrl+Shift+N note",
+            text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute, Ctrl+Shift+L ditch, Ctrl+Shift+P pit, Ctrl+Shift+N note",
             style="Muted.TLabel",
         ).pack(side=tk.RIGHT, padx=(8, 0))
 
@@ -1061,11 +1096,11 @@ class KOFViewer(tk.Tk):
         )
         self.mask_results_export_btn.pack(side=tk.LEFT, padx=(4, 0))
 
-        sections_panel = self._add_collapsible_panel(parent, "Sections and mask", expanded=False)
-        ttk.Button(sections_panel, text="Update sections", command=self._on_update_sections).pack(fill=tk.X, pady=(0, 2))
-        ttk.Label(sections_panel, text="Selected section:").pack(anchor="w", pady=(2, 0))
+        section_panel = self._add_collapsible_panel(parent, "Section", expanded=False)
+        ttk.Button(section_panel, text="Update sections", command=self._on_update_sections).pack(fill=tk.X, pady=(0, 2))
+        ttk.Label(section_panel, text="Selected section:").pack(anchor="w", pady=(2, 0))
         self.section_combo = ttk.Combobox(
-            sections_panel,
+            section_panel,
             textvariable=self.active_section_var,
             values=[],
             state="readonly",
@@ -1073,41 +1108,19 @@ class KOFViewer(tk.Tk):
         )
         self.section_combo.pack(fill=tk.X, pady=(2, 2))
         self.section_combo.bind("<<ComboboxSelected>>", self._on_section_select)
-        section_btn_row = ttk.Frame(sections_panel)
+        section_btn_row = ttk.Frame(section_panel)
         section_btn_row.pack(fill=tk.X, pady=(0, 2))
         self.section_zoom_btn = ttk.Button(section_btn_row, text="Zoom selected", command=self._on_zoom_selected_section)
         self.section_zoom_btn.pack(side=tk.LEFT)
         self.section_delete_btn = ttk.Button(section_btn_row, text="Delete selected", command=self._on_delete_selected_section)
         self.section_delete_btn.pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(sections_panel, text="Clear sections", command=self._on_clear_sections).pack(fill=tk.X, pady=(0, 2))
-        ttk.Button(sections_panel, text="Save sections...", command=self._on_save_sections_json).pack(fill=tk.X, pady=2)
-        ttk.Button(sections_panel, text="Load sections...", command=self._on_load_sections_json).pack(fill=tk.X, pady=2)
+        ttk.Button(section_panel, text="Clear sections", command=self._on_clear_sections).pack(fill=tk.X, pady=(0, 2))
+        ttk.Button(section_panel, text="Save sections...", command=self._on_save_sections_json).pack(fill=tk.X, pady=2)
+        ttk.Button(section_panel, text="Load sections...", command=self._on_load_sections_json).pack(fill=tk.X, pady=2)
 
-        ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
-        ttk.Label(sections_panel, text="Selected ditch centerline:").pack(anchor="w", pady=(2, 0))
-        self.ditch_centerline_combo = ttk.Combobox(
-            sections_panel,
-            textvariable=self.active_ditch_centerline_var,
-            values=[],
-            state="readonly",
-            width=26,
-        )
-        self.ditch_centerline_combo.pack(fill=tk.X, pady=(2, 2))
-        self.ditch_centerline_combo.bind("<<ComboboxSelected>>", self._on_ditch_centerline_select)
-        ditch_btn_row = ttk.Frame(sections_panel)
-        ditch_btn_row.pack(fill=tk.X, pady=(0, 2))
-        self.ditch_zoom_btn = ttk.Button(ditch_btn_row, text="Zoom selected ditch", command=self._on_zoom_selected_ditch)
-        self.ditch_zoom_btn.pack(side=tk.LEFT)
-        self.ditch_delete_btn = ttk.Button(ditch_btn_row, text="Delete selected ditch", command=self._on_delete_selected_ditch)
-        self.ditch_delete_btn.pack(side=tk.LEFT, padx=(4, 0))
-        self.ditch_clear_btn = ttk.Button(sections_panel, text="Clear ditch centerlines", command=self._on_clear_ditch_centerlines)
-        self.ditch_clear_btn.pack(fill=tk.X, pady=(0, 2))
-        self.ditch_config_btn = ttk.Button(sections_panel, text="Ditch setup...", command=self._on_open_ditch_setup)
-        self.ditch_config_btn.pack(fill=tk.X, pady=2)
-
-        ttk.Label(sections_panel, text="Report template:").pack(anchor="w", pady=(2, 0))
+        ttk.Label(section_panel, text="Report template:").pack(anchor="w", pady=(2, 0))
         self.report_template_combo = ttk.Combobox(
-            sections_panel,
+            section_panel,
             textvariable=self.report_template,
             values=["standard", "compact"],
             state="readonly",
@@ -1115,9 +1128,9 @@ class KOFViewer(tk.Tk):
         )
         self.report_template_combo.pack(fill=tk.X, pady=(2, 2))
 
-        ttk.Label(sections_panel, text="Report theme:").pack(anchor="w", pady=(2, 0))
+        ttk.Label(section_panel, text="Report theme:").pack(anchor="w", pady=(2, 0))
         self.report_theme_combo = ttk.Combobox(
-            sections_panel,
+            section_panel,
             textvariable=self.report_theme,
             values=["auto", "light", "dark", "print"],
             state="readonly",
@@ -1125,12 +1138,35 @@ class KOFViewer(tk.Tk):
         )
         self.report_theme_combo.pack(fill=tk.X, pady=(2, 2))
 
-        ttk.Button(sections_panel, text="Export section report...", command=self._on_export_section_report).pack(fill=tk.X, pady=2)
-        ttk.Button(sections_panel, text="Open section report in browser...", command=self._on_open_section_report_browser).pack(fill=tk.X, pady=2)
-        ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
-        ttk.Label(sections_panel, text="Active mask:").pack(anchor="w")
+        ttk.Button(section_panel, text="Export section report...", command=self._on_export_section_report).pack(fill=tk.X, pady=2)
+        ttk.Button(section_panel, text="Open section report in browser...", command=self._on_open_section_report_browser).pack(fill=tk.X, pady=2)
+
+        ditch_panel = self._add_collapsible_panel(parent, "Ditch", expanded=False)
+        ttk.Label(ditch_panel, text="Selected ditch centerline:").pack(anchor="w", pady=(2, 0))
+        self.ditch_centerline_combo = ttk.Combobox(
+            ditch_panel,
+            textvariable=self.active_ditch_centerline_var,
+            values=[],
+            state="readonly",
+            width=26,
+        )
+        self.ditch_centerline_combo.pack(fill=tk.X, pady=(2, 2))
+        self.ditch_centerline_combo.bind("<<ComboboxSelected>>", self._on_ditch_centerline_select)
+        ditch_btn_row = ttk.Frame(ditch_panel)
+        ditch_btn_row.pack(fill=tk.X, pady=(0, 2))
+        self.ditch_zoom_btn = ttk.Button(ditch_btn_row, text="Zoom selected ditch", command=self._on_zoom_selected_ditch)
+        self.ditch_zoom_btn.pack(side=tk.LEFT)
+        self.ditch_delete_btn = ttk.Button(ditch_btn_row, text="Delete selected ditch", command=self._on_delete_selected_ditch)
+        self.ditch_delete_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.ditch_clear_btn = ttk.Button(ditch_panel, text="Clear ditch centerlines", command=self._on_clear_ditch_centerlines)
+        self.ditch_clear_btn.pack(fill=tk.X, pady=(0, 2))
+        self.ditch_config_btn = ttk.Button(ditch_panel, text="Ditch setup...", command=self._on_open_ditch_setup)
+        self.ditch_config_btn.pack(fill=tk.X, pady=2)
+
+        mask_panel = self._add_collapsible_panel(parent, "Mask", expanded=False)
+        ttk.Label(mask_panel, text="Active mask:").pack(anchor="w")
         self.mask_combo = ttk.Combobox(
-            sections_panel,
+            mask_panel,
             textvariable=self.active_mask_var,
             values=[],
             state="readonly",
@@ -1138,36 +1174,127 @@ class KOFViewer(tk.Tk):
         )
         self.mask_combo.pack(fill=tk.X, pady=(2, 4))
         self.mask_combo.bind("<<ComboboxSelected>>", self._on_mask_select)
-        ttk.Label(sections_panel, text="Compute mask scope:").pack(anchor="w", pady=(2, 0))
+        ttk.Label(mask_panel, text="Compute mask scope:").pack(anchor="w", pady=(2, 0))
         self.mask_scope_combo = ttk.Combobox(
-            sections_panel,
+            mask_panel,
             textvariable=self.mask_compute_scope,
             values=list(MASK_SCOPE_LABELS.values()),
             state="readonly",
             width=26,
         )
         self.mask_scope_combo.pack(fill=tk.X, pady=(2, 4))
-        ttk.Label(sections_panel, text="Mask visibility:").pack(anchor="w", pady=(2, 0))
-        self.mask_visibility_frame = ttk.Frame(sections_panel)
+        ttk.Label(mask_panel, text="Mask visibility:").pack(anchor="w", pady=(2, 0))
+        self.mask_visibility_frame = ttk.Frame(mask_panel)
         self.mask_visibility_frame.pack(fill=tk.X, pady=(2, 2))
-        vis_btn_row = ttk.Frame(sections_panel)
+        vis_btn_row = ttk.Frame(mask_panel)
         vis_btn_row.pack(fill=tk.X, pady=(0, 2))
         ttk.Button(vis_btn_row, text="Show all", command=lambda: self._set_all_masks_visible(True)).pack(side=tk.LEFT)
         ttk.Button(vis_btn_row, text="Hide all", command=lambda: self._set_all_masks_visible(False)).pack(side=tk.LEFT, padx=(4, 0))
-        self.mask_edit_btn = ttk.Button(sections_panel, text="Edit selected mask", command=self._on_toggle_mask_edit)
+        self.mask_edit_btn = ttk.Button(mask_panel, text="Edit selected mask", command=self._on_toggle_mask_edit)
         self.mask_edit_btn.pack(fill=tk.X, pady=2)
-        self.mask_buffer_btn = ttk.Button(sections_panel, text="Buffer selected mask...", command=self._on_buffer_selected_mask)
+        self.mask_buffer_btn = ttk.Button(mask_panel, text="Buffer selected mask...", command=self._on_buffer_selected_mask)
         self.mask_buffer_btn.pack(fill=tk.X, pady=2)
-        self.mask_delete_btn = ttk.Button(sections_panel, text="Delete selected mask", command=self._on_delete_selected_mask)
+        self.mask_delete_btn = ttk.Button(mask_panel, text="Delete selected mask", command=self._on_delete_selected_mask)
         self.mask_delete_btn.pack(fill=tk.X, pady=2)
-        self.mask_clear_btn = ttk.Button(sections_panel, text="Clear all masks", command=self._on_clear_mask)
+        self.mask_clear_btn = ttk.Button(mask_panel, text="Clear all masks", command=self._on_clear_mask)
         self.mask_clear_btn.pack(fill=tk.X, pady=2)
-        ttk.Button(sections_panel, text="Save masks...", command=self._on_save_mask_json).pack(fill=tk.X, pady=2)
-        ttk.Button(sections_panel, text="Load masks...", command=self._on_load_mask_json).pack(fill=tk.X, pady=2)
-        ttk.Separator(sections_panel, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=6)
-        self.measure_toggle_btn = ttk.Button(sections_panel, text="Start measure", command=self._on_toggle_measure)
+        ttk.Button(mask_panel, text="Save masks...", command=self._on_save_mask_json).pack(fill=tk.X, pady=2)
+        ttk.Button(mask_panel, text="Load masks...", command=self._on_load_mask_json).pack(fill=tk.X, pady=2)
+
+        pit_panel = self._add_collapsible_panel(parent, "Pit", expanded=False)
+        ttk.Label(pit_panel, text="Active pit polygon:").pack(anchor="w")
+        self.pit_combo = ttk.Combobox(
+            pit_panel,
+            textvariable=self.active_pit_var,
+            values=[],
+            state="readonly",
+            width=26,
+        )
+        self.pit_combo.pack(fill=tk.X, pady=(2, 4))
+        self.pit_combo.bind("<<ComboboxSelected>>", self._on_pit_select)
+
+        ttk.Label(pit_panel, text="Pit compute scope:").pack(anchor="w", pady=(2, 0))
+        self.pit_scope_combo = ttk.Combobox(
+            pit_panel,
+            textvariable=self.pit_compute_scope,
+            values=list(PIT_SCOPE_LABELS.values()),
+            state="readonly",
+            width=26,
+        )
+        self.pit_scope_combo.pack(fill=tk.X, pady=(2, 4))
+
+        ttk.Label(pit_panel, text="Target Z (m) for active pit:").pack(anchor="w", pady=(2, 0))
+        self.pit_target_spin = ttk.Spinbox(
+            pit_panel,
+            from_=-10000.0,
+            to=10000.0,
+            increment=0.1,
+            textvariable=self.pit_target_z_var,
+            width=12,
+            command=self._on_update_active_pit_target_z,
+        )
+        self.pit_target_spin.pack(anchor="w", pady=(2, 4))
+        self.pit_target_spin.bind("<Return>", lambda _e: self._on_update_active_pit_target_z())
+        self.pit_target_spin.bind("<FocusOut>", lambda _e: self._on_update_active_pit_target_z())
+
+        ttk.Label(pit_panel, text="Pit edge slope (m/m):").pack(anchor="w", pady=(2, 0))
+        self.pit_edge_slope_spin = ttk.Spinbox(
+            pit_panel,
+            from_=-1000.0,
+            to=1000.0,
+            increment=0.1,
+            textvariable=self.pit_edge_slope_var,
+            width=12,
+            command=self._on_pit_settings_change,
+        )
+        self.pit_edge_slope_spin.pack(anchor="w", pady=(2, 4))
+        self.pit_edge_slope_spin.bind("<Return>", lambda _e: self._on_pit_settings_change())
+        self.pit_edge_slope_spin.bind("<FocusOut>", lambda _e: self._on_pit_settings_change())
+
+        stop_row = ttk.Frame(pit_panel)
+        stop_row.pack(fill=tk.X, pady=(0, 4))
+        ttk.Label(stop_row, text="Stop layer:").pack(side=tk.LEFT)
+        self.pit_stop_material_combo = ttk.Combobox(
+            stop_row,
+            textvariable=self.pit_stop_material_var,
+            values=["", "rock", "moist"],
+            width=9,
+            state="readonly",
+        )
+        self.pit_stop_material_combo.pack(side=tk.LEFT, padx=(4, 4))
+        self.pit_stop_material_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_pit_settings_change())
+        self.pit_stop_slot_spin = ttk.Spinbox(
+            stop_row,
+            from_=0,
+            to=9,
+            textvariable=self.pit_stop_slot_var,
+            width=4,
+            command=self._on_pit_settings_change,
+        )
+        self.pit_stop_slot_spin.pack(side=tk.LEFT)
+        self.pit_stop_slot_spin.bind("<Return>", lambda _e: self._on_pit_settings_change())
+        self.pit_stop_slot_spin.bind("<FocusOut>", lambda _e: self._on_pit_settings_change())
+
+        ttk.Label(pit_panel, text="Pit visibility:").pack(anchor="w", pady=(2, 0))
+        self.pit_visibility_frame = ttk.Frame(pit_panel)
+        self.pit_visibility_frame.pack(fill=tk.X, pady=(2, 2))
+        pit_vis_btn_row = ttk.Frame(pit_panel)
+        pit_vis_btn_row.pack(fill=tk.X, pady=(0, 2))
+        ttk.Button(pit_vis_btn_row, text="Show all", command=lambda: self._set_all_pits_visible(True)).pack(side=tk.LEFT)
+        ttk.Button(pit_vis_btn_row, text="Hide all", command=lambda: self._set_all_pits_visible(False)).pack(side=tk.LEFT, padx=(4, 0))
+
+        self.pit_edit_btn = ttk.Button(pit_panel, text="Edit selected pit", command=self._on_toggle_pit_edit)
+        self.pit_edit_btn.pack(fill=tk.X, pady=2)
+        self.pit_delete_btn = ttk.Button(pit_panel, text="Delete selected pit", command=self._on_delete_selected_pit)
+        self.pit_delete_btn.pack(fill=tk.X, pady=2)
+        self.pit_clear_btn = ttk.Button(pit_panel, text="Clear all pits", command=self._on_clear_pits)
+        self.pit_clear_btn.pack(fill=tk.X, pady=2)
+
+        measure_panel = self._add_collapsible_panel(parent, "Measure", expanded=False)
+        ttk.Label(measure_panel, text="Measurement tools:").pack(anchor="w", pady=(2, 0))
+        self.measure_toggle_btn = ttk.Button(measure_panel, text="Start measure", command=self._on_toggle_measure)
         self.measure_toggle_btn.pack(fill=tk.X, pady=2)
-        self.measure_clear_btn = ttk.Button(sections_panel, text="Clear measurements", command=self._on_clear_measurements)
+        self.measure_clear_btn = ttk.Button(measure_panel, text="Clear measurements", command=self._on_clear_measurements)
         self.measure_clear_btn.pack(fill=tk.X, pady=2)
 
         schema_panel = self._add_collapsible_panel(parent, "LandXML schema", expanded=False)
@@ -1177,6 +1304,7 @@ class KOFViewer(tk.Tk):
 
         self._on_intermediate_type_change()
         self._refresh_mask_controls()
+        self._refresh_pit_controls()
         self._refresh_section_controls()
         self._refresh_ditch_controls()
 
@@ -1453,6 +1581,7 @@ class KOFViewer(tk.Tk):
         reset_for_clear(self)
         self._undo.clear()
         self._refresh_mask_controls()
+        self._refresh_pit_controls()
         self._refresh_section_controls()
         self._refresh_ditch_controls()
         self._refresh_mask_result_actions()
@@ -1571,6 +1700,180 @@ class KOFViewer(tk.Tk):
         if idx is None or idx < 0 or idx >= len(self._masks):
             return None
         return self._masks[idx]
+
+    @staticmethod
+    def _pit_base_name(index: int) -> str:
+        return f"Pit {KOFViewer._section_label(index)}"
+
+    def _next_pit_name(self) -> str:
+        used = {p.name for p in self._pit_polygons}
+        idx = 0
+        while True:
+            candidate = self._pit_base_name(idx)
+            if candidate not in used:
+                return candidate
+            idx += 1
+
+    def _dedupe_pit_name(self, name: str) -> str:
+        candidate = (name or "").strip() or self._next_pit_name()
+        used = {p.name for p in self._pit_polygons}
+        if candidate not in used:
+            return candidate
+        suffix = 2
+        while f"{candidate} ({suffix})" in used:
+            suffix += 1
+        return f"{candidate} ({suffix})"
+
+    def _set_active_pit_index(self, index: Optional[int]) -> None:
+        if index is None or index < 0 or index >= len(self._pit_polygons):
+            self._active_pit_index = None
+            self.active_pit_var.set("")
+            return
+        self._active_pit_index = index
+        self.active_pit_var.set(self._pit_polygons[index].name)
+
+    def _active_pit(self) -> Optional[PitPolygon]:
+        idx = self._active_pit_index
+        if idx is None or idx < 0 or idx >= len(self._pit_polygons):
+            return None
+        return self._pit_polygons[idx]
+
+    def _pit_is_visible(self, index: int) -> bool:
+        if index < 0 or index >= len(self._pit_polygons):
+            return False
+        if index >= len(self._pit_visibility_vars):
+            return bool(self._pit_polygons[index].visible)
+        return bool(self._pit_visibility_vars[index].get())
+
+    def _sync_pit_visible_flag(self, index: int) -> None:
+        if index < 0 or index >= len(self._pit_polygons):
+            return
+        self._pit_polygons[index].visible = self._pit_is_visible(index)
+
+    def _on_toggle_pit_visibility(self, index: int) -> None:
+        self._sync_pit_visible_flag(index)
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._redraw_2d()
+
+    def _set_all_pits_visible(self, visible: bool) -> None:
+        if not self._pit_polygons:
+            return
+        for idx, var in enumerate(self._pit_visibility_vars):
+            var.set(bool(visible))
+            if idx < len(self._pit_polygons):
+                self._pit_polygons[idx].visible = bool(visible)
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._redraw_2d()
+
+    def _append_pit_polygon(
+        self,
+        vertices: list[tuple[float, float]],
+        name: Optional[str] = None,
+        *,
+        target_z: Optional[float] = None,
+        visible: bool = True,
+        track_undo: bool = True,
+        undo_label: str = "Add pit",
+    ) -> None:
+        if len(vertices) < 3:
+            return
+        before = self._capture_edit_snapshot() if track_undo else None
+        pit_name = self._dedupe_pit_name(name or self._next_pit_name())
+        tz = float(self.pit_target_z_var.get()) if target_z is None else float(target_z)
+        self._pit_polygons.append(PitPolygon(name=pit_name, vertices=list(vertices), target_z=tz, visible=bool(visible)))
+        self._pit_visibility_vars.append(tk.BooleanVar(value=bool(visible)))
+        self._set_active_pit_index(len(self._pit_polygons) - 1)
+        self._on_pit_settings_change()
+        if before is not None:
+            self._record_undoable_edit(undo_label, before)
+
+    def _on_update_active_pit_target_z(self) -> None:
+        active = self._active_pit()
+        if active is None:
+            return
+        try:
+            target_z = float(self.pit_target_z_var.get())
+        except (TypeError, ValueError, tk.TclError):
+            return
+        if not np.isfinite(target_z):
+            return
+        before = self._capture_edit_snapshot()
+        active.target_z = float(target_z)
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._refresh_pit_controls()
+        self._redraw_2d()
+        self._record_undoable_edit("Update pit target Z", before)
+
+    def _on_pit_settings_change(self) -> None:
+        try:
+            slope = float(self.pit_edge_slope_var.get())
+        except (TypeError, ValueError, tk.TclError):
+            slope = 1.0
+        if not np.isfinite(slope):
+            slope = 1.0
+        material = self.pit_stop_material_var.get().strip().lower()
+        if material not in {"rock", "moist"}:
+            material = None
+        try:
+            slot = int(self.pit_stop_slot_var.get())
+        except (TypeError, ValueError, tk.TclError):
+            slot = None
+        if slot is not None and (slot < 0 or slot > 9):
+            slot = None
+        self._pit_settings = PitSettings(edge_slope=float(slope), stop_material=material, stop_slot=slot)
+
+    def _refresh_pit_controls(self) -> None:
+        if hasattr(self, "pit_combo"):
+            names = [p.name for p in self._pit_polygons]
+            self.pit_combo.configure(values=names)
+            if names and self._active_pit_index is not None and 0 <= self._active_pit_index < len(names):
+                self.active_pit_var.set(names[self._active_pit_index])
+            else:
+                self.active_pit_var.set("")
+
+        while len(self._pit_visibility_vars) > len(self._pit_polygons):
+            self._pit_visibility_vars.pop()
+        while len(self._pit_visibility_vars) < len(self._pit_polygons):
+            idx = len(self._pit_visibility_vars)
+            self._pit_visibility_vars.append(tk.BooleanVar(value=bool(self._pit_polygons[idx].visible)))
+        for idx, pit in enumerate(self._pit_polygons):
+            self._pit_visibility_vars[idx].set(bool(pit.visible))
+
+        if hasattr(self, "pit_visibility_frame"):
+            for widget in getattr(self, "_pit_visibility_checks", []):
+                widget.destroy()
+            self._pit_visibility_checks = []
+            for idx, pit in enumerate(self._pit_polygons):
+                chk = ttk.Checkbutton(
+                    self.pit_visibility_frame,
+                    text=pit.name,
+                    variable=self._pit_visibility_vars[idx],
+                    command=lambda i=idx: self._on_toggle_pit_visibility(i),
+                )
+                chk.pack(anchor="w")
+                self._pit_visibility_checks.append(chk)
+
+        active = self._active_pit()
+        has_active = active is not None
+        has_any = bool(self._pit_polygons)
+        if hasattr(self, "pit_edit_btn"):
+            self.pit_edit_btn.configure(state="normal" if has_active else "disabled")
+        if hasattr(self, "pit_delete_btn"):
+            self.pit_delete_btn.configure(state="normal" if has_active else "disabled")
+        if hasattr(self, "pit_clear_btn"):
+            self.pit_clear_btn.configure(state="normal" if has_any else "disabled")
+        if hasattr(self, "pit_target_spin"):
+            self.pit_target_spin.configure(state="normal" if has_active else "disabled")
+
+        if active is not None:
+            self.pit_target_z_var.set(float(active.target_z))
+
+        self.pit_edge_slope_var.set(float(self._pit_settings.edge_slope))
+        self.pit_stop_material_var.set(self._pit_settings.stop_material or "")
+        self.pit_stop_slot_var.set(str(self._pit_settings.stop_slot if self._pit_settings.stop_slot is not None else 0))
 
     def _mask_is_visible(self, index: int) -> bool:
         if index < 0 or index >= len(self._masks):
@@ -1979,6 +2282,8 @@ class KOFViewer(tk.Tk):
             "sections": list(self._sections),
             "plan_raster": self._top_visible_raster_layer(),
             "mask_rows": list(self._last_volume_per_mask_rows),
+            "pit_scope": self._current_pit_scope_key(),
+            "pit_count": len(self._pit_polygons),
             "report_template": self.report_template.get().strip().lower() or "standard",
             "report_theme": self._resolved_report_theme(),
             "input_file_names": [k.name for k in self.files],
@@ -2635,6 +2940,12 @@ class KOFViewer(tk.Tk):
                 _warn("Selected intermediate raster is not a supported single-band elevation raster.")
                 return None
             return layer.elevation_surface
+        if key == "pit":
+            pit_surface = self._pit_surface_for_scope(show_warnings=show_warnings)
+            if pit_surface is None:
+                _warn("No valid pit surface could be built for the selected pit scope.")
+                return None
+            return pit_surface
         if key == "constant":
             try:
                 z_val = float(self.intermediate_constant_z.get())
@@ -2690,6 +3001,12 @@ class KOFViewer(tk.Tk):
         if mode == "raster_minus_top" and raster is not None:
             return raster, top, raster.name, top.name
 
+        if mode == "top_minus_pit":
+            pit_surface = self._pit_surface_for_scope(show_warnings=False)
+            if pit_surface is not None:
+                pit_name = getattr(pit_surface, "name", "Pit surface")
+                return top, pit_surface, top.name, pit_name
+
         return top, bottom, top.name, bottom.name
 
     def _current_mask_scope_key(self) -> str:
@@ -2709,6 +3026,38 @@ class KOFViewer(tk.Tk):
         if scope == "all_union":
             return list(range(len(self._masks)))
         return []
+
+    def _current_pit_scope_key(self) -> str:
+        label = self.pit_compute_scope.get().strip()
+        return PIT_LABEL_TO_SCOPE.get(label, "selected")
+
+    def _pit_indices_for_compute(self, scope: str) -> list[int]:
+        if not self._pit_polygons:
+            return []
+        if scope == "selected":
+            idx = self._active_pit_index
+            if idx is None or idx < 0 or idx >= len(self._pit_polygons):
+                return []
+            return [idx]
+        if scope == "visible":
+            return [idx for idx in range(len(self._pit_polygons)) if self._pit_is_visible(idx)]
+        if scope == "all":
+            return list(range(len(self._pit_polygons)))
+        return []
+
+    def _pit_surface_for_scope(self, *, show_warnings: bool = True) -> Optional[SurfaceLike]:
+        scope = self._current_pit_scope_key()
+        indices = self._pit_indices_for_compute(scope)
+        if not indices:
+            if show_warnings:
+                messagebox.showwarning("KOF Viewer", "No pit polygons available for selected pit scope.")
+            return None
+
+        self._on_pit_settings_change()
+        polygons = [self._pit_polygons[idx] for idx in indices if 0 <= idx < len(self._pit_polygons)]
+        surface_lookup = {surface.name: surface for surface in self.files}
+        stop_surface = resolve_stop_surface(self._pit_settings, self._ditch_layer_catalog, surface_lookup)
+        return TheoreticalPitSurface(polygons, self._pit_settings, stop_surface=stop_surface)
 
     @staticmethod
     def _polygon_from_geom(geom) -> list[list[tuple[float, float]]]:  # noqa: ANN001
@@ -3021,6 +3370,15 @@ class KOFViewer(tk.Tk):
                 return
             top_surface = elev
             bottom_surface = top
+        elif mode == "top_minus_pit":
+            if top is None:
+                messagebox.showwarning("KOF Viewer", "Select a top KOF surface.")
+                return
+            pit_surface = self._pit_surface_for_scope(show_warnings=True)
+            if pit_surface is None:
+                return
+            top_surface = top
+            bottom_surface = pit_surface
         else:
             messagebox.showwarning("KOF Viewer", f"Unknown volume mode: {mode}")
             return
@@ -3703,6 +4061,84 @@ class KOFViewer(tk.Tk):
         self._refresh_mask_controls()
         self._redraw()
 
+    # ------------------------------------------------------ Pit polygons
+    def _on_pit_select(self, _event=None) -> None:  # noqa: ANN001
+        selected = self.active_pit_var.get().strip()
+        for idx, pit in enumerate(self._pit_polygons):
+            if pit.name == selected:
+                self._set_active_pit_index(idx)
+                self._refresh_pit_controls()
+                self._redraw_2d()
+                return
+
+    def _on_toggle_pit(self) -> None:
+        PitTool.toggle(self)
+
+    def _cancel_pit_mode(self) -> None:
+        PitTool.cancel(self)
+
+    def _end_pit_mode(self) -> None:
+        PitTool.end(self)
+
+    def _on_pit_click(self, event) -> None:  # noqa: ANN001
+        PitTool.on_click(self, event)
+
+    def _on_toggle_pit_edit(self) -> None:
+        PitEditTool.toggle(self)
+
+    def _end_pit_edit_mode(self) -> None:
+        PitEditTool.end(self)
+
+    def _on_pit_edit_press(self, event) -> None:  # noqa: ANN001
+        PitEditTool.on_press(self, event)
+
+    def _on_pit_edit_motion(self, event) -> None:  # noqa: ANN001
+        PitEditTool.on_motion(self, event)
+
+    def _on_pit_edit_release(self, event) -> None:  # noqa: ANN001
+        PitEditTool.on_release(self, event)
+
+    def _on_delete_selected_pit(self) -> None:
+        idx = self._active_pit_index
+        if idx is None or idx < 0 or idx >= len(self._pit_polygons):
+            return
+        before = self._capture_edit_snapshot()
+        if self._pit_mode:
+            self._end_pit_mode()
+        del self._pit_polygons[idx]
+        if idx < len(self._pit_visibility_vars):
+            del self._pit_visibility_vars[idx]
+        if self._pit_edit_mode:
+            self._end_pit_edit_mode()
+        if not self._pit_polygons:
+            self._set_active_pit_index(None)
+        else:
+            self._set_active_pit_index(min(idx, len(self._pit_polygons) - 1))
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._refresh_pit_controls()
+        self._redraw()
+        self._record_undoable_edit("Delete selected pit", before)
+
+    def _on_clear_pits(self) -> None:
+        had_pits = bool(self._pit_polygons)
+        before = self._capture_edit_snapshot() if had_pits else None
+        self._pit_polygons.clear()
+        self._pit_visibility_vars.clear()
+        self._active_pit_index = None
+        self.active_pit_var.set("")
+        self._pit_click_points.clear()
+        if self._pit_mode:
+            self._end_pit_mode()
+        if self._pit_edit_mode:
+            self._end_pit_edit_mode()
+        if had_pits and self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._refresh_pit_controls()
+        self._redraw()
+        if before is not None:
+            self._record_undoable_edit("Clear pits", before)
+
     @staticmethod
     def _section_label(index: int) -> str:
         """Return A, B, ..., Z, AA, AB, ... for the given 0-based index."""
@@ -4259,6 +4695,14 @@ class KOFViewer(tk.Tk):
             "Volume cut (m3)": f"{cut_volume_m3:,.2f}",
             "Volume fill (m3)": f"{fill_volume_m3:,.2f}",
             "Latest volume per-mask": mask_report_text,
+            "Pit polygons": int(request.get("pit_count", 0)),
+            "Pit scope": str(request.get("pit_scope", "selected")),
+            "Pit edge slope (m/m)": f"{self._pit_settings.edge_slope:.3f}",
+            "Pit stop layer": (
+                f"{self._pit_settings.stop_material}:{self._pit_settings.stop_slot}"
+                if self._pit_settings.stop_material is not None
+                else "none"
+            ),
             "Ditch rules active": ", ".join(sorted(applied_ditch_rule_codes)) if applied_ditch_rule_codes else "none",
             "Ditch stop-layer hits": ", ".join(sorted(hit_stop_layers)) if hit_stop_layers else "none",
         }
@@ -4445,6 +4889,15 @@ class KOFViewer(tk.Tk):
             )
             for m in self._masks
         )
+        pit_checksum = tuple(
+            (
+                p.name,
+                bool(p.visible),
+                float(p.target_z),
+                tuple((float(pt[0]), float(pt[1])) for pt in p.vertices),
+            )
+            for p in self._pit_polygons
+        )
         measurement_checksum = tuple(
             tuple(sorted((str(k), repr(v)) for k, v in row.items()))
             for row in self._measure_results
@@ -4473,6 +4926,7 @@ class KOFViewer(tk.Tk):
             len(self.landxml_files),
             len(self._sections),
             len(self._masks),
+            len(self._pit_polygons),
             len(self._measure_results),
             len(self._notes),
             bool(self.show_labels.get()),
@@ -4486,10 +4940,13 @@ class KOFViewer(tk.Tk):
             self._section_mode,
             self._mask_mode,
             self._mask_edit_mode,
+            self._pit_mode,
+            self._pit_edit_mode,
             self._measure_mode,
             self._note_mode,
             len(self._section_click_points),
             len(self._mask_click_points),
+            len(self._pit_click_points),
             len(self._measure_click_points),
             self._active_section_marker_index,
             round(float(self._active_section_marker_chainage_m), 6)
@@ -4501,6 +4958,7 @@ class KOFViewer(tk.Tk):
             view_extent,
             section_checksum,
             mask_checksum,
+            pit_checksum,
             measurement_checksum,
             note_checksum,
         )
@@ -4564,6 +5022,10 @@ class KOFViewer(tk.Tk):
                 mode_text = "mask"
             elif self._mask_edit_mode:
                 mode_text = "mask-edit"
+            elif self._pit_mode:
+                mode_text = "pit"
+            elif self._pit_edit_mode:
+                mode_text = "pit-edit"
             elif self._measure_mode:
                 mode_text = "measure"
             elif self._note_mode:
@@ -4575,6 +5037,10 @@ class KOFViewer(tk.Tk):
         if self._mask_mode:
             return
         if self._mask_edit_mode:
+            return
+        if self._pit_mode:
+            return
+        if self._pit_edit_mode:
             return
         if self._measure_mode:
             return
@@ -4620,6 +5086,16 @@ class KOFViewer(tk.Tk):
                 )
             else:
                 base += f"   |   masks: {len(self._masks)} ({n_visible_masks} visible)"
+        if self._pit_polygons:
+            active_pit = self._active_pit()
+            n_visible_pits = sum(1 for i in range(len(self._pit_polygons)) if self._pit_is_visible(i))
+            if active_pit is not None:
+                base += (
+                    f"   |   pits: {len(self._pit_polygons)} ({n_visible_pits} visible, "
+                    f"active: {active_pit.name}, z={active_pit.target_z:.2f} m)"
+                )
+            else:
+                base += f"   |   pits: {len(self._pit_polygons)} ({n_visible_pits} visible)"
         if self._raster_layers:
             state = "on" if self.show_raster.get() else "off"
             n_visible = sum(1 for r in self._raster_layers if r.visible.get())
