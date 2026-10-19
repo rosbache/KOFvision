@@ -27,9 +27,18 @@ Separates fragile schema mapping from Tk/UI code, making payload evolution and t
 
 ## Versioning
 
-- Current payload version: `2`.
-- Supported input versions: `1`, `2`.
-- `migrate_project_payload` upgrades v1 payloads by adding new optional fields.
+- Current payload version: `3`.
+- Supported input versions: `1`, `2`, `3`.
+- `migrate_project_payload` upgrades v1/v2 payloads by adding newer optional fields.
+
+### Pit settings payload
+
+`pit_settings` is stored centrally via `kofvision.pit` payload helpers and includes:
+
+- `edge_slope` (float)
+- `vertical_wall` (bool, default `false`)
+- `stop_material` (`rock`/`moist` or null)
+- `stop_slot` (`0..9` or null)
 
 ## Extension Guidance
 
