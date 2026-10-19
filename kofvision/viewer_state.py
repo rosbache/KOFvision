@@ -50,6 +50,7 @@ def reset_for_clear(viewer: Any) -> None:
     viewer._active_pit_index = None
     viewer.active_pit_var.set("")
     viewer._pit_settings = PitSettings()
+    viewer._pit_click_points.clear()
     viewer._notes.clear()
     viewer._note_visibility_vars.clear()
     viewer._active_note_index = None
@@ -62,6 +63,10 @@ def reset_for_clear(viewer: Any) -> None:
         viewer._end_ditch_mode()
     if viewer._mask_edit_mode:
         viewer._end_mask_edit_mode()
+    if getattr(viewer, "_pit_mode", False):
+        viewer._end_pit_mode()
+    if getattr(viewer, "_pit_edit_mode", False):
+        viewer._end_pit_edit_mode()
     if viewer._measure_mode:
         viewer._end_measure_mode()
     if viewer._note_mode:
@@ -94,6 +99,7 @@ def reset_for_project_load(viewer: Any) -> None:
     viewer._active_pit_index = None
     viewer.active_pit_var.set("")
     viewer._pit_settings = PitSettings()
+    viewer._pit_click_points.clear()
     viewer._notes.clear()
     viewer._note_visibility_vars.clear()
     viewer._active_note_index = None
@@ -110,6 +116,10 @@ def reset_for_project_load(viewer: Any) -> None:
         viewer.runtime_state.last_render_3d_signature = None
     if viewer._measure_mode:
         viewer._end_measure_mode()
+    if getattr(viewer, "_pit_mode", False):
+        viewer._end_pit_mode()
+    if getattr(viewer, "_pit_edit_mode", False):
+        viewer._end_pit_edit_mode()
     if getattr(viewer, "_ditch_mode", False):
         viewer._end_ditch_mode()
     if viewer._note_mode:
