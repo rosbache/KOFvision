@@ -355,6 +355,7 @@ class KOFViewer(tk.Tk):
         self._pit_visibility_checks: list[tk.Widget] = []
         self._last_volume_per_mask_rows: list[str] = []
         self._last_mask_volume_results: list[dict[str, Any]] = []
+        self._last_volume_result_item_kind = "mask"
         self._ditch_rules: list[DitchRule] = []
         self._ditch_layer_catalog = DitchLayerCatalog()
 
@@ -654,7 +655,7 @@ class KOFViewer(tk.Tk):
 
     # ------------------------------------------------------------------ UI
     def _build_toolbar(self) -> None:
-        top = ttk.Frame(self, style="TopBar.TFrame", padding=(8, 6, 8, 6))
+        top = ttk.Frame(self, style="TopBar.TFrame", padding=(8, 6, 8, 2))
         top.pack(side=tk.TOP, fill=tk.X)
 
         open_btn = self._make_toolbar_button(top, text="Open", command=self._on_open)
@@ -741,21 +742,22 @@ class KOFViewer(tk.Tk):
         self.theme_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.theme_btn, "Switch between dark and light application themes.")
 
-        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-
-        save_project_btn = self._make_toolbar_button(top, text="Save project", command=self._on_save_project)
-        save_project_btn.pack(side=tk.LEFT, padx=3)
-
-        load_project_btn = self._make_toolbar_button(top, text="Load project", command=self._on_load_project)
-        load_project_btn.pack(side=tk.LEFT, padx=3)
-
-        self.mode_badge = ttk.Label(top, text="Mode: idle", style="Muted.TLabel")
-        self.mode_badge.pack(side=tk.LEFT, padx=(8, 0))
-
         self._on_measure_mode_changed()
 
+        top_secondary = ttk.Frame(self, style="TopBar.TFrame", padding=(8, 0, 8, 6))
+        top_secondary.pack(side=tk.TOP, fill=tk.X)
+
+        save_project_btn = self._make_toolbar_button(top_secondary, text="Save project", command=self._on_save_project)
+        save_project_btn.pack(side=tk.LEFT, padx=3)
+
+        load_project_btn = self._make_toolbar_button(top_secondary, text="Load project", command=self._on_load_project)
+        load_project_btn.pack(side=tk.LEFT, padx=3)
+
+        self.mode_badge = ttk.Label(top_secondary, text="Mode: idle", style="Muted.TLabel")
+        self.mode_badge.pack(side=tk.LEFT, padx=(8, 0))
+
         ttk.Label(
-            top,
+            top_secondary,
             text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute, Ctrl+Shift+L ditch, Ctrl+Shift+P pit, Ctrl+Shift+N note",
             style="Muted.TLabel",
         ).pack(side=tk.RIGHT, padx=(8, 0))
@@ -1198,6 +1200,8 @@ class KOFViewer(tk.Tk):
         self.mask_delete_btn.pack(fill=tk.X, pady=2)
         self.mask_clear_btn = ttk.Button(mask_panel, text="Clear all masks", command=self._on_clear_mask)
         self.mask_clear_btn.pack(fill=tk.X, pady=2)
+        self.mask_to_pit_btn = ttk.Button(mask_panel, text="Convert selected mask -> pit", command=self._on_convert_selected_mask_to_pit)
+        self.mask_to_pit_btn.pack(fill=tk.X, pady=2)
         ttk.Button(mask_panel, text="Save masks...", command=self._on_save_mask_json).pack(fill=tk.X, pady=2)
         ttk.Button(mask_panel, text="Load masks...", command=self._on_load_mask_json).pack(fill=tk.X, pady=2)
 
@@ -1591,18 +1595,23 @@ class KOFViewer(tk.Tk):
 
     def _clear_cached_mask_volume_results(self) -> None:
         clear_cached_mask_volume_results(self)
+        self._last_volume_result_item_kind = "mask"
 
     def _refresh_mask_result_actions(self) -> None:
         has_results = bool(self._last_mask_volume_results)
         state = "normal" if has_results else "disabled"
+        item_label = "pit" if self._last_volume_result_item_kind == "pit" else "mask"
         if hasattr(self, "mask_results_popup_btn"):
             self.mask_results_popup_btn.configure(state=state)
+            self.mask_results_popup_btn.configure(text=f"{item_label.title()} results table...")
         if hasattr(self, "mask_results_export_btn"):
             self.mask_results_export_btn.configure(state=state)
+            self.mask_results_export_btn.configure(text=f"Export {item_label} CSV...")
 
     def _on_show_mask_results_table(self) -> None:
         if not self._last_mask_volume_results:
-            messagebox.showinfo("KOF Viewer", "No per-mask volume results available. Run Compute volume first.")
+            item_label = "pit" if self._last_volume_result_item_kind == "pit" else "mask"
+            messagebox.showinfo("KOF Viewer", f"No per-{item_label} volume results available. Run Compute volume first.")
             return
         self._cleanup_mask_results_windows()
         popup = MaskVolumeResultsWindow(self, self._last_mask_volume_results, theme_palette=self._theme)
@@ -1611,13 +1620,16 @@ class KOFViewer(tk.Tk):
     def _on_export_mask_results_csv(self) -> None:
         rows = self._last_mask_volume_results
         if not rows:
-            messagebox.showinfo("KOF Viewer", "No per-mask volume results available. Run Compute volume first.")
+            item_label = "pit" if self._last_volume_result_item_kind == "pit" else "mask"
+            messagebox.showinfo("KOF Viewer", f"No per-{item_label} volume results available. Run Compute volume first.")
             return
 
+        item_label = "pit" if self._last_volume_result_item_kind == "pit" else "mask"
+
         out_path = filedialog.asksaveasfilename(
-            title="Export mask volume summary CSV",
+            title=f"Export {item_label} volume summary CSV",
             defaultextension=".csv",
-            initialfile="mask_volume_summary.csv",
+            initialfile=f"{item_label}_volume_summary.csv",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
         )
         if not out_path:
@@ -1874,6 +1886,7 @@ class KOFViewer(tk.Tk):
         self.pit_edge_slope_var.set(float(self._pit_settings.edge_slope))
         self.pit_stop_material_var.set(self._pit_settings.stop_material or "")
         self.pit_stop_slot_var.set(str(self._pit_settings.stop_slot if self._pit_settings.stop_slot is not None else 0))
+        self._refresh_layer_controls()
 
     def _mask_is_visible(self, index: int) -> bool:
         if index < 0 or index >= len(self._masks):
@@ -1970,6 +1983,8 @@ class KOFViewer(tk.Tk):
             self.mask_buffer_btn.configure(state=edit_state)
         if hasattr(self, "mask_delete_btn"):
             self.mask_delete_btn.configure(state=edit_state)
+        if hasattr(self, "mask_to_pit_btn"):
+            self.mask_to_pit_btn.configure(state=edit_state)
         if hasattr(self, "mask_clear_btn"):
             self.mask_clear_btn.configure(state=any_state)
         self._refresh_layer_controls()
@@ -2402,6 +2417,17 @@ class KOFViewer(tk.Tk):
         self._refresh_mask_controls()
         self._redraw_2d()
 
+    def _on_layer_pit_item_click(self, index: int) -> None:
+        if index < 0 or index >= len(self._pit_polygons):
+            return
+        self._set_active_pit_index(index)
+        poly = list(self._pit_polygons[index].vertices)
+        if len(poly) >= 3:
+            self._zoom_to_bounds(self._polygon_bounds(poly))
+        self.notebook.select(0)
+        self._refresh_pit_controls()
+        self._redraw_2d()
+
     def _on_layer_note_item_click(self, index: int) -> None:
         if index < 0 or index >= len(self._notes):
             return
@@ -2715,6 +2741,34 @@ class KOFViewer(tk.Tk):
                 )
                 mask_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 mask_label.bind("<Button-1>", lambda _e, i=idx: self._on_layer_mask_item_click(i))
+
+        if self._pit_polygons:
+            ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(2, 4))
+            ttk.Label(self.layers_inner, text="Pits").pack(anchor="w")
+            while len(self._pit_visibility_vars) < len(self._pit_polygons):
+                idx = len(self._pit_visibility_vars)
+                self._pit_visibility_vars.append(tk.BooleanVar(value=bool(self._pit_polygons[idx].visible)))
+            for idx, pit in enumerate(self._pit_polygons):
+                self._pit_visibility_vars[idx].set(bool(pit.visible))
+                if not _matches(pit.name):
+                    continue
+                row = ttk.Frame(self.layers_inner)
+                row.pack(fill=tk.X, pady=1)
+                ttk.Checkbutton(
+                    row,
+                    variable=self._pit_visibility_vars[idx],
+                    command=lambda i=idx: self._on_toggle_pit_visibility(i),
+                ).pack(side=tk.LEFT)
+                is_active = idx == self._active_pit_index
+                pit_label = ttk.Label(
+                    row,
+                    text=f"{pit.name} ({pit.target_z:.2f} m)",
+                    foreground="#204080" if is_active else "",
+                    font=("TkDefaultFont", 9, "bold" if is_active else "normal"),
+                    cursor="hand2",
+                )
+                pit_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                pit_label.bind("<Button-1>", lambda _e, i=idx: self._on_layer_pit_item_click(i))
 
         if self._notes:
             ttk.Separator(self.layers_inner, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(2, 4))
@@ -3053,8 +3107,16 @@ class KOFViewer(tk.Tk):
                 messagebox.showwarning("KOF Viewer", "No pit polygons available for selected pit scope.")
             return None
 
+        return self._pit_surface_for_indices(indices)
+
+    def _pit_surface_for_indices(self, indices: list[int]) -> Optional[SurfaceLike]:
+        if not indices:
+            return None
+
         self._on_pit_settings_change()
         polygons = [self._pit_polygons[idx] for idx in indices if 0 <= idx < len(self._pit_polygons)]
+        if not polygons:
+            return None
         surface_lookup = {surface.name: surface for surface in self.files}
         stop_surface = resolve_stop_surface(self._pit_settings, self._ditch_layer_catalog, surface_lookup)
         return TheoreticalPitSurface(polygons, self._pit_settings, stop_surface=stop_surface)
@@ -3103,7 +3165,8 @@ class KOFViewer(tk.Tk):
         bottom_surface: SurfaceLike,
         intermediate_surface: Optional[SurfaceLike],
         mask_compute_polygons: list[list[tuple[float, float]]],
-        mask_indices: list[int],
+        item_kind: str,
+        item_indices: list[int],
         effective_method: str,
     ) -> dict[str, Any]:
         per_mask_rows: list[str] = []
@@ -3131,21 +3194,41 @@ class KOFViewer(tk.Tk):
                     partial_results.append(partial)
             result = self._combine_volume_results(partial_results)
 
-        if mask_indices:
-            for idx in mask_indices:
-                mask = self._masks[idx]
-                mask_result = self._compute_volume_for_mask(
-                    top_surface,
-                    bottom_surface,
-                    intermediate_surface,
-                    mask_polygon=list(mask.vertices),
-                    method=effective_method,
-                )
-                if mask_result is None:
-                    per_mask_rows.append(f"- {mask.name}: no overlap")
+        if item_indices:
+            for idx in item_indices:
+                if item_kind == "pit":
+                    if idx < 0 or idx >= len(self._pit_polygons):
+                        continue
+                    pit = self._pit_polygons[idx]
+                    display_name = pit.name
+                    local_bottom = self._pit_surface_for_indices([idx])
+                    if local_bottom is None:
+                        continue
+                    item_result = self._compute_volume_for_mask(
+                        top_surface,
+                        local_bottom,
+                        intermediate_surface,
+                        mask_polygon=None,
+                        method=effective_method,
+                    )
+                else:
+                    if idx < 0 or idx >= len(self._masks):
+                        continue
+                    mask = self._masks[idx]
+                    display_name = mask.name
+                    item_result = self._compute_volume_for_mask(
+                        top_surface,
+                        bottom_surface,
+                        intermediate_surface,
+                        mask_polygon=list(mask.vertices),
+                        method=effective_method,
+                    )
+
+                if item_result is None:
+                    per_mask_rows.append(f"- {display_name}: no overlap")
                     per_mask_result_rows.append(
                         {
-                            "mask_name": mask.name,
+                            "mask_name": display_name,
                             "area_m2": "",
                             "net_m3": "",
                             "cut_m3": "",
@@ -3160,26 +3243,27 @@ class KOFViewer(tk.Tk):
                         }
                     )
                     continue
-                if isinstance(mask_result, SplitVolumeResult):
-                    area_m2 = float(mask_result.upper.area)
-                    net_m3 = float(mask_result.net)
-                    cut_m3 = float(mask_result.cut)
-                    fill_m3 = float(mask_result.fill)
-                    upper_net_m3 = float(mask_result.upper.net)
-                    upper_cut_m3 = float(mask_result.upper.cut)
-                    upper_fill_m3 = float(mask_result.upper.fill)
-                    lower_net_m3 = float(mask_result.lower.net)
-                    lower_cut_m3 = float(mask_result.lower.cut)
-                    lower_fill_m3 = float(mask_result.lower.fill)
+
+                if isinstance(item_result, SplitVolumeResult):
+                    area_m2 = float(item_result.upper.area)
+                    net_m3 = float(item_result.net)
+                    cut_m3 = float(item_result.cut)
+                    fill_m3 = float(item_result.fill)
+                    upper_net_m3 = float(item_result.upper.net)
+                    upper_cut_m3 = float(item_result.upper.cut)
+                    upper_fill_m3 = float(item_result.upper.fill)
+                    lower_net_m3 = float(item_result.lower.net)
+                    lower_cut_m3 = float(item_result.lower.cut)
+                    lower_fill_m3 = float(item_result.lower.fill)
                     per_mask_rows.append(
-                        f"- {mask.name}: area {area_m2:,.1f} m2 | "
+                        f"- {display_name}: area {area_m2:,.1f} m2 | "
                         f"net {net_m3:+,.2f} m3 | "
                         f"top-intermediate {upper_net_m3:+,.2f} | "
                         f"intermediate-bottom {lower_net_m3:+,.2f}"
                     )
                     per_mask_result_rows.append(
                         {
-                            "mask_name": mask.name,
+                            "mask_name": display_name,
                             "area_m2": f"{area_m2:.6f}",
                             "net_m3": f"{net_m3:.6f}",
                             "cut_m3": f"{cut_m3:.6f}",
@@ -3194,17 +3278,17 @@ class KOFViewer(tk.Tk):
                         }
                     )
                 else:
-                    area_m2 = float(mask_result.area)
-                    net_m3 = float(mask_result.net)
-                    cut_m3 = float(mask_result.cut)
-                    fill_m3 = float(mask_result.fill)
+                    area_m2 = float(item_result.area)
+                    net_m3 = float(item_result.net)
+                    cut_m3 = float(item_result.cut)
+                    fill_m3 = float(item_result.fill)
                     per_mask_rows.append(
-                        f"- {mask.name}: area {area_m2:,.1f} m2 | "
+                        f"- {display_name}: area {area_m2:,.1f} m2 | "
                         f"net {net_m3:+,.2f} m3 | cut {cut_m3:,.2f} | fill {fill_m3:,.2f}"
                     )
                     per_mask_result_rows.append(
                         {
-                            "mask_name": mask.name,
+                            "mask_name": display_name,
                             "area_m2": f"{area_m2:.6f}",
                             "net_m3": f"{net_m3:.6f}",
                             "cut_m3": f"{cut_m3:.6f}",
@@ -3231,9 +3315,10 @@ class KOFViewer(tk.Tk):
         payload: dict[str, Any],
         mode: str,
         effective_method: str,
+        item_kind: str,
         scope: str,
         scope_label: str,
-        mask_indices: list[int],
+        item_indices: list[int],
     ) -> None:
         result = payload.get("result")
         per_mask_rows = list(payload.get("per_mask_rows", []))
@@ -3248,12 +3333,13 @@ class KOFViewer(tk.Tk):
 
         self.last_volume = result
         self._last_volume_per_mask_rows = list(per_mask_rows)
+        self._last_volume_result_item_kind = "pit" if item_kind == "pit" else "mask"
 
         if not per_mask_result_rows:
             if isinstance(result, SplitVolumeResult):
                 per_mask_result_rows.append(
                     {
-                        "mask_name": "(no mask)",
+                        "mask_name": f"(no {item_kind})",
                         "area_m2": f"{float(result.upper.area):.6f}",
                         "net_m3": f"{float(result.net):.6f}",
                         "cut_m3": f"{float(result.cut):.6f}",
@@ -3270,7 +3356,7 @@ class KOFViewer(tk.Tk):
             else:
                 per_mask_result_rows.append(
                     {
-                        "mask_name": "(no mask)",
+                        "mask_name": f"(no {item_kind})",
                         "area_m2": f"{float(result.area):.6f}",
                         "net_m3": f"{float(result.net):.6f}",
                         "cut_m3": f"{float(result.cut):.6f}",
@@ -3289,12 +3375,13 @@ class KOFViewer(tk.Tk):
         self._refresh_mask_result_actions()
 
         mask_suffix = ""
+        item_label = "pit" if item_kind == "pit" else "mask"
         if scope == "selected":
-            active = self._active_mask()
+            active = self._active_pit() if item_kind == "pit" else self._active_mask()
             if active is not None:
-                mask_suffix = f" (mask: {active.name})"
-        elif mask_indices:
-            mask_suffix = f" (scope: {scope_label}, masks: {len(mask_indices)})"
+                mask_suffix = f" ({item_label}: {active.name})"
+        elif item_indices:
+            mask_suffix = f" (scope: {scope_label}, {item_label}s: {len(item_indices)})"
 
         if isinstance(result, SplitVolumeResult):
             upper = result.upper
@@ -3384,8 +3471,13 @@ class KOFViewer(tk.Tk):
             return
 
         method = self.volume_method.get().strip().lower()
-        scope = self._current_mask_scope_key()
-        scope_label = MASK_SCOPE_LABELS.get(scope, MASK_SCOPE_LABELS["selected"])
+        item_kind = "pit" if mode == "top_minus_pit" else "mask"
+        if item_kind == "pit":
+            scope = self._current_pit_scope_key()
+            scope_label = PIT_SCOPE_LABELS.get(scope, PIT_SCOPE_LABELS["selected"])
+        else:
+            scope = self._current_mask_scope_key()
+            scope_label = MASK_SCOPE_LABELS.get(scope, MASK_SCOPE_LABELS["selected"])
 
         if method == "triangles" and intermediate_type != "none":
             messagebox.showwarning(
@@ -3408,15 +3500,16 @@ class KOFViewer(tk.Tk):
             )
             return
 
-        mask_indices = self._mask_indices_for_compute(scope)
+        mask_indices = self._mask_indices_for_compute(scope) if item_kind == "mask" else []
+        pit_indices = self._pit_indices_for_compute(scope) if item_kind == "pit" else []
         per_mask_rows: list[str] = []
         per_mask_result_rows: list[dict[str, Any]] = []
         effective_method = method
 
         union_polygons: list[list[tuple[float, float]]] = []
-        if scope == "selected":
+        if item_kind == "mask" and scope == "selected":
             union_polygons = [self._active_mask_polygon()] if self._active_mask_polygon() is not None else []
-        elif mask_indices:
+        elif item_kind == "mask" and mask_indices:
             try:
                 from shapely.geometry import Polygon
                 from shapely.ops import unary_union
@@ -3447,8 +3540,10 @@ class KOFViewer(tk.Tk):
                     "Mask union currently runs with raster method; switched from triangles for this computation.",
                 )
 
+        item_indices = pit_indices if item_kind == "pit" else mask_indices
+
         mask_compute_polygons = [p for p in union_polygons if p is not None and len(p) >= 3]
-        if scope != "selected" and mask_indices and not mask_compute_polygons:
+        if item_kind == "mask" and scope != "selected" and mask_indices and not mask_compute_polygons:
             messagebox.showerror(
                 "KOF Viewer",
                 "Could not build a valid union polygon from selected masks.",
@@ -3468,7 +3563,8 @@ class KOFViewer(tk.Tk):
                 bottom_surface=bottom_surface,
                 intermediate_surface=intermediate_surface,
                 mask_compute_polygons=mask_compute_polygons,
-                mask_indices=mask_indices,
+                item_kind=item_kind,
+                item_indices=item_indices,
                 effective_method=effective_method,
             )
 
@@ -3478,9 +3574,10 @@ class KOFViewer(tk.Tk):
                 payload=payload,
                 mode=mode,
                 effective_method=effective_method,
+                item_kind=item_kind,
                 scope=scope,
                 scope_label=scope_label,
-                mask_indices=mask_indices,
+                item_indices=item_indices,
             )
             self._update_status()
 
@@ -4059,6 +4156,38 @@ class KOFViewer(tk.Tk):
         if self.last_volume is not None:
             self.volume_text.set("Volume: (stale – recompute)")
         self._refresh_mask_controls()
+        self._redraw()
+
+    def _on_convert_selected_mask_to_pit(self) -> None:
+        active = self._active_mask()
+        if active is None or len(active.vertices) < 3:
+            messagebox.showinfo("KOF Viewer", "Select a closed mask first.")
+            return
+
+        default_z = float(self.pit_target_z_var.get())
+        target_z = simpledialog.askfloat(
+            "Convert mask to pit",
+            "Target pit elevation Z (m):",
+            initialvalue=default_z,
+        )
+        if target_z is None:
+            return
+        if not np.isfinite(target_z):
+            messagebox.showwarning("KOF Viewer", "Target Z must be a finite number.")
+            return
+
+        self.pit_target_z_var.set(float(target_z))
+        self._append_pit_polygon(
+            list(active.vertices),
+            name=f"{active.name} pit",
+            target_z=float(target_z),
+            visible=True,
+            track_undo=True,
+            undo_label="Convert mask to pit",
+        )
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._refresh_pit_controls()
         self._redraw()
 
     # ------------------------------------------------------ Pit polygons

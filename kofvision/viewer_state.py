@@ -10,6 +10,8 @@ def clear_cached_mask_volume_results(viewer: Any) -> None:
     """Clear cached per-mask compute results and refresh related UI actions."""
     viewer._last_volume_per_mask_rows.clear()
     viewer._last_mask_volume_results.clear()
+    if hasattr(viewer, "_last_volume_result_item_kind"):
+        viewer._last_volume_result_item_kind = "mask"
     viewer._refresh_mask_result_actions()
 
 
