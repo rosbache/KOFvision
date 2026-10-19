@@ -1086,14 +1086,14 @@ class KOFViewer(tk.Tk):
         mask_results_btn_row.pack(fill=tk.X, pady=(4, 0))
         self.mask_results_popup_btn = ttk.Button(
             mask_results_btn_row,
-            text="Mask results table...",
+            text="Mask volume report...",
             command=self._on_show_mask_results_table,
             state="disabled",
         )
         self.mask_results_popup_btn.pack(side=tk.LEFT)
         self.mask_results_export_btn = ttk.Button(
             mask_results_btn_row,
-            text="Export mask CSV...",
+            text="Export mask volume report CSV...",
             command=self._on_export_mask_results_csv,
             state="disabled",
         )
@@ -1612,10 +1612,10 @@ class KOFViewer(tk.Tk):
         item_label = "pit" if self._last_volume_result_item_kind == "pit" else "mask"
         if hasattr(self, "mask_results_popup_btn"):
             self.mask_results_popup_btn.configure(state=state)
-            self.mask_results_popup_btn.configure(text=f"{item_label.title()} results table...")
+            self.mask_results_popup_btn.configure(text=f"{item_label.title()} volume report...")
         if hasattr(self, "mask_results_export_btn"):
             self.mask_results_export_btn.configure(state=state)
-            self.mask_results_export_btn.configure(text=f"Export {item_label} CSV...")
+            self.mask_results_export_btn.configure(text=f"Export {item_label} volume report CSV...")
 
     def _on_show_mask_results_table(self) -> None:
         if not self._last_mask_volume_results:
@@ -1623,7 +1623,12 @@ class KOFViewer(tk.Tk):
             messagebox.showinfo("KOF Viewer", f"No per-{item_label} volume results available. Run Compute volume first.")
             return
         self._cleanup_mask_results_windows()
-        popup = MaskVolumeResultsWindow(self, self._last_mask_volume_results, theme_palette=self._theme)
+        popup = VolumeReportWindow(
+            self,
+            self._last_mask_volume_results,
+            item_kind=self._last_volume_result_item_kind,
+            theme_palette=self._theme,
+        )
         self._mask_results_windows.append(popup)
 
     def _on_export_mask_results_csv(self) -> None:
@@ -1644,8 +1649,9 @@ class KOFViewer(tk.Tk):
         if not out_path:
             return
 
+        item_name_field = f"{item_label}_name"
         fieldnames = [
-            "mask_name",
+            item_name_field,
             "area_m2",
             "net_m3",
             "cut_m3",
@@ -1665,7 +1671,7 @@ class KOFViewer(tk.Tk):
                 for row in rows:
                     writer.writerow(
                         {
-                            "mask_name": row.get("mask_name", ""),
+                            item_name_field: row.get("mask_name", ""),
                             "area_m2": row.get("area_m2", ""),
                             "net_m3": row.get("net_m3", ""),
                             "cut_m3": row.get("cut_m3", ""),
@@ -3188,6 +3194,7 @@ class KOFViewer(tk.Tk):
         item_kind: str,
         item_indices: list[int],
         effective_method: str,
+        pit_item_strategy: str,
     ) -> dict[str, Any]:
         per_mask_rows: list[str] = []
         per_mask_result_rows: list[dict[str, Any]] = []
@@ -3221,16 +3228,25 @@ class KOFViewer(tk.Tk):
                         continue
                     pit = self._pit_polygons[idx]
                     display_name = pit.name
-                    local_bottom = self._pit_surface_for_indices([idx])
-                    if local_bottom is None:
-                        continue
-                    item_result = self._compute_volume_for_mask(
-                        top_surface,
-                        local_bottom,
-                        intermediate_surface,
-                        mask_polygon=None,
-                        method=effective_method,
-                    )
+                    if pit_item_strategy == "clip_polygon":
+                        item_result = self._compute_volume_for_mask(
+                            top_surface,
+                            bottom_surface,
+                            intermediate_surface,
+                            mask_polygon=list(pit.vertices),
+                            method=effective_method,
+                        )
+                    else:
+                        local_bottom = self._pit_surface_for_indices([idx])
+                        if local_bottom is None:
+                            continue
+                        item_result = self._compute_volume_for_mask(
+                            top_surface,
+                            local_bottom,
+                            intermediate_surface,
+                            mask_polygon=None,
+                            method=effective_method,
+                        )
                 else:
                     if idx < 0 or idx >= len(self._masks):
                         continue
@@ -3491,7 +3507,8 @@ class KOFViewer(tk.Tk):
             return
 
         method = self.volume_method.get().strip().lower()
-        item_kind = "pit" if mode == "top_minus_pit" else "mask"
+        item_kind = "pit" if (mode == "top_minus_pit" or intermediate_type == "pit") else "mask"
+        pit_item_strategy = "local_bottom" if mode == "top_minus_pit" else "clip_polygon"
         if item_kind == "pit":
             scope = self._current_pit_scope_key()
             scope_label = PIT_SCOPE_LABELS.get(scope, PIT_SCOPE_LABELS["selected"])
@@ -3586,6 +3603,7 @@ class KOFViewer(tk.Tk):
                 item_kind=item_kind,
                 item_indices=item_indices,
                 effective_method=effective_method,
+                pit_item_strategy=pit_item_strategy,
             )
 
         def _on_success(payload: dict[str, Any]) -> None:
@@ -5587,8 +5605,8 @@ class SectionWindow(tk.Toplevel):
         self._set_chainage(chainage, notify=True, update_slider=False)
 
 
-class MaskVolumeResultsWindow(tk.Toplevel):
-    """Toplevel table view for per-mask volume summary rows."""
+class VolumeReportWindow(tk.Toplevel):
+    """Toplevel table view for per-item volume report rows."""
 
     @staticmethod
     def _fmt_num(raw: Any, *, signed: bool = False) -> str:
@@ -5636,11 +5654,19 @@ class MaskVolumeResultsWindow(tk.Toplevel):
         bb = int(round(b + (tb - b) * t))
         return f"#{rr:02x}{gg:02x}{bb:02x}"
 
-    def __init__(self, master: tk.Misc, rows: list[dict[str, Any]], theme_palette: Optional[dict[str, str]] = None) -> None:
+    def __init__(
+        self,
+        master: tk.Misc,
+        rows: list[dict[str, Any]],
+        *,
+        item_kind: str,
+        theme_palette: Optional[dict[str, str]] = None,
+    ) -> None:
         super().__init__(master)
         self._theme = dict(theme_palette or DARK_COLORS)
         self._rows = rows
-        self.title("Per-mask volume summary")
+        item_label = "Pit" if item_kind == "pit" else "Mask"
+        self.title(f"{item_label} volume report")
         self.geometry("1560x420")
         self.configure(background=self._theme["bg_root"])
 
@@ -5667,7 +5693,7 @@ class MaskVolumeResultsWindow(tk.Toplevel):
         )
         tree = ttk.Treeview(frame, columns=columns, show="headings", height=14, style=self._tree_style_name)
         self._tree = tree
-        tree.heading("mask", text="Mask")
+        tree.heading("mask", text=item_label)
         tree.heading("area", text="Area (m2)")
         tree.heading("net", text="Net (m3)")
         tree.heading("cut", text="Cut (m3)")
