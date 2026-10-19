@@ -128,6 +128,7 @@ from kofvision.ditch import (
     ditch_rules_to_payload,
     parse_ditch_rules,
 )
+from kofvision.pit import PitPolygon, PitSettings
 
 try:
     import customtkinter as ctk
@@ -329,6 +330,11 @@ class KOFViewer(tk.Tk):
         self._active_mask_index: Optional[int] = None
         self.active_mask_var = tk.StringVar(value="")
         self._mask_visibility_checks: list[tk.Widget] = []
+        self._pit_polygons: list[PitPolygon] = []
+        self._pit_visibility_vars: list[tk.BooleanVar] = []
+        self._active_pit_index: Optional[int] = None
+        self.active_pit_var = tk.StringVar(value="")
+        self._pit_settings = PitSettings()
         self._last_volume_per_mask_rows: list[str] = []
         self._last_mask_volume_results: list[dict[str, Any]] = []
         self._ditch_rules: list[DitchRule] = []
@@ -421,11 +427,14 @@ class KOFViewer(tk.Tk):
             sections=copy.deepcopy(self._sections),
             ditch_centerlines=copy.deepcopy(self._ditch_centerlines),
             masks=copy.deepcopy(self._masks),
+            pit_polygons=copy.deepcopy(self._pit_polygons),
+            pit_settings=copy.deepcopy(self._pit_settings),
             notes=copy.deepcopy(self._notes),
             measurements=copy.deepcopy(self._measure_results),
             active_section_index=self._active_section_index,
             active_ditch_centerline_index=self._active_ditch_centerline_index,
             active_mask_index=self._active_mask_index,
+            active_pit_index=self._active_pit_index,
             active_note_index=self._active_note_index,
         )
 
@@ -434,11 +443,14 @@ class KOFViewer(tk.Tk):
         self._sections = copy.deepcopy(snapshot.sections)
         self._ditch_centerlines = copy.deepcopy(snapshot.ditch_centerlines)
         self._masks = copy.deepcopy(snapshot.masks)
+        self._pit_polygons = copy.deepcopy(snapshot.pit_polygons)
+        self._pit_settings = copy.deepcopy(snapshot.pit_settings)
         self._notes = copy.deepcopy(snapshot.notes)
         self._measure_results = copy.deepcopy(snapshot.measurements)
         self._active_section_index = snapshot.active_section_index
         self._active_ditch_centerline_index = snapshot.active_ditch_centerline_index
         self._active_mask_index = snapshot.active_mask_index
+        self._active_pit_index = snapshot.active_pit_index
         self._active_note_index = snapshot.active_note_index
 
         self._clear_active_section_marker(redraw=False)
@@ -446,6 +458,7 @@ class KOFViewer(tk.Tk):
         self._measure_click_points.clear()
 
         self._mask_visibility_vars = [tk.BooleanVar(value=bool(m.visible)) for m in self._masks]
+        self._pit_visibility_vars = [tk.BooleanVar(value=bool(p.visible)) for p in self._pit_polygons]
         self._note_visibility_vars = [tk.BooleanVar(value=bool(n.visible)) for n in self._notes]
         self._clear_cached_mask_volume_results()
         if self.last_volume is not None:
