@@ -8,11 +8,16 @@ from kofvision.viewer_undo import EditSnapshot, UndoRedoManager
 def _snapshot(seed: int) -> EditSnapshot:
     return EditSnapshot(
         sections=[((0.0 + seed, 0.0), (1.0 + seed, 1.0))],
+        ditch_centerlines=[],
         masks=[],
+        pit_polygons=[],
+        pit_settings={"edge_slope": 1.0},
         notes=[],
         measurements=[],
         active_section_index=0,
+        active_ditch_centerline_index=None,
         active_mask_index=None,
+        active_pit_index=None,
         active_note_index=None,
     )
 

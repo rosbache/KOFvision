@@ -48,6 +48,13 @@ class _DummyViewer:
         self._active_ditch_centerline_index = 0
         self._masks = []
         self.active_mask_var = _Var("")
+        self._pit_polygons = []
+        self._pit_settings = type("_PitSettings", (), {
+            "edge_slope": 1.0,
+            "stop_material": None,
+            "stop_slot": None,
+        })()
+        self.active_pit_var = _Var("")
         self.runtime_state = _DummyRuntime(volume_history=[])
         self.theme_mode = _Var("dark")
         self.station_interval_m = _Var(10.0)
@@ -119,6 +126,20 @@ def test_validate_project_payload_migrates_v1_payload() -> None:
     assert validated["version"] == PROJECT_VERSION
     assert "volume_history" in validated
     assert "saved_preferences" in validated
+    assert "pit_polygons" in validated
+    assert "pit_settings" in validated
+
+
+def test_validate_project_payload_migrates_v2_payload() -> None:
+    payload = {
+        "type": PROJECT_TYPE,
+        "version": 2,
+        "source_files": [],
+    }
+    validated = validate_project_payload(payload)
+    assert validated["version"] == PROJECT_VERSION
+    assert "pit_polygons" in validated
+    assert "pit_settings" in validated
 
 
 def test_build_project_payload_includes_ditch_data() -> None:
@@ -127,3 +148,5 @@ def test_build_project_payload_includes_ditch_data() -> None:
     assert payload["active_ditch_centerline_index"] == 0
     assert payload["ditch_rules"][0]["code_label"] == "1.1"
     assert payload["ditch_layer_catalog"]["rock"][0] == "s0"
+    assert payload["pit_polygons"] == []
+    assert payload["pit_settings"]["edge_slope"] == 1.0
