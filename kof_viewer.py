@@ -61,6 +61,7 @@ from matplotlib.backends.backend_tkagg import (
     NavigationToolbar2Tk,
 )
 from matplotlib.figure import Figure
+from matplotlib.path import Path as MplPath
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
 from kofvision import compute_volume, compute_volume_with_intermediate, parse_kof, parse_landxml
@@ -3160,12 +3161,16 @@ class KOFViewer(tk.Tk):
         (y0, x0), (y1, x1) = self._sections[index]
         section_intermediate = self._section_intermediate_surface()
         area_top_surface, area_bottom_surface, area_top_name, area_bottom_name = self._section_area_pair(top, bottom)
+        mask_border_markers = self._section_mask_border_markers((y0, x0), (y1, x1))
+        mask_clip_polygons = self._visible_mask_polygons_for_section()
         window = SectionWindow(
             self,
             top,
             bottom,
             (y0, x0),
             (y1, x1),
+            mask_border_markers=mask_border_markers,
+            mask_clip_polygons=mask_clip_polygons,
             theme_palette=self._theme,
             raster_surface=self._section_reference_raster(),
             intermediate_surface=section_intermediate,
@@ -3178,6 +3183,83 @@ class KOFViewer(tk.Tk):
             on_chainage_change=self._on_section_window_chainage,
         )
         self._section_windows.append(window)
+
+    @staticmethod
+    def _segment_intersection_parameter(
+        p0: tuple[float, float],
+        p1: tuple[float, float],
+        q0: tuple[float, float],
+        q1: tuple[float, float],
+    ) -> Optional[float]:
+        """Return t in p0 + t*(p1-p0) where segments intersect, else None."""
+        sy = p1[0] - p0[0]
+        sx = p1[1] - p0[1]
+        ey = q1[0] - q0[0]
+        ex = q1[1] - q0[1]
+
+        denom = (sx * ey) - (sy * ex)
+        if abs(denom) <= 1e-12:
+            return None
+
+        dy = q0[0] - p0[0]
+        dx = q0[1] - p0[1]
+        t = ((dx * ey) - (dy * ex)) / denom
+        u = ((dx * sy) - (dy * sx)) / denom
+        eps = 1e-12
+        if (-eps <= t <= 1.0 + eps) and (-eps <= u <= 1.0 + eps):
+            return float(min(max(t, 0.0), 1.0))
+        return None
+
+    def _section_mask_border_markers(
+        self,
+        p0: tuple[float, float],
+        p1: tuple[float, float],
+    ) -> list[tuple[float, str, str]]:
+        """Compute mask boundary crossings along a section as distance markers."""
+        sy = p1[0] - p0[0]
+        sx = p1[1] - p0[1]
+        length = float(np.hypot(sy, sx))
+        if length <= 0:
+            return []
+
+        visible_mask_indices = [idx for idx in range(len(self._masks)) if self._mask_is_visible(idx)]
+        all_markers: list[tuple[float, str, str]] = []
+        tol_dist = max(1e-6, length * 1e-6)
+
+        for mask_index in visible_mask_indices:
+            mask = self._masks[mask_index]
+            if len(mask.vertices) < 3:
+                continue
+            color = FILE_COLORS[mask_index % len(FILE_COLORS)]
+            ring = list(mask.vertices)
+            ring.append(ring[0])
+            mask_distances: list[float] = []
+
+            for start, end in zip(ring[:-1], ring[1:]):
+                t = self._segment_intersection_parameter(p0, p1, start, end)
+                if t is None:
+                    continue
+                dist = float(t * length)
+                if not any(abs(dist - existing) <= tol_dist for existing in mask_distances):
+                    mask_distances.append(dist)
+
+            mask_distances.sort()
+            for marker_idx, dist in enumerate(mask_distances):
+                label = f"Mask border: {mask.name}" if marker_idx == 0 else ""
+                all_markers.append((dist, label, color))
+
+        all_markers.sort(key=lambda item: item[0])
+        return all_markers
+
+    def _visible_mask_polygons_for_section(self) -> list[list[tuple[float, float]]]:
+        polys: list[list[tuple[float, float]]] = []
+        for idx, mask in enumerate(self._masks):
+            if not self._mask_is_visible(idx):
+                continue
+            if len(mask.vertices) < 3:
+                continue
+            polys.append(list(mask.vertices))
+        return polys
 
     def _on_update_sections(self) -> None:
         if not self._sections:
@@ -4560,6 +4642,8 @@ class SectionWindow(tk.Toplevel):
         bottom: SurfaceLike,
         p0: tuple[float, float],
         p1: tuple[float, float],
+        mask_border_markers: Optional[list[tuple[float, str, str]]] = None,
+        mask_clip_polygons: Optional[list[list[tuple[float, float]]]] = None,
         theme_palette: Optional[dict[str, str]] = None,
         raster_surface: Optional[ElevationRasterSurface] = None,
         intermediate_surface: Optional[Any] = None,
@@ -4611,20 +4695,40 @@ class SectionWindow(tk.Toplevel):
         self._on_chainage_change = on_chainage_change
         self._section_total_len = total_len
         self._chainage_updating = False
+        self._mask_border_markers = list(mask_border_markers or [])
+        self._mask_clip_polygons = [list(poly) for poly in (mask_clip_polygons or []) if len(poly) >= 3]
+
+        if self._mask_clip_polygons:
+            points = np.column_stack([ys, xs])
+            display_inside_mask = np.zeros(len(points), dtype=bool)
+            for poly in self._mask_clip_polygons:
+                path = MplPath(np.asarray(poly, dtype=float))
+                display_inside_mask |= path.contains_points(points, radius=1e-9)
+            display_mode_label = "mask-clipped"
+        else:
+            display_inside_mask = np.ones_like(dists, dtype=bool)
+            display_mode_label = "full profile"
 
         # Area between curves (m² of cross-section); split into cut (top above
         # bottom) and fill (top below bottom).
         diff = z_area_top - z_area_bottom
-        mask = np.isfinite(diff)
-        if mask.any():
-            d_valid = dists[mask]
-            diff_valid = diff[mask]
-            # Positive and negative integrals via trapezoid rule.
-            pos = np.clip(diff_valid, 0, None)
-            neg = np.clip(diff_valid, None, 0)
-            area_cut = float(np.trapezoid(pos, d_valid))
-            area_fill = float(-np.trapezoid(neg, d_valid))
-            area_net = float(np.trapezoid(diff_valid, d_valid))
+        finite = np.isfinite(diff)
+        seg_ok = finite[:-1] & finite[1:] & display_inside_mask[:-1] & display_inside_mask[1:]
+        if seg_ok.any():
+            d0 = dists[:-1]
+            d1 = dists[1:]
+            delta = d1 - d0
+            diff0 = diff[:-1]
+            diff1 = diff[1:]
+            area_net = float(np.sum(0.5 * (diff0 + diff1) * delta * seg_ok))
+
+            pos0 = np.clip(diff0, 0, None)
+            pos1 = np.clip(diff1, 0, None)
+            area_cut = float(np.sum(0.5 * (pos0 + pos1) * delta * seg_ok))
+
+            neg0 = np.clip(diff0, None, 0)
+            neg1 = np.clip(diff1, None, 0)
+            area_fill = float(-np.sum(0.5 * (neg0 + neg1) * delta * seg_ok))
         else:
             area_cut = area_fill = area_net = float("nan")
 
@@ -4662,8 +4766,8 @@ class SectionWindow(tk.Toplevel):
 
         # Shade split legs in different colors when intermediate is shown.
         if z_intermediate is not None and np.any(np.isfinite(z_intermediate)):
-            both_upper = np.isfinite(z_top) & np.isfinite(z_intermediate)
-            both_lower = np.isfinite(z_intermediate) & np.isfinite(z_bot)
+            both_upper = np.isfinite(z_top) & np.isfinite(z_intermediate) & display_inside_mask
+            both_lower = np.isfinite(z_intermediate) & np.isfinite(z_bot) & display_inside_mask
             intermediate_name = getattr(intermediate_surface, "name", "Intermediate")
             if both_upper.any():
                 ax.fill_between(
@@ -4687,7 +4791,7 @@ class SectionWindow(tk.Toplevel):
                 )
         else:
             # Shade the area between surfaces where both are defined.
-            both = np.isfinite(z_area_top) & np.isfinite(z_area_bottom)
+            both = np.isfinite(z_area_top) & np.isfinite(z_area_bottom) & display_inside_mask
             if both.any():
                 cut_mask = both & (z_area_top >= z_area_bottom)
                 fill_mask = both & (z_area_top < z_area_bottom)
@@ -4709,6 +4813,21 @@ class SectionWindow(tk.Toplevel):
             alpha=0.85,
             label="Centerline",
         )
+        first_mask_marker = True
+        for distance_m, marker_label, marker_color in self._mask_border_markers:
+            if not np.isfinite(distance_m):
+                continue
+            x = min(max(float(distance_m), 0.0), total_len)
+            ax.axvline(
+                x,
+                color=marker_color,
+                linestyle=":",
+                linewidth=1.0,
+                alpha=0.95,
+                label=(marker_label if marker_label and first_mask_marker else None),
+            )
+            if marker_label:
+                first_mask_marker = False
 
         ax.set_xlabel("Distance along section (m) [Left -> Right, looking toward higher station]")
         ax.set_ylabel("Elevation (m)")
@@ -4724,7 +4843,8 @@ class SectionWindow(tk.Toplevel):
         ax.set_title(
             f"Length {total_len:,.2f} m   |   "
             f"Area ({area_top_label} - {area_bottom_label}) net {area_net:+,.2f} m²   "
-            f"(cut {area_cut:,.2f} / fill {area_fill:,.2f})"
+            f"(cut {area_cut:,.2f} / fill {area_fill:,.2f})   |   "
+            f"Display area: {display_mode_label}"
         )
 
         canvas = FigureCanvasTkAgg(fig, master=self)
@@ -4749,6 +4869,14 @@ class SectionWindow(tk.Toplevel):
         )
         self._chainage_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 8))
         ttk.Label(slider_row, textvariable=self._chainage_value_text, width=20, anchor=tk.E).pack(side=tk.LEFT)
+
+        display_mode_info = ttk.Label(
+            self,
+            text=f"Display area: {display_mode_label}",
+            anchor=tk.W,
+            padding=(8, 0),
+        )
+        display_mode_info.pack(side=tk.BOTTOM, fill=tk.X)
 
         info = ttk.Label(
             self,
