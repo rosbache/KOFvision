@@ -51,6 +51,7 @@ class _DummyViewer:
         self._pit_polygons = []
         self._pit_settings = type("_PitSettings", (), {
             "edge_slope": 1.0,
+            "vertical_wall": False,
             "stop_material": None,
             "stop_slot": None,
         })()
@@ -150,3 +151,4 @@ def test_build_project_payload_includes_ditch_data() -> None:
     assert payload["ditch_layer_catalog"]["rock"][0] == "s0"
     assert payload["pit_polygons"] == []
     assert payload["pit_settings"]["edge_slope"] == 1.0
+    assert payload["pit_settings"]["vertical_wall"] is False
