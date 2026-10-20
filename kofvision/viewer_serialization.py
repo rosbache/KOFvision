@@ -339,7 +339,7 @@ def apply_project_payload(
     viewer._ditch_rules = parse_ditch_rules(payload.get("ditch_rules"))
     viewer._ditch_layer_catalog = DitchLayerCatalog.from_payload(payload.get("ditch_layer_catalog"))
 
-    names = [surface.name for surface in viewer.files]
+    names = list(viewer._volume_surface_choices())
     top_name = str(payload.get("top_surface", ""))
     bottom_name = str(payload.get("bottom_surface", ""))
     if top_name in names:
