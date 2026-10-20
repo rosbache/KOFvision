@@ -150,6 +150,7 @@ FILE_COLORS = [
 ]
 
 VOLUME_MODE_LABELS: dict[str, str] = {
+    "surfaces": "Selected surfaces",
     "kof_vs_kof": "KOF - KOF",
     "top_minus_raster": "Top KOF - Raster",
     "raster_minus_bottom": "Raster - Bottom KOF",
@@ -288,7 +289,7 @@ class KOFViewer(tk.Tk):
 
         self.top_var = tk.StringVar()
         self.bottom_var = tk.StringVar()
-        self.volume_source_mode = tk.StringVar(value=VOLUME_MODE_LABELS["kof_vs_kof"])
+        self.volume_source_mode = tk.StringVar(value=VOLUME_MODE_LABELS["surfaces"])
         self.volume_method = tk.StringVar(value="raster")
         self.intermediate_type = tk.StringVar(value=INTERMEDIATE_TYPE_LABELS["none"])
         self.intermediate_kof_var = tk.StringVar()
@@ -978,10 +979,9 @@ class KOFViewer(tk.Tk):
         self.volume_source_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
         _HoverTooltip(
             self.volume_source_combo,
-            "KOF - KOF: existing KOF top/bottom workflow.\n"
-            "Top KOF - Raster: top KOF minus loaded elevation raster.\n"
-            "Raster - Bottom KOF: loaded elevation raster minus bottom KOF.\n"
-            "Raster - Top KOF: loaded elevation raster minus top KOF.",
+            "Selected surfaces: independently select any loaded vector surface or DEM\n"
+            "as Top and Bottom, with either calculation method.\n"
+            "The other modes retain the legacy active-raster and pit workflows.",
         )
 
         int_type_row = ttk.Frame(volume_panel)
@@ -1000,7 +1000,7 @@ class KOFViewer(tk.Tk):
             self.intermediate_type_combo,
             "Optional split-volume reference.\n"
             "None: single result (top-bottom).\n"
-            "KOF layer: split into Top-KOF and KOF-Bottom.\n"
+            "KOF layer: use a loaded KOF or LandXML vector surface.\n"
             "Raster layer: split into Top-Raster and Raster-Bottom.\n"
             "Constant Z: split against a horizontal plane.",
         )
@@ -1082,8 +1082,9 @@ class KOFViewer(tk.Tk):
         self.volume_method_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_intermediate_type_change())
         _HoverTooltip(
             self.volume_method_combo,
-            "raster: fastest for quick estimates.\n"
-            "triangles: exact overlap integration; slower but more accurate.",
+            "raster: sample vector surfaces and DEMs on a common grid.\n"
+            "triangles: integrate TIN overlap; DEM grid cells are split into triangles.\n"
+            "DEM triangles are piecewise planar, unlike bilinear raster sampling.",
         )
 
         boundary_row = ttk.Frame(volume_panel)
@@ -2297,13 +2298,13 @@ class KOFViewer(tk.Tk):
         return float(spacing_m), float(section_length_m), int(n_samples)
 
     def _prepare_section_report_request(self) -> Optional[dict[str, Any]]:
-        top = self._find_file(self.top_var.get())
-        bot = self._find_file(self.bottom_var.get())
+        top = self._find_volume_surface(self.top_var.get())
+        bot = self._find_volume_surface(self.bottom_var.get())
         if top is None or bot is None:
             messagebox.showwarning("KOF Viewer", "Select both top and bottom surfaces first.")
             return None
         if top is bot:
-            messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
+            messagebox.showwarning("KOF Viewer", "Top and bottom must be different surfaces.")
             return None
         if not self._sections and not self._ditch_centerlines:
             messagebox.showinfo(
@@ -2643,19 +2644,22 @@ class KOFViewer(tk.Tk):
 
     def _refresh_file_selectors(self) -> None:
         names = [k.name for k in self.files]
-        self.top_combo["values"] = names
-        self.bottom_combo["values"] = names
+        surface_names = list(self._volume_surface_choices())
+        self.top_combo["values"] = surface_names
+        self.bottom_combo["values"] = surface_names
         self.intermediate_kof_combo["values"] = names
-        if names:
-            if self.top_var.get() not in names:
-                self.top_var.set(names[0])
-            if self.bottom_var.get() not in names:
-                self.bottom_var.set(names[1] if len(names) > 1 else names[0])
-            if self.intermediate_kof_var.get() not in names:
-                self.intermediate_kof_var.set(names[0])
+        if surface_names:
+            if self.top_var.get() not in surface_names:
+                self.top_var.set(surface_names[0])
+            if self.bottom_var.get() not in surface_names:
+                self.bottom_var.set(surface_names[1] if len(surface_names) > 1 else surface_names[0])
         else:
             self.top_var.set("")
             self.bottom_var.set("")
+        if names:
+            if self.intermediate_kof_var.get() not in names:
+                self.intermediate_kof_var.set(names[0])
+        else:
             self.intermediate_kof_var.set("")
 
     def _refresh_intermediate_raster_selector(self) -> None:
@@ -2887,6 +2891,16 @@ class KOFViewer(tk.Tk):
                 return k
         return None
 
+    def _volume_surface_choices(self) -> dict[str, SurfaceLike]:
+        choices: dict[str, SurfaceLike] = {surface.name: surface for surface in self.files}
+        for layer in self._raster_layers:
+            if layer.elevation_surface is not None:
+                choices[f"Raster: {layer.path}"] = layer.elevation_surface
+        return choices
+
+    def _find_volume_surface(self, name: str) -> Optional[SurfaceLike]:
+        return self._volume_surface_choices().get(name)
+
     def _all_files_bounds(self) -> Optional[tuple[float, float, float, float]]:
         bounds = [k.xy_bounds() for k in self.files]
         valid = [b for b in bounds if b is not None]
@@ -2913,7 +2927,7 @@ class KOFViewer(tk.Tk):
         key = raw.lower()
         if key in VOLUME_MODE_LABELS:
             return key
-        return "kof_vs_kof"
+        return "surfaces"
 
     def _current_intermediate_type_key(self) -> str:
         raw = self.intermediate_type.get().strip()
@@ -2962,13 +2976,11 @@ class KOFViewer(tk.Tk):
 
     def _on_intermediate_type_change(self) -> None:
         key = self._current_intermediate_type_key()
-        method = self.volume_method.get().strip().lower()
-        allow_intermediate = method != "triangles"
-        constant_enabled = allow_intermediate and key == "constant"
+        constant_enabled = key == "constant"
 
-        self._set_widget_state(self.intermediate_type_combo, allow_intermediate)
-        self._set_widget_state(self.intermediate_kof_combo, allow_intermediate and key == "kof")
-        self._set_widget_state(self.intermediate_raster_combo, allow_intermediate and key == "raster")
+        self._set_widget_state(self.intermediate_type_combo, True)
+        self._set_widget_state(self.intermediate_kof_combo, key == "kof")
+        self._set_widget_state(self.intermediate_raster_combo, key == "raster")
         self._set_widget_state(
             self.intermediate_constant_z_spin,
             constant_enabled,
@@ -3067,8 +3079,6 @@ class KOFViewer(tk.Tk):
 
     def _section_intermediate_surface(self) -> Optional[SurfaceLike]:
         """Return currently selected intermediate surface for section/profile visualization."""
-        if self.volume_method.get().strip().lower() == "triangles":
-            return None
         if self._current_intermediate_type_key() == "none":
             return None
         return self._resolve_intermediate_surface_with_feedback(show_warnings=False)
@@ -3080,10 +3090,6 @@ class KOFViewer(tk.Tk):
             return None
         layer = self._raster_layers[self._elevation_raster_index]
         if layer.elevation_surface is None:
-            return None
-        # Keep section raster previews aligned with raster-based sampling mode,
-        # including KOF-KOF where the raster is shown as reference only.
-        if self.volume_method.get().strip().lower() != "raster":
             return None
         return layer.elevation_surface
 
@@ -3560,17 +3566,17 @@ class KOFViewer(tk.Tk):
             self._redraw_2d()
 
     def _on_compute_volume(self) -> None:
-        top = self._find_file(self.top_var.get())
-        bot = self._find_file(self.bottom_var.get())
+        top = self._find_volume_surface(self.top_var.get())
+        bot = self._find_volume_surface(self.bottom_var.get())
         mode = self._current_volume_mode_key()
         intermediate_type = self._current_intermediate_type_key()
 
-        if mode == "kof_vs_kof":
+        if mode in {"surfaces", "kof_vs_kof"}:
             if top is None or bot is None:
                 messagebox.showwarning("KOF Viewer", "Select both a top and bottom surface.")
                 return
             if top is bot:
-                messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
+                messagebox.showwarning("KOF Viewer", "Top and bottom must be different surfaces.")
                 return
             top_surface = top
             bottom_surface = bot
@@ -3636,14 +3642,6 @@ class KOFViewer(tk.Tk):
             scope = self._current_mask_scope_key()
             scope_label = MASK_SCOPE_LABELS.get(scope, MASK_SCOPE_LABELS["selected"])
 
-        if method == "triangles" and intermediate_type != "none":
-            messagebox.showwarning(
-                "KOF Viewer",
-                "Intermediate layer split requires 'raster' method. "
-                "'triangles' currently supports top-bottom pairs only.",
-            )
-            return
-
         intermediate_surface: Optional[SurfaceLike] = None
         if intermediate_type != "none":
             intermediate_surface = self._resolve_intermediate_surface()
@@ -3690,12 +3688,6 @@ class KOFViewer(tk.Tk):
             if geoms:
                 union_geom = unary_union(geoms)
                 union_polygons = self._polygon_from_geom(union_geom)
-            if method == "triangles" and union_polygons:
-                effective_method = "raster"
-                messagebox.showwarning(
-                    "KOF Viewer",
-                    "Mask union currently runs with raster method; switched from triangles for this computation.",
-                )
 
         item_indices = pit_indices if item_kind == "pit" else mask_indices
 
@@ -4011,13 +4003,13 @@ class KOFViewer(tk.Tk):
             messagebox.showinfo("KOF Viewer", "No section lines available to update.")
             return
 
-        top = self._find_file(self.top_var.get())
-        bot = self._find_file(self.bottom_var.get())
+        top = self._find_volume_surface(self.top_var.get())
+        bot = self._find_volume_surface(self.bottom_var.get())
         if top is None or bot is None:
             messagebox.showwarning("KOF Viewer", "Select both top and bottom surfaces first.")
             return
         if top is bot:
-            messagebox.showwarning("KOF Viewer", "Top and bottom must be different files.")
+            messagebox.showwarning("KOF Viewer", "Top and bottom must be different surfaces.")
             return
 
         self._close_section_windows()
