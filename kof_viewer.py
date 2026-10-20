@@ -270,6 +270,7 @@ class KOFViewer(tk.Tk):
         self._landxml_group_vars: dict[str, tk.BooleanVar] = {}
         self.last_volume: Optional[VolumeResult | SplitVolumeResult] = None
         self._latest_section_report_path: Optional[str] = None
+        self._section_volume_bars: list[dict[str, float]] = []
 
         self.show_labels = tk.BooleanVar(value=False)
         self.show_stations = tk.BooleanVar(value=True)
@@ -277,6 +278,9 @@ class KOFViewer(tk.Tk):
         self.show_lines = tk.BooleanVar(value=True)
         self.show_triangulation = tk.BooleanVar(value=False)
         self.show_tin_fill = tk.BooleanVar(value=True)
+        self.show_volume_bars = tk.BooleanVar(value=True)
+        self.show_upper_leg_bars = tk.BooleanVar(value=True)
+        self.show_lower_leg_bars = tk.BooleanVar(value=True)
         self.tin_fill_alpha = tk.DoubleVar(value=0.14)
         self.equal_aspect = tk.BooleanVar(value=True)
         self.show_raster = tk.BooleanVar(value=False)
@@ -803,6 +807,24 @@ class KOFViewer(tk.Tk):
         ttk.Checkbutton(display_panel, text="Lines", variable=self.show_lines, command=self._redraw).pack(anchor="w")
         ttk.Checkbutton(display_panel, text="Triangulation", variable=self.show_triangulation, command=self._redraw).pack(anchor="w")
         ttk.Checkbutton(display_panel, text="TIN fill", variable=self.show_tin_fill, command=self._redraw).pack(anchor="w")
+        ttk.Checkbutton(
+            display_panel,
+            text="Calculated volume bars (3D)",
+            variable=self.show_volume_bars,
+            command=self._redraw_3d,
+        ).pack(anchor="w")
+        ttk.Checkbutton(
+            display_panel,
+            text="Upper-leg / cut bars (blue)",
+            variable=self.show_upper_leg_bars,
+            command=self._redraw_3d,
+        ).pack(anchor="w", padx=(16, 0))
+        ttk.Checkbutton(
+            display_panel,
+            text="Lower-leg / fill bars (orange)",
+            variable=self.show_lower_leg_bars,
+            command=self._redraw_3d,
+        ).pack(anchor="w", padx=(16, 0))
         ttk.Checkbutton(display_panel, text="Equal aspect (2D)", variable=self.equal_aspect, command=self._redraw).pack(anchor="w")
 
         station_row = ttk.Frame(display_panel)
@@ -3343,7 +3365,102 @@ class KOFViewer(tk.Tk):
             "result": result,
             "per_mask_rows": per_mask_rows,
             "per_mask_result_rows": per_mask_result_rows,
+            "volume_bars": self._sample_volume_bars(
+                top_surface,
+                bottom_surface,
+                intermediate_surface,
+                mask_compute_polygons,
+            ),
         }
+
+    @staticmethod
+    def _sample_volume_bars(
+        top_surface: SurfaceLike,
+        bottom_surface: SurfaceLike,
+        intermediate_surface: Optional[SurfaceLike],
+        mask_polygons: list[list[tuple[float, float]]],
+        *,
+        target_cells: int = 18,
+    ) -> list[dict[str, float]]:
+        top_bounds = top_surface.xy_bounds()
+        bottom_bounds = bottom_surface.xy_bounds()
+        if top_bounds is None or bottom_bounds is None:
+            return []
+
+        y_min = max(top_bounds[0], bottom_bounds[0])
+        x_min = max(top_bounds[1], bottom_bounds[1])
+        y_max = min(top_bounds[2], bottom_bounds[2])
+        x_max = min(top_bounds[3], bottom_bounds[3])
+        if intermediate_surface is not None:
+            intermediate_bounds = intermediate_surface.xy_bounds()
+            if intermediate_bounds is None:
+                return []
+            y_min = max(y_min, intermediate_bounds[0])
+            x_min = max(x_min, intermediate_bounds[1])
+            y_max = min(y_max, intermediate_bounds[2])
+            x_max = min(x_max, intermediate_bounds[3])
+        if y_min >= y_max or x_min >= x_max:
+            return []
+
+        span = max(y_max - y_min, x_max - x_min)
+        step = span / max(target_cells, 2)
+        ny = max(int(np.ceil((y_max - y_min) / step)), 1)
+        nx = max(int(np.ceil((x_max - x_min) / step)), 1)
+        dy = (y_max - y_min) / ny
+        dx = (x_max - x_min) / nx
+        ys = y_min + (np.arange(ny, dtype=float) + 0.5) * dy
+        xs = x_min + (np.arange(nx, dtype=float) + 0.5) * dx
+        yy, xx = np.meshgrid(ys, xs, indexing="ij")
+        y_flat = yy.ravel()
+        x_flat = xx.ravel()
+
+        valid = np.ones(len(y_flat), dtype=bool)
+        if mask_polygons:
+            points = np.column_stack([y_flat, x_flat])
+            valid = np.zeros(len(points), dtype=bool)
+            for polygon in mask_polygons:
+                if len(polygon) >= 3:
+                    valid |= MplPath(np.asarray(polygon, dtype=float)).contains_points(points)
+
+        z_top = top_surface.interpolate(y_flat, x_flat)
+        z_bottom = bottom_surface.interpolate(y_flat, x_flat)
+        valid &= np.isfinite(z_top) & np.isfinite(z_bottom)
+        if intermediate_surface is not None:
+            z_intermediate = intermediate_surface.interpolate(y_flat, x_flat)
+            valid &= np.isfinite(z_intermediate)
+            upper_height = z_top - z_intermediate
+            lower_height = z_intermediate - z_bottom
+            upper_base = z_intermediate
+            lower_base = z_bottom
+        else:
+            diff = z_top - z_bottom
+            upper_height = np.where(diff > 0.0, diff, np.nan)
+            lower_height = np.where(diff < 0.0, diff, np.nan)
+            upper_base = z_bottom
+            lower_base = z_bottom
+
+        cell_area = dx * dy
+        bars: list[dict[str, float]] = []
+        for index in np.flatnonzero(valid):
+            upper = float(upper_height[index])
+            lower = float(lower_height[index])
+            if not np.isfinite(upper) and not np.isfinite(lower):
+                continue
+            bars.append(
+                {
+                    "y": float(y_flat[index]),
+                    "x": float(x_flat[index]),
+                    "width_m": float(dy * 0.82),
+                    "depth_m": float(dx * 0.82),
+                    "upper_base_z": float(upper_base[index]),
+                    "lower_base_z": float(lower_base[index]),
+                    "upper_height_m": upper,
+                    "lower_height_m": lower,
+                    "upper_volume_m3": upper * cell_area if np.isfinite(upper) else float("nan"),
+                    "lower_volume_m3": lower * cell_area if np.isfinite(lower) else float("nan"),
+                }
+            )
+        return bars
 
     def _apply_volume_compute_payload(
         self,
@@ -3368,6 +3485,8 @@ class KOFViewer(tk.Tk):
             return
 
         self.last_volume = result
+        self._section_volume_bars = list(payload.get("volume_bars", []))
+        self.runtime_state.last_render_3d_signature = None
         self._last_volume_per_mask_rows = list(per_mask_rows)
         self._last_volume_result_item_kind = "pit" if item_kind == "pit" else "mask"
 
@@ -3436,8 +3555,9 @@ class KOFViewer(tk.Tk):
             summary = summary + "\n" + "\n".join(per_mask_rows)
         self.volume_text.set(summary)
         self._record_volume_history(summary)
+        self._redraw_3d()
         if self.show_triangulation.get():
-            self._redraw()
+            self._redraw_2d()
 
     def _on_compute_volume(self) -> None:
         top = self._find_file(self.top_var.get())
@@ -4699,6 +4819,7 @@ class KOFViewer(tk.Tk):
         os.makedirs(profiles_dir, exist_ok=True)
 
         profile_rows: list[dict[str, object]] = []
+        volume_bar_samples: list[dict[str, float]] = []
         plan_points: list[tuple[str, tuple[float, float]]] = []
         surface_lookup = {surface.name: surface for surface in self.files}
         applied_ditch_rule_codes: set[str] = set()
@@ -4768,6 +4889,31 @@ class KOFViewer(tk.Tk):
                     "ditch_rules": list(ditch_adjust.applied_rule_codes),
                     "ditch_stop_hits": list(ditch_adjust.hit_stop_layers),
                     "image_rel": image_rel.replace("\\", "/"),
+                }
+            )
+            center_index = int(np.argmin(np.abs(sample.dists_m - sample.length_m * 0.5)))
+            volume_bar_samples.append(
+                {
+                    "station_m": float(sample.station_m),
+                    "y": float(center[0]),
+                    "x": float(center[1]),
+                    "section_length_m": float(sample.length_m),
+                    "upper_area_m2": (
+                        float(sample.area_upper_leg_m2)
+                        if sample.area_upper_leg_m2 is not None
+                        else float("nan")
+                    ),
+                    "lower_area_m2": (
+                        float(sample.area_lower_leg_m2)
+                        if sample.area_lower_leg_m2 is not None
+                        else float("nan")
+                    ),
+                    "intermediate_z": (
+                        float(sample.z_secondary_reference[center_index])
+                        if sample.z_secondary_reference is not None
+                        else float("nan")
+                    ),
+                    "bottom_z": float(sample.z_bottom[center_index]),
                 }
             )
             plan_points.append((profile_id, center))
@@ -4961,7 +5107,26 @@ class KOFViewer(tk.Tk):
                 indent=2,
             )
 
-        return {"run_dir": run_dir, "report_path": report_path}
+        volume_bars: list[dict[str, float]] = []
+        for left, right in zip(volume_bar_samples, volume_bar_samples[1:]):
+            interval_m = right["station_m"] - left["station_m"]
+            section_length = 0.5 * (left["section_length_m"] + right["section_length_m"])
+            if interval_m <= 0.0 or section_length <= 0.0:
+                continue
+            bar = {
+                "y": 0.5 * (left["y"] + right["y"]),
+                "x": 0.5 * (left["x"] + right["x"]),
+                "width_m": max(interval_m * 0.55, 0.1),
+                "upper_base_z": 0.5 * (left["intermediate_z"] + right["intermediate_z"]),
+                "lower_base_z": 0.5 * (left["bottom_z"] + right["bottom_z"]),
+                "upper_height_m": 0.5 * (left["upper_area_m2"] + right["upper_area_m2"]) / section_length,
+                "lower_height_m": 0.5 * (left["lower_area_m2"] + right["lower_area_m2"]) / section_length,
+                "upper_volume_m3": 0.5 * (left["upper_area_m2"] + right["upper_area_m2"]) * interval_m,
+                "lower_volume_m3": 0.5 * (left["lower_area_m2"] + right["lower_area_m2"]) * interval_m,
+            }
+            volume_bars.append(bar)
+
+        return {"run_dir": run_dir, "report_path": report_path, "volume_bars": volume_bars}
 
     def _generate_section_report(self, out_root: str, *, open_in_browser: bool) -> Optional[str]:
         request = self._prepare_section_report_request()
@@ -4971,6 +5136,9 @@ class KOFViewer(tk.Tk):
         run_dir = str(result["run_dir"])
         report_path = str(result["report_path"])
         self._latest_section_report_path = report_path
+        self._section_volume_bars = list(result["volume_bars"])
+        self.runtime_state.last_render_3d_signature = None
+        self._redraw_3d()
         if open_in_browser:
             opened = self._open_path_in_browser(report_path)
             if not opened:
@@ -4999,6 +5167,9 @@ class KOFViewer(tk.Tk):
             run_dir = str(result["run_dir"])
             report_path = str(result["report_path"])
             self._latest_section_report_path = report_path
+            self._section_volume_bars = list(result["volume_bars"])
+            self.runtime_state.last_render_3d_signature = None
+            self._redraw_3d()
             opened = True
             if open_in_browser:
                 opened = self._open_path_in_browser(report_path)
@@ -5143,6 +5314,13 @@ class KOFViewer(tk.Tk):
             bool(self.show_lines.get()),
             bool(self.show_labels.get()),
             bool(self.show_triangulation.get()),
+            bool(self.show_volume_bars.get()),
+            bool(self.show_upper_leg_bars.get()),
+            bool(self.show_lower_leg_bars.get()),
+            tuple(
+                tuple(sorted(bar.items()))
+                for bar in self._section_volume_bars
+            ),
         )
         if signature == self.runtime_state.last_render_3d_signature:
             return
