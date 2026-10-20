@@ -26,6 +26,7 @@ def reset_for_clear(viewer: Any) -> None:
     viewer._landxml_group_vars.clear()
     viewer._view_extent_2d = None
     viewer._latest_section_report_path = None
+    viewer._section_volume_bars.clear()
     if hasattr(viewer, "runtime_state"):
         viewer.runtime_state.volume_history.clear()
         viewer.runtime_state.last_render_2d_signature = None
@@ -110,6 +111,7 @@ def reset_for_project_load(viewer: Any) -> None:
     viewer._active_raster_index = None
     viewer._elevation_raster_index = None
     viewer._latest_section_report_path = None
+    viewer._section_volume_bars.clear()
     viewer._ditch_rules.clear()
     viewer._ditch_layer_catalog = DitchLayerCatalog()
     if hasattr(viewer, "runtime_state"):
