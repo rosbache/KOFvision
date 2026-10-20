@@ -38,6 +38,31 @@ class ElevationRasterSurface:
         # KOF convention: (y_min, x_min, y_max, x_max)
         return float(xmin), float(ymin), float(xmax), float(ymax)
 
+    def triangulation_data(self) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Split each valid grid quad into two triangles without bridging NoData."""
+        if self.values.ndim != 2:
+            raise ValueError("Elevation raster must be a 2D array.")
+        rows, cols = self.values.shape
+        xmin, xmax, ymin, ymax = self.extent
+        if rows < 2 or cols < 2 or xmax <= xmin or ymax <= ymin:
+            return None
+
+        # Use the same sample positions and row orientation as interpolate().
+        eastings = np.linspace(xmin, xmax, cols)
+        northings = np.linspace(ymax, ymin, rows) if self.origin == "upper" else np.linspace(ymin, ymax, rows)
+        yy, xx = np.meshgrid(eastings, northings)
+        xy = np.column_stack((yy.ravel(), xx.ravel()))
+        indices = np.arange(rows * cols).reshape(rows, cols)
+        i00 = indices[:-1, :-1].ravel()
+        i10 = indices[:-1, 1:].ravel()
+        i01 = indices[1:, :-1].ravel()
+        i11 = indices[1:, 1:].ravel()
+        z = np.asarray(self.values, dtype=float).ravel()
+        valid = np.isfinite(z[i00]) & np.isfinite(z[i10]) & np.isfinite(z[i01]) & np.isfinite(z[i11])
+        first = np.column_stack((i00[valid], i10[valid], i11[valid]))
+        second = np.column_stack((i00[valid], i11[valid], i01[valid]))
+        return xy, z, np.concatenate((first, second))
+
     def interpolate(self, y: np.ndarray, x: np.ndarray) -> np.ndarray:
         ys = np.asarray(y, dtype=float)
         xs = np.asarray(x, dtype=float)
