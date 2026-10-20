@@ -10,6 +10,7 @@ Raster-layer lifecycle and state transitions.
 - Maintain active raster and elevation raster selection.
 - Maintain layer ordering and per-layer visibility/alpha interactions.
 - Refresh related combobox selector state.
+- Refresh shared Top/Bottom elevation-source choices when raster layers change.
 
 ## Interaction Pattern
 
