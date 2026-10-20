@@ -51,8 +51,8 @@ class SectionTool:
         if viewer._section_mode:
             viewer._end_section_mode()
             return
-        if len(viewer.files) < 2:
-            messagebox.showinfo("KOF Viewer", "Load at least two files and select Top/Bottom first.")
+        if len(viewer._volume_surface_choices()) < 2:
+            messagebox.showinfo("KOF Viewer", "Load at least two elevation surfaces and select Top/Bottom first.")
             return
         if not viewer.top_var.get() or not viewer.bottom_var.get():
             messagebox.showinfo("KOF Viewer", "Pick a top and bottom surface before drawing a section.")
@@ -115,8 +115,8 @@ class SectionTool:
             viewer._active_section_index = len(viewer._sections) - 1
             viewer._refresh_section_controls()
 
-        top = viewer._find_file(viewer.top_var.get())
-        bot = viewer._find_file(viewer.bottom_var.get())
+        top = viewer._find_volume_surface(viewer.top_var.get())
+        bot = viewer._find_volume_surface(viewer.bottom_var.get())
         viewer._end_section_mode()
         viewer._redraw_2d()
         if top is not None and bot is not None:
