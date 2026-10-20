@@ -25,12 +25,14 @@ The main app is implemented in `kof_viewer.py`.
 	- fill volume
 	- overlap area
 	- volume source modes:
+		- `Selected surfaces` (default): independently choose KOF, LandXML, or elevation raster for Top and Bottom
+		- legacy active-raster modes remain available:
 		- `KOF - KOF`
 		- `Top KOF - Raster`
 		- `Raster - Bottom KOF`
 		- `Raster - Top KOF`
 - Optional intermediate layer for split-volume calculation:
-	- KOF layer
+	- KOF or LandXML layer
 	- raster elevation layer
 	- virtual constant Z plane
 	- split output:
@@ -38,13 +40,14 @@ The main app is implemented in `kof_viewer.py`.
 		- Intermediate - Bottom
 		- Total (sum of both legs)
 - Load multiple raster layers, reorder them (up/down), toggle visibility, and set per-layer alpha
-- Set an active single-band elevation raster used for raster-based volume modes and section reference profile
+- Use any loaded single-band elevation raster as Top, Bottom, or Intermediate with either volume method
+- Set an active elevation raster for legacy raster source modes and the section reference profile
 - Optionally clip raster loading to current KOF bounds with user-defined buffer
 - Modern hybrid UI: slim top command bar + collapsible right-side analysis panels
 - Scrollable right-side panel column for smaller screen heights
 - Draw one or more section lines in 2D and open section windows with:
 	- top and bottom profiles
-	- optional raster reference profile (when raster volume mode is active)
+	- optional active raster reference profile
 	- shaded cut/fill regions
 	- net/cut/fill cross-section area
 - Draw one or more ditch centerlines in 2D and use them as section-report baselines
@@ -168,8 +171,8 @@ For full packaging and distribution details, see `docs/pyinstaller-windows.md`.
 
 ## Workflow
 
-1. Open two surface files (for example existing top and design/bottom).
-2. In the right-side Volume setup panel, select Top and Bottom.
+1. Open elevation sources (KOF/LandXML files and/or single-band elevation rasters).
+2. In the right-side Volume setup panel, leave Volume from as `Selected surfaces` and select Top and Bottom independently. DEM choices are prefixed with `Raster:` and include the source path, so selection survives raster reordering and distinguishes identical filenames in different folders.
 3. Choose volume Method (`raster` or `triangles`).
 4. Optionally choose Intermediate (`None`, `KOF layer`, `Raster layer`, or `Constant Z`).
 5. If Intermediate is `Constant Z`, type Z directly and optionally use +/- with configurable step.
@@ -275,8 +278,8 @@ KOFvision computes signed difference as:
 
 | Method | Typical speed | Accuracy profile | Supported inputs | Intermediate split support |
 |---|---|---|---|---|
-| `raster` | Faster (default workflow) | Grid-approximation; accuracy depends on sampling resolution (`target_cells`) | `KOF - KOF`, `Top KOF - Raster`, `Raster - Bottom KOF`, `Raster - Top KOF` | Yes (`KOF`, `Raster`, `Constant Z`) |
-| `triangles` | Slower | Exact polygon-overlap integration on triangulated KOF surfaces | `KOF - KOF` only | No |
+| `raster` | Faster (default workflow) | Grid-approximation; accuracy depends on sampling resolution (`target_cells`) | Any pair of KOF, LandXML, DEM, or constant-Z surfaces | Yes (`KOF`, `LandXML`, `Raster`, `Constant Z`) |
+| `triangles` | Slower | Exact polygon-overlap integration of the resulting piecewise-planar surfaces | Any pair of KOF, LandXML, DEM, or constant-Z surfaces | Yes (`KOF`, `LandXML`, `Raster`, `Constant Z`) |
 
 ### 1) `raster` method (default)
 
@@ -295,10 +298,9 @@ How it works:
 
 Supports:
 
-- KOF vs KOF
-- KOF vs raster elevation surface
-- raster elevation surface vs KOF
-- split-volume with intermediate layer (`KOF`, `Raster`, `Constant Z`)
+- Any combination of KOF, LandXML, and elevation raster surfaces, including DEM vs DEM
+- Vector surfaces are sampled directly onto the calculation grid; no intermediate raster file is needed
+- Split-volume with intermediate layer (`KOF`, `LandXML`, `Raster`, `Constant Z`)
 
 ### 2) `triangles` method
 
@@ -306,26 +308,32 @@ Used by `compute_volume(..., method="triangles")`.
 
 How it works:
 
-1. Triangulates both KOF surfaces (Delaunay + boundary filtering).
+1. Uses each source's triangles: KOF Delaunay with boundary filtering, LandXML TIN faces, or two triangles per valid DEM grid quad. Constant-Z planes use two triangles over their bounds.
 2. Finds overlapping top/bottom triangle pairs by bounding-box prefilter.
 3. Computes exact convex polygon intersections for candidate pairs.
 4. Integrates linear surface difference analytically over each overlap polygon.
 5. Splits positive and negative contributions into cut/fill.
 
-This method is more exact for triangulated KOF pairs, and usually slower than `raster`.
+This method integrates the resulting triangles exactly, and is usually slower than `raster`.
 
 Supports:
 
-- KOF vs KOF only
+- Any combination of KOF, LandXML, elevation raster, and constant-Z surfaces
+- Split-volume with any of those intermediate surfaces
+- Polygon masks and union mask scopes without switching to the raster method
 
-Current limitations:
+DEM conversion details and limitations:
 
-- No intermediate split-volume with `triangles`.
-- No raster surface participation in `triangles`.
+- Triangles use the same sample coordinates and row orientation as the existing DEM interpolator.
+- A quad is excluded if any of its four samples is non-finite (NaN/infinity); holes are not bridged by Delaunay triangulation.
+- DEM triangles are piecewise planar. They can differ from bilinear raster interpolation on non-planar quads, so the two methods need not produce identical cut/fill results.
+- Orthophotos/RGB rasters are display-only and are not elevation inputs.
+- Theoretical pit surfaces still require the raster method.
+- Large-raster loading, clipping, and mesh scalability are unchanged.
 
 ### Intermediate Split-Volume
 
-When `Intermediate` is set and method is `raster`, KOFvision computes two legs:
+When `Intermediate` is set, either method computes two legs:
 
 - `upper = Top - Intermediate`
 - `lower = Intermediate - Bottom`
@@ -472,7 +480,7 @@ It writes PNG files to `docs/images/`.
 	- `Y` = Easting
 	- `H` = Elevation
 - Volume method options:
-	- `raster` (default): grid sampling over overlap between selected surfaces (KOF and/or elevation raster).
-	- `triangles`: direct polygon-overlap integration on triangulated KOF pairs.
-	- split-volume with intermediate layer is available only with `raster`.
+	- `raster` (default): grid sampling over overlap between selected vector surfaces and/or elevation rasters.
+	- `triangles`: direct polygon-overlap integration on vector TINs and/or triangulated elevation rasters.
+	- split-volume with KOF, LandXML, raster, or constant-Z intermediate layers is available with either method.
 - Interpolation outside the filtered triangulation boundary is ignored.
