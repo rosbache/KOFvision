@@ -547,6 +547,53 @@ def _draw_3d_surface_layers(viewer: Any, file_colors: list[str]) -> None:
                 viewer.ax3d.scatter(surface._xy[:, 0], surface._xy[:, 1], surface._z, color=color, s=10, label=surface.name)
 
 
+def _draw_3d_volume_bars(viewer: Any) -> None:
+    if not viewer.show_volume_bars.get():
+        return
+
+    upper_labeled = False
+    lower_labeled = False
+    for bar in viewer._section_volume_bars:
+        width = float(bar["width_m"])
+        depth = float(bar.get("depth_m", width))
+        y = float(bar["y"]) - width * 0.5
+        x = float(bar["x"]) - depth * 0.5
+
+        upper_height = float(bar["upper_height_m"])
+        upper_base = float(bar["upper_base_z"])
+        if viewer.show_upper_leg_bars.get() and np.isfinite(upper_height) and np.isfinite(upper_base):
+            viewer.ax3d.bar3d(
+                y,
+                x,
+                upper_base,
+                width,
+                depth,
+                upper_height,
+                color="#4c78a8",
+                alpha=0.78,
+                shade=True,
+                label="Upper leg / cut volume" if not upper_labeled else None,
+            )
+            upper_labeled = True
+
+        lower_height = float(bar["lower_height_m"])
+        lower_base = float(bar["lower_base_z"])
+        if viewer.show_lower_leg_bars.get() and np.isfinite(lower_height) and np.isfinite(lower_base):
+            viewer.ax3d.bar3d(
+                y,
+                x,
+                lower_base,
+                width,
+                depth,
+                lower_height,
+                color="#f58518",
+                alpha=0.78,
+                shade=True,
+                label="Lower leg / fill volume" if not lower_labeled else None,
+            )
+            lower_labeled = True
+
+
 def _draw_3d_legend_or_empty_state(viewer: Any) -> None:
     if viewer.files:
         viewer.ax3d.legend(loc="best", fontsize=8)
@@ -567,6 +614,7 @@ def _draw_3d_legend_or_empty_state(viewer: Any) -> None:
 def render_3d(viewer: Any, file_colors: list[str]) -> None:
     initialize_3d_axes(viewer)
     _draw_3d_surface_layers(viewer, file_colors)
+    _draw_3d_volume_bars(viewer)
     _draw_3d_legend_or_empty_state(viewer)
     viewer.fig3d.tight_layout()
     viewer.canvas3d.draw_idle()
