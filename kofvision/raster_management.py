@@ -253,3 +253,4 @@ class RasterLayerManager:
             self.viewer.intermediate_raster_var.set(names[0])
         if not names:
             self.viewer.intermediate_raster_var.set("")
+        self.viewer._refresh_file_selectors()
