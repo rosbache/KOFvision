@@ -109,13 +109,17 @@ def test_mask_polygon_limits_split_volume_area() -> None:
     assert split.lower.net == pytest.approx(1.0 * expected_area, abs=2.0)
 
 
-def test_triangles_method_rejects_non_kof_surfaces() -> None:
+def test_triangles_method_supports_constant_split_surfaces() -> None:
     top = _surface("top", 10.0)
     bottom = _surface("bottom", 7.0)
     mid = _surface("mid", 8.0)
 
-    with pytest.raises(ValueError, match="triangles"):
-        compute_volume(top, bottom, method="triangles")
-
-    with pytest.raises(ValueError, match="triangles"):
-        compute_volume_with_intermediate(top, mid, bottom, method="triangles")
+    result = compute_volume(top, bottom, method="triangles")
+    split = compute_volume_with_intermediate(top, mid, bottom, method="triangles")
+    assert result is not None
+    assert split is not None
+    assert result.area == pytest.approx(AREA)
+    assert result.net == pytest.approx(3.0 * AREA)
+    assert split.upper.net == pytest.approx(2.0 * AREA)
+    assert split.lower.net == pytest.approx(AREA)
+    assert split.net == pytest.approx(result.net)
