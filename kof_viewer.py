@@ -3788,6 +3788,8 @@ class KOFViewer(tk.Tk):
         section_intermediate = self._section_intermediate_surface()
         area_top_surface, area_bottom_surface, area_top_name, area_bottom_name = self._section_area_pair(top, bottom)
         mask_border_markers = self._section_mask_border_markers((y0, x0), (y1, x1))
+        pit_border_markers = self._section_pit_border_markers((y0, x0), (y1, x1))
+        pit_slope_end_markers = self._section_pit_slope_end_markers((y0, x0), (y1, x1), top_surface=top)
         mask_clip_polygons = self._visible_mask_polygons_for_section()
         window = SectionWindow(
             self,
@@ -3796,6 +3798,8 @@ class KOFViewer(tk.Tk):
             (y0, x0),
             (y1, x1),
             mask_border_markers=mask_border_markers,
+            pit_border_markers=pit_border_markers,
+            pit_slope_end_markers=pit_slope_end_markers,
             mask_clip_polygons=mask_clip_polygons,
             theme_palette=self._theme,
             raster_surface=self._section_reference_raster(),
@@ -3876,6 +3880,121 @@ class KOFViewer(tk.Tk):
 
         all_markers.sort(key=lambda item: item[0])
         return all_markers
+
+    def _section_pit_border_markers(
+        self,
+        p0: tuple[float, float],
+        p1: tuple[float, float],
+    ) -> list[tuple[float, str, str]]:
+        """Compute visible pit boundary crossings along a section as distance markers."""
+        sy = p1[0] - p0[0]
+        sx = p1[1] - p0[1]
+        length = float(np.hypot(sy, sx))
+        if length <= 0:
+            return []
+
+        visible_pit_indices = [idx for idx in range(len(self._pit_polygons)) if self._pit_is_visible(idx)]
+        all_markers: list[tuple[float, str, str]] = []
+        tol_dist = max(1e-6, length * 1e-6)
+
+        for pit_index in visible_pit_indices:
+            pit = self._pit_polygons[pit_index]
+            if len(pit.vertices) < 3:
+                continue
+            color = "#8b1e3f" if pit_index == self._active_pit_index else "#b23a48"
+            ring = list(pit.vertices)
+            ring.append(ring[0])
+            pit_distances: list[float] = []
+
+            for start, end in zip(ring[:-1], ring[1:]):
+                t = self._segment_intersection_parameter(p0, p1, start, end)
+                if t is None:
+                    continue
+                dist = float(t * length)
+                if not any(abs(dist - existing) <= tol_dist for existing in pit_distances):
+                    pit_distances.append(dist)
+
+            pit_distances.sort()
+            for marker_idx, dist in enumerate(pit_distances):
+                label = f"Pit border: {pit.name}" if marker_idx == 0 else ""
+                all_markers.append((dist, label, color))
+
+        all_markers.sort(key=lambda item: item[0])
+        return all_markers
+
+    def _section_pit_slope_end_markers(
+        self,
+        p0: tuple[float, float],
+        p1: tuple[float, float],
+        *,
+        top_surface: SurfaceLike,
+    ) -> list[tuple[float, str, str]]:
+        """Estimate where pit side slopes intersect top surface along a section."""
+        if bool(getattr(self._pit_settings, "vertical_wall", False)):
+            return []
+        slope_abs = abs(float(getattr(self._pit_settings, "edge_slope", 0.0)))
+        if slope_abs <= 0.0:
+            return []
+
+        sy = p1[0] - p0[0]
+        sx = p1[1] - p0[1]
+        length = float(np.hypot(sy, sx))
+        if length <= 0:
+            return []
+
+        sample_count = 700
+        ts = np.linspace(0.0, 1.0, sample_count)
+        ys = p0[0] + sy * ts
+        xs = p0[1] + sx * ts
+        top_z = top_surface.interpolate(ys, xs)
+        points = np.column_stack([ys, xs])
+        tol_dist = max(1e-3, length * 1e-4)
+        markers: list[tuple[float, str, str]] = []
+
+        for pit_index, pit in enumerate(self._pit_polygons):
+            if not self._pit_is_visible(pit_index):
+                continue
+            if len(pit.vertices) < 3:
+                continue
+            local_bottom = self._pit_surface_for_indices([pit_index])
+            if local_bottom is None:
+                continue
+            pit_z = local_bottom.interpolate(ys, xs)
+            finite = np.isfinite(top_z) & np.isfinite(pit_z)
+            if np.count_nonzero(finite) < 2:
+                continue
+            inside = MplPath(np.asarray(pit.vertices, dtype=float)).contains_points(points, radius=1e-9)
+            diff = top_z - pit_z
+            color = "#8b1e3f" if pit_index == self._active_pit_index else "#b23a48"
+            first_for_pit = True
+
+            for i in range(sample_count - 1):
+                if not (finite[i] and finite[i + 1]):
+                    continue
+                if inside[i] or inside[i + 1]:
+                    continue
+                d0 = float(diff[i])
+                d1 = float(diff[i + 1])
+                if d0 == 0.0:
+                    t_seg = 0.0
+                elif d1 == 0.0:
+                    t_seg = 1.0
+                elif d0 * d1 > 0.0:
+                    continue
+                else:
+                    denom = abs(d0) + abs(d1)
+                    if denom <= 0.0:
+                        continue
+                    t_seg = abs(d0) / denom
+                dist = float((ts[i] + (t_seg * (ts[i + 1] - ts[i]))) * length)
+                if any(abs(dist - existing[0]) <= tol_dist for existing in markers):
+                    continue
+                label = f"Pit slope end: {pit.name}" if first_for_pit else ""
+                markers.append((dist, label, color))
+                first_for_pit = False
+
+        markers.sort(key=lambda item: item[0])
+        return markers
 
     def _visible_mask_polygons_for_section(self) -> list[list[tuple[float, float]]]:
         polys: list[list[tuple[float, float]]] = []
@@ -5258,6 +5377,12 @@ class KOFViewer(tk.Tk):
             )
             for layer in self._raster_layers
         )
+        pit_settings_checksum = (
+            float(getattr(self._pit_settings, "edge_slope", 0.0)),
+            bool(getattr(self._pit_settings, "vertical_wall", False)),
+            getattr(self._pit_settings, "stop_material", None),
+            getattr(self._pit_settings, "stop_slot", None),
+        )
         view_extent = tuple(float(v) for v in self._view_extent_2d) if self._view_extent_2d is not None else None
         signature = (
             self.theme_mode.get(),
@@ -5291,9 +5416,11 @@ class KOFViewer(tk.Tk):
             round(float(self._active_section_marker_chainage_m), 6)
             if self._active_section_marker_chainage_m is not None
             else None,
+            self.top_var.get().strip(),
             layer_visibility_checksum,
             landxml_group_checksum,
             raster_checksum,
+            pit_settings_checksum,
             view_extent,
             section_checksum,
             mask_checksum,
@@ -5478,6 +5605,8 @@ class SectionWindow(tk.Toplevel):
         p0: tuple[float, float],
         p1: tuple[float, float],
         mask_border_markers: Optional[list[tuple[float, str, str]]] = None,
+        pit_border_markers: Optional[list[tuple[float, str, str]]] = None,
+        pit_slope_end_markers: Optional[list[tuple[float, str, str]]] = None,
         mask_clip_polygons: Optional[list[list[tuple[float, float]]]] = None,
         theme_palette: Optional[dict[str, str]] = None,
         raster_surface: Optional[ElevationRasterSurface] = None,
@@ -5531,6 +5660,8 @@ class SectionWindow(tk.Toplevel):
         self._section_total_len = total_len
         self._chainage_updating = False
         self._mask_border_markers = list(mask_border_markers or [])
+        self._pit_border_markers = list(pit_border_markers or [])
+        self._pit_slope_end_markers = list(pit_slope_end_markers or [])
         self._mask_clip_polygons = [list(poly) for poly in (mask_clip_polygons or []) if len(poly) >= 3]
 
         if self._mask_clip_polygons:
@@ -5663,6 +5794,38 @@ class SectionWindow(tk.Toplevel):
             )
             if marker_label:
                 first_mask_marker = False
+
+        first_pit_border_marker = True
+        for distance_m, marker_label, marker_color in self._pit_border_markers:
+            if not np.isfinite(distance_m):
+                continue
+            x = min(max(float(distance_m), 0.0), total_len)
+            ax.axvline(
+                x,
+                color=marker_color,
+                linestyle="--",
+                linewidth=1.2,
+                alpha=0.95,
+                label=(marker_label if marker_label and first_pit_border_marker else None),
+            )
+            if marker_label:
+                first_pit_border_marker = False
+
+        first_pit_slope_marker = True
+        for distance_m, marker_label, marker_color in self._pit_slope_end_markers:
+            if not np.isfinite(distance_m):
+                continue
+            x = min(max(float(distance_m), 0.0), total_len)
+            ax.axvline(
+                x,
+                color=marker_color,
+                linestyle="-.",
+                linewidth=1.2,
+                alpha=0.95,
+                label=(marker_label if marker_label and first_pit_slope_marker else None),
+            )
+            if marker_label:
+                first_pit_slope_marker = False
 
         ax.set_xlabel("Distance along section (m) [Left -> Right, looking toward higher station]")
         ax.set_ylabel("Elevation (m)")

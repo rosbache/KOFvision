@@ -359,6 +359,91 @@ def _draw_pits(viewer: Any) -> None:
         )
 
 
+def _draw_pit_slope_end_lines(viewer: Any) -> None:
+    pits = getattr(viewer, "_pit_polygons", [])
+    if not pits:
+        return
+    settings = getattr(viewer, "_pit_settings", None)
+    if settings is None or bool(getattr(settings, "vertical_wall", False)):
+        return
+    slope_abs = abs(float(getattr(settings, "edge_slope", 0.0)))
+    if slope_abs <= 0.0:
+        return
+    top_name = str(viewer.top_var.get()).strip() if hasattr(viewer, "top_var") else ""
+    if not top_name:
+        return
+    top_surface = viewer._find_file(top_name) if hasattr(viewer, "_find_file") else None
+    if top_surface is None or not hasattr(top_surface, "xy_bounds"):
+        return
+    top_bounds = top_surface.xy_bounds()
+    if top_bounds is None:
+        return
+
+    first_label = True
+    for idx, pit in enumerate(pits):
+        if not viewer._pit_is_visible(idx):
+            continue
+        if len(pit.vertices) < 3:
+            continue
+        pit_surface = viewer._pit_surface_for_indices([idx]) if hasattr(viewer, "_pit_surface_for_indices") else None
+        if pit_surface is None or not hasattr(pit_surface, "xy_bounds"):
+            continue
+        pit_bounds = pit_surface.xy_bounds()
+        if pit_bounds is None:
+            continue
+
+        y_min = max(float(top_bounds[0]), float(pit_bounds[0]))
+        x_min = max(float(top_bounds[1]), float(pit_bounds[1]))
+        y_max = min(float(top_bounds[2]), float(pit_bounds[2]))
+        x_max = min(float(top_bounds[3]), float(pit_bounds[3]))
+        if y_min >= y_max or x_min >= x_max:
+            continue
+
+        vertices = np.asarray(pit.vertices, dtype=float)
+        z_top_edge = top_surface.interpolate(vertices[:, 0], vertices[:, 1])
+        finite_edge = np.isfinite(z_top_edge)
+        if finite_edge.any():
+            depth_max = max(float(np.max(z_top_edge[finite_edge] - float(pit.target_z))), 0.0)
+        else:
+            depth_max = 0.0
+        margin = max(2.0, (depth_max / slope_abs) * 1.15 if depth_max > 0 else 2.0)
+
+        y_min = max(float(top_bounds[0]), y_min - margin)
+        x_min = max(float(top_bounds[1]), x_min - margin)
+        y_max = min(float(top_bounds[2]), y_max + margin)
+        x_max = min(float(top_bounds[3]), x_max + margin)
+        if y_min >= y_max or x_min >= x_max:
+            continue
+
+        n_y = 180
+        n_x = 180
+        ys = np.linspace(y_min, y_max, n_y)
+        xs = np.linspace(x_min, x_max, n_x)
+        yy, xx = np.meshgrid(ys, xs, indexing="xy")
+        z_top = top_surface.interpolate(yy, xx)
+        z_pit = pit_surface.interpolate(yy, xx)
+        finite = np.isfinite(z_top) & np.isfinite(z_pit)
+        if np.count_nonzero(finite) < 20:
+            continue
+        delta = np.where(finite, z_top - z_pit, np.nan)
+        color = "#8b1e3f" if idx == getattr(viewer, "_active_pit_index", None) else "#b23a48"
+        label = f"Pit slope end: {pit.name}" if first_label else None
+        viewer.ax2d.contour(
+            yy,
+            xx,
+            delta,
+            levels=[0.0],
+            colors=[color],
+            linewidths=[1.5 if idx == getattr(viewer, "_active_pit_index", None) else 1.0],
+            linestyles=["--"],
+            zorder=12,
+        )
+        if label is not None:
+            # Add a lightweight proxy artist for legend text once.
+            viewer.ax2d.plot([], [], "--", color=color, linewidth=1.2, label=label)
+            first_label = False
+
+
 def _draw_active_pit_preview(viewer: Any) -> None:
     if not (getattr(viewer, "_pit_mode", False) and getattr(viewer, "_pit_click_points", [])):
         return
@@ -494,6 +579,7 @@ def render_2d(viewer: Any, file_colors: list[str]) -> None:
     _draw_masks(viewer, file_colors)
     _draw_active_mask_preview(viewer)
     _draw_pits(viewer)
+    _draw_pit_slope_end_lines(viewer)
     _draw_active_pit_preview(viewer)
     _draw_measurements(viewer)
     _draw_active_measurement_preview(viewer)
