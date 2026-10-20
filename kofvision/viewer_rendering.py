@@ -372,7 +372,7 @@ def _draw_pit_slope_end_lines(viewer: Any) -> None:
     top_name = str(viewer.top_var.get()).strip() if hasattr(viewer, "top_var") else ""
     if not top_name:
         return
-    top_surface = viewer._find_file(top_name) if hasattr(viewer, "_find_file") else None
+    top_surface = viewer._find_volume_surface(top_name) if hasattr(viewer, "_find_volume_surface") else None
     if top_surface is None or not hasattr(top_surface, "xy_bounds"):
         return
     top_bounds = top_surface.xy_bounds()
