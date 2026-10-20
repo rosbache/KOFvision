@@ -75,6 +75,14 @@ class ConstantElevationSurface:
     def interpolate(self, y: np.ndarray, x: np.ndarray) -> np.ndarray:  # noqa: ARG002
         return np.full_like(y, fill_value=float(self.z_value), dtype=float)
 
+    def triangulation_data(self) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        y_min, x_min, y_max, x_max = self.bounds
+        if y_min >= y_max or x_min >= x_max:
+            return None
+        xy = np.array([(y_min, x_min), (y_max, x_min), (y_max, x_max), (y_min, x_max)])
+        z = np.full(4, float(self.z_value))
+        return xy, z, np.array([(0, 1, 2), (0, 2, 3)])
+
 
 def _compute_volume_raster(
     top: SurfaceLike,
@@ -97,10 +105,12 @@ def _compute_volume_raster(
     span = max(y_max - y_min, x_max - x_min)
     cell = span / max(target_cells, 10)
 
-    ny = max(int(np.ceil((y_max - y_min) / cell)), 2)
-    nx = max(int(np.ceil((x_max - x_min) / cell)), 2)
-    ys = np.linspace(y_min + cell / 2, y_max - cell / 2, ny)
-    xs = np.linspace(x_min + cell / 2, x_max - cell / 2, nx)
+    ny = max(int(np.ceil((y_max - y_min) / cell)), 1)
+    nx = max(int(np.ceil((x_max - x_min) / cell)), 1)
+    dy = (y_max - y_min) / ny
+    dx = (x_max - x_min) / nx
+    ys = y_min + (np.arange(ny) + 0.5) * dy
+    xs = x_min + (np.arange(nx) + 0.5) * dx
     yy, xx = np.meshgrid(ys, xs, indexing="xy")
     yy_f = yy.ravel()
     xx_f = xx.ravel()
@@ -116,7 +126,7 @@ def _compute_volume_raster(
     diff = z_top - z_bot
     mask = np.isfinite(diff) & in_poly
     valid = diff[mask]
-    cell_area = (ys[1] - ys[0]) * (xs[1] - xs[0]) if len(ys) > 1 and len(xs) > 1 else cell * cell
+    cell_area = dy * dx
 
     cut = float(valid[valid > 0].sum() * cell_area)
     fill = float(-valid[valid < 0].sum() * cell_area)
@@ -309,4 +319,6 @@ def _compute_volume_pair(
         if not isinstance(top, TriangulatedSurfaceLike) or not isinstance(bottom, TriangulatedSurfaceLike):
             raise ValueError("'triangles' method requires triangulated surfaces.")
         return _compute_volume_triangles(top, bottom, mask_polygon=mask_polygon)
-    return _compute_volume_raster(top, bottom, target_cells=target_cells, mask_polygon=mask_polygon)
+    if mode == "raster":
+        return _compute_volume_raster(top, bottom, target_cells=target_cells, mask_polygon=mask_polygon)
+    raise ValueError(f"Unknown volume method: {mode!r}. Expected 'raster' or 'triangles'.")
