@@ -360,36 +360,47 @@ def _draw_pits(viewer: Any) -> None:
 
 
 def _draw_pit_slope_end_lines(viewer: Any) -> None:
+    viewer._pit_daylight_debug = ""
     pits = getattr(viewer, "_pit_polygons", [])
     if not pits:
+        viewer._pit_daylight_debug = "no pits"
         return
     settings = getattr(viewer, "_pit_settings", None)
     if settings is None or bool(getattr(settings, "vertical_wall", False)):
+        viewer._pit_daylight_debug = "pit daylight disabled (vertical wall)"
         return
     slope_abs = abs(float(getattr(settings, "edge_slope", 0.0)))
     if slope_abs <= 0.0:
+        viewer._pit_daylight_debug = "pit daylight disabled (slope <= 0)"
         return
     top_name = str(viewer.top_var.get()).strip() if hasattr(viewer, "top_var") else ""
     if not top_name:
+        viewer._pit_daylight_debug = "pit daylight skipped (no top surface selected)"
         return
     top_surface = viewer._find_volume_surface(top_name) if hasattr(viewer, "_find_volume_surface") else None
     if top_surface is None or not hasattr(top_surface, "xy_bounds"):
+        viewer._pit_daylight_debug = "pit daylight skipped (top surface unavailable)"
         return
     top_bounds = top_surface.xy_bounds()
     if top_bounds is None:
+        viewer._pit_daylight_debug = "pit daylight skipped (top bounds unavailable)"
         return
 
     first_label = True
+    debug_parts: list[str] = []
     for idx, pit in enumerate(pits):
         if not viewer._pit_is_visible(idx):
             continue
         if len(pit.vertices) < 3:
+            debug_parts.append(f"{pit.name}: skipped (<3 vertices)")
             continue
         pit_surface = viewer._pit_surface_for_indices([idx]) if hasattr(viewer, "_pit_surface_for_indices") else None
         if pit_surface is None or not hasattr(pit_surface, "xy_bounds"):
+            debug_parts.append(f"{pit.name}: skipped (pit surface unavailable)")
             continue
         pit_bounds = pit_surface.xy_bounds()
         if pit_bounds is None:
+            debug_parts.append(f"{pit.name}: skipped (pit bounds unavailable)")
             continue
 
         y_min = max(float(top_bounds[0]), float(pit_bounds[0]))
@@ -397,6 +408,7 @@ def _draw_pit_slope_end_lines(viewer: Any) -> None:
         y_max = min(float(top_bounds[2]), float(pit_bounds[2]))
         x_max = min(float(top_bounds[3]), float(pit_bounds[3]))
         if y_min >= y_max or x_min >= x_max:
+            debug_parts.append(f"{pit.name}: skipped (no bbox overlap with top)")
             continue
 
         vertices = np.asarray(pit.vertices, dtype=float)
@@ -415,33 +427,85 @@ def _draw_pit_slope_end_lines(viewer: Any) -> None:
         if y_min >= y_max or x_min >= x_max:
             continue
 
-        n_y = 180
-        n_x = 180
-        ys = np.linspace(y_min, y_max, n_y)
-        xs = np.linspace(x_min, x_max, n_x)
-        yy, xx = np.meshgrid(ys, xs, indexing="xy")
-        z_top = top_surface.interpolate(yy, xx)
-        z_pit = pit_surface.interpolate(yy, xx)
-        finite = np.isfinite(z_top) & np.isfinite(z_pit)
-        if np.count_nonzero(finite) < 20:
-            continue
-        delta = np.where(finite, z_top - z_pit, np.nan)
-        color = "#8b1e3f" if idx == getattr(viewer, "_active_pit_index", None) else "#b23a48"
+        color = "#d90429" if idx == getattr(viewer, "_active_pit_index", None) else "#b23a48"
         label = f"Pit slope end: {pit.name}" if first_label else None
-        viewer.ax2d.contour(
-            yy,
-            xx,
-            delta,
-            levels=[0.0],
-            colors=[color],
-            linewidths=[1.5 if idx == getattr(viewer, "_active_pit_index", None) else 1.0],
-            linestyles=["--"],
-            zorder=12,
-        )
-        if label is not None:
-            # Add a lightweight proxy artist for legend text once.
-            viewer.ax2d.plot([], [], "--", color=color, linewidth=1.2, label=label)
-            first_label = False
+        draw_line_width = 2.4 if idx == getattr(viewer, "_active_pit_index", None) else 1.6
+
+        margin_scale = 1.0
+        drew_contour = False
+        min_delta = float("nan")
+        max_delta = float("nan")
+        for _attempt in range(6):
+            yy_min = max(float(top_bounds[0]), y_min - (margin * (margin_scale - 1.0)))
+            xx_min = max(float(top_bounds[1]), x_min - (margin * (margin_scale - 1.0)))
+            yy_max = min(float(top_bounds[2]), y_max + (margin * (margin_scale - 1.0)))
+            xx_max = min(float(top_bounds[3]), x_max + (margin * (margin_scale - 1.0)))
+            if yy_min >= yy_max or xx_min >= xx_max:
+                break
+
+            span_y = yy_max - yy_min
+            span_x = xx_max - xx_min
+            n_y = int(np.clip(np.ceil(span_y / 0.5), 180, 700))
+            n_x = int(np.clip(np.ceil(span_x / 0.5), 180, 700))
+            ys = np.linspace(yy_min, yy_max, n_y)
+            xs = np.linspace(xx_min, xx_max, n_x)
+            yy, xx = np.meshgrid(ys, xs, indexing="xy")
+            z_top = top_surface.interpolate(yy, xx)
+            z_pit = pit_surface.interpolate(yy, xx)
+            finite = np.isfinite(z_top) & np.isfinite(z_pit)
+            if np.count_nonzero(finite) < 20:
+                debug_parts.append(f"{pit.name}: finite overlap too small")
+                break
+            delta = np.where(finite, z_top - z_pit, np.nan)
+            finite_delta = delta[finite]
+            if finite_delta.size == 0:
+                debug_parts.append(f"{pit.name}: no finite delta samples")
+                break
+            min_delta = float(np.min(finite_delta))
+            max_delta = float(np.max(finite_delta))
+            has_crossing = min_delta <= 0.0 <= max_delta
+            if has_crossing:
+                viewer.ax2d.contour(
+                    yy,
+                    xx,
+                    delta,
+                    levels=[0.0],
+                    colors=[color],
+                    linewidths=[draw_line_width],
+                    linestyles=["-"],
+                    zorder=16,
+                )
+                if label is not None:
+                    # Add a lightweight proxy artist for legend text once.
+                    viewer.ax2d.plot([], [], "-", color=color, linewidth=2.0, label=label)
+                    first_label = False
+                drew_contour = True
+                debug_parts.append(
+                    f"{pit.name}: daylight yes; depth={depth_max:.2f}m slope={slope_abs:.3f} "
+                    f"delta=[{min_delta:.3f},{max_delta:.3f}]"
+                )
+                break
+
+            # If pit is still entirely below top surface in this window, expand
+            # search radius and try again; this catches shallow slopes where the
+            # daylight line sits far outside the pit border.
+            if min_delta > 0.0:
+                full_y_covered = abs(yy_min - float(top_bounds[0])) < 1e-9 and abs(yy_max - float(top_bounds[2])) < 1e-9
+                full_x_covered = abs(xx_min - float(top_bounds[1])) < 1e-9 and abs(xx_max - float(top_bounds[3])) < 1e-9
+                if full_y_covered and full_x_covered:
+                    break
+                margin_scale *= 1.8
+                continue
+            break
+
+        if not drew_contour:
+            if np.isfinite(min_delta) and np.isfinite(max_delta):
+                debug_parts.append(
+                    f"{pit.name}: daylight no; depth={depth_max:.2f}m slope={slope_abs:.3f} "
+                    f"delta=[{min_delta:.3f},{max_delta:.3f}]"
+                )
+            continue
+    viewer._pit_daylight_debug = " | ".join(debug_parts)
 
 
 def _draw_active_pit_preview(viewer: Any) -> None:
