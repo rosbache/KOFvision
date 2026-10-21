@@ -1,0 +1,71 @@
+{
+    // =========================================================================
+    // SOSI KOORDSYS → EPSG code lookup
+    // =========================================================================
+    // Maps SOSI coordinate system codes (from ...KOORDSYS in .HODE) to EPSG
+    // codes for horizontal (flat) CRS.  Extend as needed.
+    //
+    // Reference: SOSI standard chapter 2, table of coordinate system codes.
+    // =========================================================================
+
+    "koordsys": {
+        // --- NGO1948 Gauss-Krüger (historical) ---
+        "1":  { "epsg": 27391, "name": "NGO1948 Gauss-Krüger zone 1" },
+        "2":  { "epsg": 27392, "name": "NGO1948 Gauss-Krüger zone 2" },
+        "3":  { "epsg": 27393, "name": "NGO1948 Gauss-Krüger zone 3" },
+        "4":  { "epsg": 27394, "name": "NGO1948 Gauss-Krüger zone 4" },
+        "5":  { "epsg": 27395, "name": "NGO1948 Gauss-Krüger zone 5" },
+        "6":  { "epsg": 27396, "name": "NGO1948 Gauss-Krüger zone 6" },
+        "7":  { "epsg": 27397, "name": "NGO1948 Gauss-Krüger zone 7" },
+        "8":  { "epsg": 27398, "name": "NGO1948 Gauss-Krüger zone 8" },
+
+        // --- ETRS89 / UTM (modern Norwegian standard) ---
+        "21": { "epsg": 25831, "name": "ETRS89 / UTM zone 31N" },
+        "22": { "epsg": 25832, "name": "ETRS89 / UTM zone 32N" },
+        "23": { "epsg": 25833, "name": "ETRS89 / UTM zone 33N" },
+        "24": { "epsg": 25834, "name": "ETRS89 / UTM zone 34N" },
+        "25": { "epsg": 25835, "name": "ETRS89 / UTM zone 35N" },
+        "26": { "epsg": 25836, "name": "ETRS89 / UTM zone 36N" },
+
+        // --- WGS84 / UTM ---
+        "31": { "epsg": 32631, "name": "WGS 84 / UTM zone 31N" },
+        "32": { "epsg": 32632, "name": "WGS 84 / UTM zone 32N" },
+        "33": { "epsg": 32633, "name": "WGS 84 / UTM zone 33N" },
+        "34": { "epsg": 32634, "name": "WGS 84 / UTM zone 34N" },
+        "35": { "epsg": 32635, "name": "WGS 84 / UTM zone 35N" },
+        "36": { "epsg": 32636, "name": "WGS 84 / UTM zone 36N" },
+
+        // --- Geographic ---
+        "41": { "epsg": 4258, "name": "ETRS89 geographic (lat/lon)" },
+        "42": { "epsg": 4326, "name": "WGS 84 geographic (lat/lon)" },
+        "84": { "epsg": 4326, "name": "WGS 84 geographic (lat/lon)" }
+    },
+
+    // =========================================================================
+    // SOSI vertical datum → EPSG height CRS
+    // =========================================================================
+    // Maps VERT-DATUM string values from .HODE to EPSG codes for vertical CRS.
+    // These can be combined with the horizontal CRS to form a compound CRS.
+    // =========================================================================
+
+    "vert_datum": {
+        "NN2000":  { "epsg": 5941, "name": "NN2000 height" },
+        "NN1954":  { "epsg": 5776, "name": "NN1954 height" },
+        "NN54":    { "epsg": 5776, "name": "NN1954 height" },
+        "SVR2009": { "epsg": 4883, "name": "Svalbard vertical reference 2009" }
+    },
+
+    // =========================================================================
+    // SOSI TEGNSETT → Python encoding name
+    // =========================================================================
+
+    "tegnsett": {
+        "UTF-8":      "utf-8",
+        "ISO8859-1":  "latin-1",
+        "ISO8859-10": "latin-6",
+        "ANSI":       "cp1252",
+        "DOSN8":      "cp865",
+        "ND7":        "cp865",
+        "DECN7":      "cp1252"
+    }
+}
