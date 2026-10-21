@@ -64,8 +64,8 @@ from matplotlib.figure import Figure
 from matplotlib.path import Path as MplPath
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
-from kofvision import compute_volume, compute_volume_with_intermediate, parse_kof, parse_landxml
-from kofvision.export import export_kof_files_to_gpkg
+from kofvision import compute_volume, compute_volume_with_intermediate, parse_kof, parse_landxml, parse_sosi_as_kof
+from kofvision.export import export_surfaces_to_gpkg
 from kofvision.models import KOFFile, LandXMLFile, LandXMLStation, LandXMLSurface
 from kofvision.mask_io import (
     MaskDataError,
@@ -151,13 +151,22 @@ FILE_COLORS = [
 
 VOLUME_MODE_LABELS: dict[str, str] = {
     "surfaces": "Selected surfaces",
-    "kof_vs_kof": "KOF - KOF",
-    "top_minus_raster": "Top KOF - Raster",
-    "raster_minus_bottom": "Raster - Bottom KOF",
-    "raster_minus_top": "Raster - Top KOF",
-    "top_minus_pit": "Top KOF - Pit",
+    "kof_vs_kof": "Top surface - Bottom surface",
+    "top_minus_raster": "Top surface - Raster",
+    "raster_minus_bottom": "Raster - Bottom surface",
+    "raster_minus_top": "Raster - Top surface",
+    "top_minus_pit": "Top surface - Pit",
 }
 VOLUME_LABEL_TO_MODE: dict[str, str] = {v: k for k, v in VOLUME_MODE_LABELS.items()}
+VOLUME_LABEL_TO_MODE.update(
+    {
+        "KOF - KOF": "kof_vs_kof",
+        "Top KOF - Raster": "top_minus_raster",
+        "Raster - Bottom KOF": "raster_minus_bottom",
+        "Raster - Top KOF": "raster_minus_top",
+        "Top KOF - Pit": "top_minus_pit",
+    }
+)
 
 INTERMEDIATE_TYPE_LABELS: dict[str, str] = {
     "none": "None",
@@ -297,6 +306,7 @@ class KOFViewer(tk.Tk):
         self.intermediate_constant_z = tk.DoubleVar(value=0.0)
         self.intermediate_constant_step = tk.DoubleVar(value=0.1)
         self.volume_text = tk.StringVar(value="Volume: (not computed)")
+        self.pit_daylight_text = tk.StringVar(value="Pit daylight: (not evaluated)")
         self.boundary_factor = tk.DoubleVar(value=2.5)
         self.raster_clip_to_kof = tk.BooleanVar(value=False)
         self.raster_clip_buffer_m = tk.DoubleVar(value=10.0)
@@ -313,6 +323,9 @@ class KOFViewer(tk.Tk):
         self.pit_vertical_wall_var = tk.BooleanVar(value=False)
         self.pit_stop_material_var = tk.StringVar(value="")
         self.pit_stop_slot_var = tk.StringVar(value="0")
+        self.volume_stop_material_var = tk.StringVar(value="rock")
+        self.volume_stop_slot_var = tk.StringVar(value="0")
+        self.volume_stop_surface_var = tk.StringVar(value="")
         self.measure_mode = tk.StringVar(value=MEASURE_MODE_LABELS["line"])
         self.max_labels = tk.IntVar(value=400)
         self.report_template = tk.StringVar(value="standard")
@@ -362,6 +375,7 @@ class KOFViewer(tk.Tk):
         self._last_volume_per_mask_rows: list[str] = []
         self._last_mask_volume_results: list[dict[str, Any]] = []
         self._last_volume_result_item_kind = "mask"
+        self._pit_daylight_debug = ""
         self._ditch_rules: list[DitchRule] = []
         self._ditch_layer_catalog = DitchLayerCatalog()
 
@@ -1105,6 +1119,13 @@ class KOFViewer(tk.Tk):
 
         ttk.Button(volume_panel, text="Compute volume", command=self._on_compute_volume).pack(anchor="w", pady=(2, 0))
         ttk.Label(volume_panel, textvariable=self.volume_text, foreground="#204080", wraplength=300, justify=tk.LEFT).pack(fill=tk.X, pady=(4, 0))
+        ttk.Label(
+            volume_panel,
+            textvariable=self.pit_daylight_text,
+            foreground="#6b7280",
+            wraplength=340,
+            justify=tk.LEFT,
+        ).pack(fill=tk.X, pady=(2, 0))
         mask_results_btn_row = ttk.Frame(volume_panel)
         mask_results_btn_row.pack(fill=tk.X, pady=(4, 0))
         self.mask_results_popup_btn = ttk.Button(
@@ -1121,6 +1142,50 @@ class KOFViewer(tk.Tk):
             state="disabled",
         )
         self.mask_results_export_btn.pack(side=tk.LEFT, padx=(4, 0))
+
+        ttk.Label(volume_panel, text="Project stop-layer mapping:").pack(anchor="w", pady=(8, 0))
+        stop_map_row = ttk.Frame(volume_panel)
+        stop_map_row.pack(fill=tk.X, pady=(2, 2))
+        self.volume_stop_material_combo = ttk.Combobox(
+            stop_map_row,
+            textvariable=self.volume_stop_material_var,
+            values=["rock", "moist", "constructiontc"],
+            state="readonly",
+            width=12,
+        )
+        self.volume_stop_material_combo.pack(side=tk.LEFT)
+        self.volume_stop_slot_spin = ttk.Spinbox(
+            stop_map_row,
+            from_=0,
+            to=9,
+            textvariable=self.volume_stop_slot_var,
+            width=4,
+        )
+        self.volume_stop_slot_spin.pack(side=tk.LEFT, padx=(4, 4))
+        self.volume_stop_surface_combo = ttk.Combobox(
+            stop_map_row,
+            textvariable=self.volume_stop_surface_var,
+            values=[],
+            width=32,
+        )
+        self.volume_stop_surface_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        stop_map_actions = ttk.Frame(volume_panel)
+        stop_map_actions.pack(fill=tk.X, pady=(2, 2))
+        self.volume_stop_assign_btn = ttk.Button(
+            stop_map_actions,
+            text="Add/Update stop mapping",
+            command=self._on_assign_volume_stop_mapping,
+        )
+        self.volume_stop_assign_btn.pack(side=tk.LEFT)
+        self.volume_stop_clear_btn = ttk.Button(
+            stop_map_actions,
+            text="Clear selected stop mapping",
+            command=self._on_clear_selected_volume_stop_mapping,
+        )
+        self.volume_stop_clear_btn.pack(side=tk.LEFT, padx=(4, 0))
+        self.volume_stop_mapping_list = tk.Listbox(volume_panel, height=6)
+        self.volume_stop_mapping_list.pack(fill=tk.X, pady=(2, 0))
+        self.volume_stop_mapping_list.bind("<<ListboxSelect>>", self._on_volume_stop_mapping_select)
 
         section_panel = self._add_collapsible_panel(parent, "Section", expanded=False)
         ttk.Button(section_panel, text="Update sections", command=self._on_update_sections).pack(fill=tk.X, pady=(0, 2))
@@ -1339,6 +1404,7 @@ class KOFViewer(tk.Tk):
         ttk.Button(schema_panel, text="XSD file...", command=self._on_pick_local_xsd).pack(anchor="w", pady=(4, 0))
 
         self._on_intermediate_type_change()
+        self._refresh_volume_stop_mapping_controls()
         self._refresh_mask_controls()
         self._refresh_pit_controls()
         self._refresh_section_controls()
@@ -1560,7 +1626,13 @@ class KOFViewer(tk.Tk):
     def _on_open(self) -> None:
         paths = filedialog.askopenfilenames(
             title="Open surface/alignment file(s)",
-            filetypes=[("Supported files", "*.kof *.xml"), ("KOF files", "*.kof"), ("LandXML", "*.xml"), ("All files", "*.*")],
+            filetypes=[
+                ("Supported files", "*.kof *.xml *.sos *.sosi"),
+                ("KOF files", "*.kof"),
+                ("SOSI files", "*.sos *.sosi"),
+                ("LandXML", "*.xml"),
+                ("All files", "*.*"),
+            ],
         )
         for path in paths:
             self._load_file(path, redraw=False)
@@ -1569,14 +1641,14 @@ class KOFViewer(tk.Tk):
         self._redraw()
 
     def _on_export_gpkg(self) -> None:
-        kof_files = [k for k in self.files if isinstance(k, KOFFile)]
-        if not kof_files:
-            messagebox.showinfo("KOF Viewer", "Load one or more KOF files first.")
+        surfaces = list(self.files)
+        if not surfaces:
+            messagebox.showinfo("KOF Viewer", "Load one or more surface layers first.")
             return
 
-        default_name = "kof_export.gpkg"
-        if kof_files:
-            first_name, _ext = os.path.splitext(kof_files[0].name)
+        default_name = "surface_export.gpkg"
+        if surfaces:
+            first_name, _ext = os.path.splitext(surfaces[0].name)
             default_name = f"{first_name}_export.gpkg"
 
         out_path = filedialog.asksaveasfilename(
@@ -1589,7 +1661,7 @@ class KOFViewer(tk.Tk):
             return
 
         try:
-            summary = export_kof_files_to_gpkg(kof_files, out_path)
+            summary = export_surfaces_to_gpkg(surfaces, out_path)
         except ImportError:
             messagebox.showerror(
                 "KOF Viewer",
@@ -1609,7 +1681,9 @@ class KOFViewer(tk.Tk):
             f"Layers:\n"
             f"- {summary['points_layer']} ({summary['point_count']} points)\n"
             f"- {summary['polylines_layer']} "
-            f"({summary['polyline_count']} polylines)",
+            f"({summary['polyline_count']} polylines)\n"
+            f"- {summary['triangles_layer']} "
+            f"({summary['triangle_count']} triangles)",
         )
 
     def _on_clear(self) -> None:
@@ -1858,6 +1932,7 @@ class KOFViewer(tk.Tk):
         self._record_undoable_edit("Update pit target Z", before)
 
     def _on_pit_settings_change(self) -> None:
+        previous_settings = self._pit_settings
         try:
             slope = float(self.pit_edge_slope_var.get())
         except (TypeError, ValueError, tk.TclError):
@@ -1880,6 +1955,11 @@ class KOFViewer(tk.Tk):
             stop_material=material,
             stop_slot=slot,
         )
+        if self._pit_settings != previous_settings:
+            if self.last_volume is not None:
+                self.volume_text.set("Volume: (stale – recompute)")
+            self._refresh_pit_controls()
+            self._redraw_2d()
 
     def _refresh_pit_controls(self) -> None:
         if hasattr(self, "pit_combo"):
@@ -2628,6 +2708,12 @@ class KOFViewer(tk.Tk):
                             "KOF Viewer",
                             f"Strict XSD validation {verdict}\nFile: {landxml.name}\nSchema: {source}\n\n{details}",
                         )
+            elif ext in {".sos", ".sosi"}:
+                surface = parse_sosi_as_kof(path)
+                self.files.append(surface)
+                self.layer_vars.append(tk.BooleanVar(value=True))
+                self._surface_owner_paths.append(None)
+                self._surface_source_paths.append(path)
             else:
                 kof = parse_kof(path)
                 self.files.append(kof)
@@ -2661,6 +2747,95 @@ class KOFViewer(tk.Tk):
                 self.intermediate_kof_var.set(names[0])
         else:
             self.intermediate_kof_var.set("")
+        self._refresh_volume_stop_mapping_controls()
+
+    def _refresh_volume_stop_mapping_controls(self) -> None:
+        if not hasattr(self, "volume_stop_surface_combo"):
+            return
+        surface_names = [""] + list(self._volume_surface_choices())
+        self.volume_stop_surface_combo.configure(values=surface_names)
+        current_surface = self.volume_stop_surface_var.get().strip()
+        if current_surface and current_surface not in surface_names:
+            self.volume_stop_surface_var.set("")
+
+        if not hasattr(self, "volume_stop_mapping_list"):
+            return
+        self.volume_stop_mapping_list.delete(0, tk.END)
+        for material in ("rock", "moist", "constructiontc"):
+            slots = self._ditch_layer_catalog.slots.get(material, [None] * 10)
+            for slot, name in enumerate(slots[:10]):
+                if name:
+                    self.volume_stop_mapping_list.insert(tk.END, f"{material}[{slot}] -> {name}")
+        if self.volume_stop_mapping_list.size() == 0:
+            self.volume_stop_mapping_list.insert(tk.END, "(no mappings)")
+
+    def _parse_volume_stop_mapping_selection(self) -> Optional[tuple[str, int]]:
+        if not hasattr(self, "volume_stop_mapping_list"):
+            return None
+        sel = self.volume_stop_mapping_list.curselection()
+        if not sel:
+            return None
+        text = self.volume_stop_mapping_list.get(sel[0]).strip()
+        if text == "(no mappings)":
+            return None
+        try:
+            left = text.split("->", 1)[0].strip()
+            material, slot_text = left.split("[", 1)
+            slot = int(slot_text.rstrip("]"))
+        except (TypeError, ValueError):
+            return None
+        material = material.strip()
+        if material not in {"rock", "moist", "constructiontc"}:
+            return None
+        if slot < 0 or slot > 9:
+            return None
+        return material, slot
+
+    def _on_volume_stop_mapping_select(self, _event=None) -> None:  # noqa: ANN001
+        selection = self._parse_volume_stop_mapping_selection()
+        if selection is None:
+            return
+        material, slot = selection
+        name = self._ditch_layer_catalog.slots.get(material, [None] * 10)[slot]
+        self.volume_stop_material_var.set(material)
+        self.volume_stop_slot_var.set(str(slot))
+        self.volume_stop_surface_var.set(name or "")
+
+    def _on_assign_volume_stop_mapping(self) -> None:
+        material = self.volume_stop_material_var.get().strip().lower()
+        if material not in {"rock", "moist", "constructiontc"}:
+            messagebox.showwarning("KOF Viewer", "Stop material must be rock, moist, or constructiontc.")
+            return
+        try:
+            slot = int(self.volume_stop_slot_var.get())
+        except (TypeError, ValueError, tk.TclError):
+            messagebox.showwarning("KOF Viewer", "Stop slot must be an integer in 0-9.")
+            return
+        if slot < 0 or slot > 9:
+            messagebox.showwarning("KOF Viewer", "Stop slot must be in 0-9.")
+            return
+
+        surface_name = self.volume_stop_surface_var.get().strip() or None
+        if surface_name is not None:
+            known_surfaces = set(self._volume_surface_choices())
+            if surface_name not in known_surfaces:
+                messagebox.showwarning(
+                    "KOF Viewer",
+                    "Stop surface must be one of the loaded surfaces (KOF/LandXML or elevation raster).",
+                )
+                return
+        self._ditch_layer_catalog.slots[material][slot] = surface_name
+        self._refresh_volume_stop_mapping_controls()
+        self._on_pit_settings_change()
+
+    def _on_clear_selected_volume_stop_mapping(self) -> None:
+        selection = self._parse_volume_stop_mapping_selection()
+        if selection is None:
+            return
+        material, slot = selection
+        self._ditch_layer_catalog.slots[material][slot] = None
+        self._refresh_volume_stop_mapping_controls()
+        self._on_pit_settings_change()
 
     def _refresh_intermediate_raster_selector(self) -> None:
         self._raster_manager.refresh_intermediate_raster_selector()
@@ -3171,7 +3346,7 @@ class KOFViewer(tk.Tk):
         polygons = [self._pit_polygons[idx] for idx in indices if 0 <= idx < len(self._pit_polygons)]
         if not polygons:
             return None
-        surface_lookup = {surface.name: surface for surface in self.files}
+        surface_lookup = self._volume_surface_choices()
         stop_surface = resolve_stop_surface(self._pit_settings, self._ditch_layer_catalog, surface_lookup)
         return TheoreticalPitSurface(polygons, self._pit_settings, stop_surface=stop_surface)
 
@@ -4726,9 +4901,6 @@ class KOFViewer(tk.Tk):
         dialog.resizable(True, True)
 
         local_rules = parse_ditch_rules(ditch_rules_to_payload(self._ditch_rules))
-        local_catalog = DitchLayerCatalog.from_payload(self._ditch_layer_catalog.to_payload())
-        surface_names = [surface.name for surface in self.files]
-        surface_choices = [""] + surface_names
 
         root = ttk.Frame(dialog, padding=10)
         root.pack(fill=tk.BOTH, expand=True)
@@ -4776,19 +4948,6 @@ class KOFViewer(tk.Tk):
         ttk.Label(stop_row, text="Stop slot (0-9)").pack(side=tk.LEFT)
         ttk.Spinbox(stop_row, from_=0, to=9, textvariable=stop_slot_var, width=4).pack(side=tk.LEFT, padx=(6, 0))
 
-        assignment_row = ttk.Frame(root)
-        assignment_row.pack(fill=tk.X, pady=(8, 2))
-        assign_material_var = tk.StringVar(value="rock")
-        assign_slot_var = tk.StringVar(value="0")
-        assign_surface_var = tk.StringVar(value="")
-        ttk.Label(assignment_row, text="Layer mapping:").pack(side=tk.LEFT)
-        ttk.Combobox(assignment_row, textvariable=assign_material_var, values=["rock", "moist", "constructiontc"], state="readonly", width=14).pack(side=tk.LEFT, padx=(6, 4))
-        ttk.Spinbox(assignment_row, from_=0, to=9, textvariable=assign_slot_var, width=4).pack(side=tk.LEFT, padx=(0, 4))
-        ttk.Combobox(assignment_row, textvariable=assign_surface_var, values=surface_choices, width=44).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-        mapping_list = tk.Listbox(root, height=7)
-        mapping_list.pack(fill=tk.BOTH, expand=True, pady=(2, 6))
-
         def _refresh_rules_list() -> None:
             rules_list.delete(0, tk.END)
             for rule in local_rules:
@@ -4797,16 +4956,6 @@ class KOFViewer(tk.Tk):
                     tk.END,
                     f"{rule.code_label} side={rule.side:+d} dist={rule.distance_m:.2f} slope={rule.slope:.3f} p={rule.profile_start}-{rule.profile_end}{stop_label}",
                 )
-
-        def _refresh_mapping_list() -> None:
-            mapping_list.delete(0, tk.END)
-            for material in ("rock", "moist", "constructiontc"):
-                slots = local_catalog.slots.get(material, [None] * 10)
-                for slot, name in enumerate(slots[:10]):
-                    if name:
-                        mapping_list.insert(tk.END, f"{material}[{slot}] -> {name}")
-            if mapping_list.size() == 0:
-                mapping_list.insert(tk.END, "(no mappings)")
 
         def _selected_rule_index() -> Optional[int]:
             sel = rules_list.curselection()
@@ -4874,31 +5023,13 @@ class KOFViewer(tk.Tk):
             del local_rules[idx]
             _refresh_rules_list()
 
-        def _on_assign_mapping() -> None:
-            material = assign_material_var.get().strip()
-            if material not in {"rock", "moist", "constructiontc"}:
-                return
-            try:
-                slot = int(assign_slot_var.get())
-            except (TypeError, ValueError):
-                messagebox.showwarning("Ditch setup", "Slot must be in 0-9.")
-                return
-            if slot < 0 or slot > 9:
-                messagebox.showwarning("Ditch setup", "Slot must be in 0-9.")
-                return
-            surface_name = assign_surface_var.get().strip() or None
-            local_catalog.slots[material][slot] = surface_name
-            _refresh_mapping_list()
-
         rule_btn_row = ttk.Frame(root)
         rule_btn_row.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(rule_btn_row, text="Add/Update rule", command=_on_add_or_update_rule).pack(side=tk.LEFT)
         ttk.Button(rule_btn_row, text="Remove selected rule", command=_on_remove_rule).pack(side=tk.LEFT, padx=(4, 0))
-        ttk.Button(rule_btn_row, text="Assign layer mapping", command=_on_assign_mapping).pack(side=tk.RIGHT)
 
         def _on_save() -> None:
             self._ditch_rules = parse_ditch_rules(ditch_rules_to_payload(local_rules))
-            self._ditch_layer_catalog = DitchLayerCatalog.from_payload(local_catalog.to_payload())
             self._refresh_ditch_controls()
             dialog.destroy()
 
@@ -4906,9 +5037,7 @@ class KOFViewer(tk.Tk):
         footer.pack(fill=tk.X)
         ttk.Button(footer, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT)
         ttk.Button(footer, text="Save", command=_on_save).pack(side=tk.RIGHT, padx=(0, 6))
-
         _refresh_rules_list()
-        _refresh_mapping_list()
         self.wait_window(dialog)
 
     def _run_section_report(self, out_root: str, request: dict[str, Any]) -> dict[str, Any]:
@@ -4932,7 +5061,7 @@ class KOFViewer(tk.Tk):
         profile_rows: list[dict[str, object]] = []
         volume_bar_samples: list[dict[str, float]] = []
         plan_points: list[tuple[str, tuple[float, float]]] = []
-        surface_lookup = {surface.name: surface for surface in self.files}
+        surface_lookup = self._volume_surface_choices()
         applied_ditch_rule_codes: set[str] = set()
         hit_stop_layers: set[str] = set()
 
@@ -5327,6 +5456,11 @@ class KOFViewer(tk.Tk):
         self._update_status()
 
     def _redraw_2d(self) -> None:
+        if hasattr(self, "pit_daylight_text"):
+            pit_dbg = str(getattr(self, "_pit_daylight_debug", "")).strip()
+            self.pit_daylight_text.set(
+                f"Pit daylight: {pit_dbg}" if pit_dbg else "Pit daylight: (not evaluated)"
+            )
         section_checksum = tuple(
             (float(p0[0]), float(p0[1]), float(p1[0]), float(p1[1]))
             for (p0, p1) in self._sections
@@ -5424,6 +5558,11 @@ class KOFViewer(tk.Tk):
             return
         self.runtime_state.last_render_2d_signature = signature
         render_2d(self, FILE_COLORS)
+        if hasattr(self, "pit_daylight_text"):
+            pit_dbg = str(getattr(self, "_pit_daylight_debug", "")).strip()
+            self.pit_daylight_text.set(
+                f"Pit daylight: {pit_dbg}" if pit_dbg else "Pit daylight: (not evaluated)"
+            )
 
     def _redraw_3d(self) -> None:
         signature = (
@@ -5578,6 +5717,9 @@ class KOFViewer(tk.Tk):
         if self._notes:
             n_with_text = sum(1 for n in self._notes if bool(n.text.strip()))
             base += f"   |   notes: {len(self._notes)} ({n_with_text} with comment)"
+        pit_daylight_debug = str(getattr(self, "_pit_daylight_debug", "")).strip()
+        if pit_daylight_debug:
+            base += f"   |   pit daylight: {pit_daylight_debug}"
         self.status.set(base)
 
 
