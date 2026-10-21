@@ -21,7 +21,7 @@ import geopandas as gpd
 from shapely.geometry import Point
 
 from kofvision.models import KOFPoint
-from kofvision.parser import parse_kof, parse_kof_coordinate_line
+from kofvision.parser import parse_kof_as_koffile, parse_kof_coordinate_line
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,7 @@ def read_kof_file(file_path: str, *, crs: Optional[str] = None, encoding: str = 
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"KOF file not found: {file_path}")
 
-    parsed = parse_kof(file_path, encoding=encoding)
+    parsed = parse_kof_as_koffile(file_path, encoding=encoding)
     points: list[KOFPoint] = parsed.all_points
 
     gdf = gpd.GeoDataFrame(

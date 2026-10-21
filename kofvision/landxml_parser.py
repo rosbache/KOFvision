@@ -9,7 +9,7 @@ from urllib.request import urlopen
 import numpy as np
 from lxml import etree
 
-from .models import LandXMLAlignment, LandXMLFile, LandXMLStation, LandXMLSurface
+from .models import LandXMLAlignment, LandXMLFile, LandXMLStation, VectorSurface
 
 
 SCHEMA_BY_NAMESPACE: dict[str, str] = {
@@ -146,8 +146,8 @@ def _interpolate_pvi_z(pvi: list[tuple[float, float]], station: float) -> Option
     return None
 
 
-def _parse_surfaces(root: etree._Element, ns: str, path: str) -> list[LandXMLSurface]:
-    out: list[LandXMLSurface] = []
+def _parse_surfaces(root: etree._Element, ns: str, path: str) -> list[VectorSurface]:
+    out: list[VectorSurface] = []
     for surf in root.findall(f".//{{{ns}}}Surfaces/{{{ns}}}Surface"):
         surf_name = surf.get("name") or "surface"
         pnts_node = surf.find(f".//{{{ns}}}Definition/{{{ns}}}Pnts")
@@ -188,7 +188,17 @@ def _parse_surfaces(root: etree._Element, ns: str, path: str) -> list[LandXMLSur
                     continue
                 faces.append(tri)
 
-        out.append(LandXMLSurface(path=path, layer_name=surf_name, points=ordered_points, faces=faces))
+        out.append(
+            VectorSurface(
+                path=path,
+                layer_name=surf_name,
+                points=ordered_points,
+                triangles=faces,
+                source_kind="landxml",
+                point_labels=[f"{surf_name}-{idx}" for idx, _ in enumerate(ordered_points)],
+                point_codes=[surf_name for _ in ordered_points],
+            )
+        )
     return out
 
 

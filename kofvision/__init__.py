@@ -6,11 +6,14 @@ from .models import (
     LandXMLFile,
     LandXMLStation,
     LandXMLSurface,
+    VectorSurface,
+    koffile_to_vector_surface,
+    vector_surface_to_koffile,
 )
 from .export import export_kof_files_to_gpkg, export_surfaces_to_gpkg
 from .landxml_parser import parse_landxml
-from .parser import parse_kof, parse_kof_coordinate_line
-from .sosi_import import parse_sosi_as_kof
+from .parser import parse_kof, parse_kof_as_koffile, parse_kof_coordinate_line
+from .sosi_import import parse_sosi_as_kof, parse_sosi_surface
 from .volume import (
     ConstantElevationSurface,
     SplitVolumeResult,
@@ -26,11 +29,16 @@ __all__ = [
     "LandXMLStation",
     "LandXMLAlignment",
     "LandXMLSurface",
+    "VectorSurface",
+    "koffile_to_vector_surface",
+    "vector_surface_to_koffile",
     "LandXMLFile",
     "export_kof_files_to_gpkg",
     "export_surfaces_to_gpkg",
     "parse_kof",
+    "parse_kof_as_koffile",
     "parse_sosi_as_kof",
+    "parse_sosi_surface",
     "parse_landxml",
     "parse_kof_coordinate_line",
     "ConstantElevationSurface",

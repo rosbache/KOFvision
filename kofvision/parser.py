@@ -4,7 +4,7 @@ import logging
 import re
 from typing import Iterable, Optional
 
-from .models import KOFBlock, KOFFile, KOFPoint
+from .models import KOFBlock, KOFFile, KOFPoint, VectorSurface, koffile_to_vector_surface
 
 logger = logging.getLogger(__name__)
 
@@ -132,8 +132,8 @@ def read_lines_with_fallback(file_path: str, encoding: str = "utf-8") -> Iterabl
             return handle.readlines()
 
 
-def parse_kof(file_path: str, *, encoding: str = "utf-8") -> KOFFile:
-    """Parse a KOF file into blocks (polylines + loose points)."""
+def parse_kof_as_koffile(file_path: str, *, encoding: str = "utf-8") -> KOFFile:
+    """Parse a KOF file into legacy KOF blocks (polylines + loose points)."""
     blocks: list[KOFBlock] = []
     current: Optional[KOFBlock] = None
     loose = KOFBlock(is_polyline=False)
@@ -171,3 +171,9 @@ def parse_kof(file_path: str, *, encoding: str = "utf-8") -> KOFFile:
         blocks.append(loose)
 
     return KOFFile(path=file_path, blocks=blocks)
+
+
+def parse_kof(file_path: str, *, encoding: str = "utf-8") -> VectorSurface:
+    """Parse a KOF file into a format-independent VectorSurface."""
+    legacy = parse_kof_as_koffile(file_path, encoding=encoding)
+    return koffile_to_vector_surface(legacy)
