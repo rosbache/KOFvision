@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 
-from kofvision.models import KOFFile, LandXMLSurface
+from kofvision.models import KOFFile, VectorSurface, koffile_to_vector_surface
 from kofvision.viewer_ui import apply_matplotlib_axes_theme, apply_matplotlib_figure_theme, apply_matplotlib_legend_theme
 
 
@@ -66,70 +66,82 @@ def _draw_surface_layers(viewer: Any, file_colors: list[str]) -> None:
         if not viewer._is_layer_visible(idx):
             continue
         color = file_colors[idx % len(file_colors)]
-        if isinstance(surface, KOFFile):
-            _draw_kof_surface(viewer, surface, color)
-        else:
-            _draw_landxml_surface_points(viewer, surface, color)
+        _draw_surface_points(viewer, surface, color)
         _draw_surface_triangulation(viewer, surface, color)
 
 
-def _draw_kof_surface(viewer: Any, surface: KOFFile, color: str) -> None:
+def _draw_surface_points(viewer: Any, surface: Any, color: str) -> None:
+    vector = _coerce_surface(surface)
     labeled = False
-    for block in surface.blocks:
-        if not block.points:
-            continue
-        xs = [p.y for p in block.points]
-        ys = [p.x for p in block.points]
-        label = surface.name if not labeled else None
-        labeled = True
-        if block.is_polyline and viewer.show_lines.get() and len(block.points) >= 2:
-            viewer.ax2d.plot(xs, ys, "-", color=color, linewidth=1.2, label=label)
-            if viewer.show_markers.get():
-                viewer.ax2d.plot(xs, ys, "o", color=color, markersize=3)
-        else:
-            marker = "o" if viewer.show_markers.get() else "."
-            viewer.ax2d.plot(xs, ys, marker, color=color, markersize=4, linestyle="None", label=label)
+    if vector.line_strings:
+        for line_idx, line in enumerate(vector.line_strings):
+            if not line:
+                continue
+            xs = [p[0] for p in line]
+            ys = [p[1] for p in line]
+            label = vector.name if not labeled else None
+            labeled = True
+            if viewer.show_lines.get() and len(line) >= 2:
+                viewer.ax2d.plot(xs, ys, "-", color=color, linewidth=1.2, label=label)
+                if viewer.show_markers.get():
+                    viewer.ax2d.plot(xs, ys, "o", color=color, markersize=3)
+            elif viewer.show_markers.get():
+                viewer.ax2d.plot(xs, ys, "o", color=color, markersize=4, linestyle="None", label=label)
 
-        if viewer.show_labels.get():
-            step = _label_step(len(block.points), _max_label_count(viewer))
-            for pidx, point in enumerate(block.points):
-                if pidx % step != 0:
-                    continue
-                viewer.ax2d.annotate(
-                    point.pkt,
-                    (point.y, point.x),
-                    fontsize=7,
-                    xytext=(3, 3),
-                    textcoords="offset points",
-                    color=color,
-                )
+            if viewer.show_labels.get() and vector.point_labels:
+                step = _label_step(len(line), _max_label_count(viewer))
+                start = 0
+                for prev in vector.line_strings[:line_idx]:
+                    start += len(prev)
+                for pidx, point in enumerate(line):
+                    if pidx % step != 0:
+                        continue
+                    label_idx = start + pidx
+                    text = vector.point_labels[label_idx] if label_idx < len(vector.point_labels) else str(label_idx)
+                    viewer.ax2d.annotate(
+                        text,
+                        (point[0], point[1]),
+                        fontsize=7,
+                        xytext=(3, 3),
+                        textcoords="offset points",
+                        color=color,
+                    )
+        return
 
-
-def _draw_landxml_surface_points(viewer: Any, surface: Any, color: str) -> None:
-    if viewer.show_markers.get() and surface.ensure_triangulation() and surface._xy is not None:
-        viewer.ax2d.plot(
-            surface._xy[:, 0],
-            surface._xy[:, 1],
-            "o",
-            color=color,
-            markersize=2,
-            linestyle="None",
-            label=surface.name,
-        )
+    if not viewer.show_markers.get() or not vector.points:
+        return
+    xs = [p[0] for p in vector.points]
+    ys = [p[1] for p in vector.points]
+    viewer.ax2d.plot(xs, ys, "o", color=color, markersize=3, linestyle="None", label=vector.name)
+    if viewer.show_labels.get() and vector.point_labels:
+        step = _label_step(len(vector.points), _max_label_count(viewer))
+        for pidx, point in enumerate(vector.points):
+            if pidx % step != 0:
+                continue
+            text = vector.point_labels[pidx] if pidx < len(vector.point_labels) else str(pidx)
+            viewer.ax2d.annotate(
+                text,
+                (point[0], point[1]),
+                fontsize=7,
+                xytext=(3, 3),
+                textcoords="offset points",
+                color=color,
+            )
 
 
 def _draw_surface_triangulation(viewer: Any, surface: Any, color: str) -> None:
-    draw_tin_faces = isinstance(surface, LandXMLSurface) and len(surface.faces) > 0 and viewer.show_lines.get()
-    if not ((viewer.show_triangulation.get() or draw_tin_faces) and surface.ensure_triangulation()):
+    vector = _coerce_surface(surface)
+    draw_tin_faces = len(vector.triangles) > 0 and viewer.show_lines.get()
+    if not ((viewer.show_triangulation.get() or draw_tin_faces) and vector.ensure_triangulation()):
         return
-    kept = surface.kept_simplices
+    kept = vector.kept_simplices
     if kept is None or len(kept) == 0:
         return
-    if draw_tin_faces and viewer.show_tin_fill.get() and surface._xy is not None:
+    if draw_tin_faces and viewer.show_tin_fill.get() and vector._xy is not None:
         face_vals = np.zeros(len(kept), dtype=float)
         viewer.ax2d.tripcolor(
-            surface._xy[:, 0],
-            surface._xy[:, 1],
+            vector._xy[:, 0],
+            vector._xy[:, 1],
             face_vals,
             triangles=kept,
             shading="flat",
@@ -140,13 +152,37 @@ def _draw_surface_triangulation(viewer: Any, surface: Any, color: str) -> None:
             zorder=1,
         )
     viewer.ax2d.triplot(
-        surface._xy[:, 0],
-        surface._xy[:, 1],
+        vector._xy[:, 0],
+        vector._xy[:, 1],
         kept,
         color=color,
         linewidth=0.45,
         alpha=0.75,
     )
+
+
+def _draw_landxml_surface_points(viewer: Any, surface: Any, color: str) -> None:
+    vector = _coerce_surface(surface)
+    if viewer.show_markers.get() and vector.ensure_triangulation() and vector._xy is not None:
+        viewer.ax2d.plot(
+            vector._xy[:, 0],
+            vector._xy[:, 1],
+            "o",
+            color=color,
+            markersize=2,
+            linestyle="None",
+            label=vector.name,
+        )
+
+
+def _draw_kof_surface(viewer: Any, surface: KOFFile, color: str) -> None:
+    vector = _coerce_surface(surface)
+    for line in vector.line_strings:
+        if not line:
+            continue
+        xs = [p[0] for p in line]
+        ys = [p[1] for p in line]
+        viewer.ax2d.plot(xs, ys, "-", color=color, linewidth=1.2)
 
 
 def _draw_alignments_and_stations(viewer: Any, file_colors: list[str]) -> None:
@@ -658,43 +694,68 @@ def _draw_3d_surface_layers(viewer: Any, file_colors: list[str]) -> None:
         if not viewer._is_layer_visible(idx):
             continue
         color = file_colors[idx % len(file_colors)]
+        vector = _coerce_surface(surface)
         labeled = False
-        if viewer.show_triangulation.get() and hasattr(surface, "ensure_triangulation") and surface.ensure_triangulation():
-            kept = surface.kept_simplices
+        if viewer.show_triangulation.get() and vector.ensure_triangulation():
+            kept = vector.kept_simplices
             if kept is not None and len(kept) > 0:
                 viewer.ax3d.plot_trisurf(
-                    surface._xy[:, 0],
-                    surface._xy[:, 1],
-                    surface._z,
+                    vector._xy[:, 0],
+                    vector._xy[:, 1],
+                    vector._z,
                     triangles=kept,
                     color=color,
                     alpha=0.35,
                     linewidth=0.2,
                     edgecolor=color,
                 )
-        if isinstance(surface, KOFFile):
-            for block in surface.blocks:
-                if not block.points:
-                    continue
-                xs = [p.y for p in block.points]
-                ys = [p.x for p in block.points]
-                zs = [p.h for p in block.points]
-                label = surface.name if not labeled else None
-                labeled = True
-                if block.is_polyline and viewer.show_lines.get() and len(block.points) >= 2:
-                    viewer.ax3d.plot(xs, ys, zs, "-", color=color, linewidth=1.2, label=label)
-                    if viewer.show_markers.get():
-                        viewer.ax3d.scatter(xs, ys, zs, color=color, s=10)
-                else:
-                    if viewer.show_markers.get():
-                        viewer.ax3d.scatter(xs, ys, zs, color=color, s=12, label=label)
+        for line in vector.line_strings:
+            if not line:
+                continue
+            xs = [p[0] for p in line]
+            ys = [p[1] for p in line]
+            zs = [p[2] for p in line]
+            label = vector.name if not labeled else None
+            labeled = True
+            if viewer.show_lines.get() and len(line) >= 2:
+                viewer.ax3d.plot(xs, ys, zs, "-", color=color, linewidth=1.2, label=label)
+                if viewer.show_markers.get():
+                    viewer.ax3d.scatter(xs, ys, zs, color=color, s=10)
+            elif viewer.show_markers.get():
+                viewer.ax3d.scatter(xs, ys, zs, color=color, s=12, label=label)
 
-                if viewer.show_labels.get():
-                    for point in block.points:
-                        viewer.ax3d.text(point.y, point.x, point.h, point.pkt, fontsize=7, color=color)
-        else:
-            if surface.ensure_triangulation() and surface._xy is not None and surface._z is not None and viewer.show_markers.get():
-                viewer.ax3d.scatter(surface._xy[:, 0], surface._xy[:, 1], surface._z, color=color, s=10, label=surface.name)
+        if not vector.line_strings and viewer.show_markers.get():
+            viewer.ax3d.scatter(
+                [p[0] for p in vector.points],
+                [p[1] for p in vector.points],
+                [p[2] for p in vector.points],
+                color=color,
+                s=10,
+                label=vector.name if not labeled else None,
+            )
+        if viewer.show_labels.get() and vector.point_labels:
+            for idx, (y, x, h) in enumerate(vector.points):
+                label = vector.point_labels[idx] if idx < len(vector.point_labels) else str(idx)
+                viewer.ax3d.text(y, x, h, label, fontsize=7, color=color)
+
+
+def _coerce_surface(surface: Any) -> VectorSurface:
+    if isinstance(surface, VectorSurface):
+        return surface
+    if isinstance(surface, KOFFile):
+        return koffile_to_vector_surface(surface)
+    if hasattr(surface, "points") and hasattr(surface, "path"):
+        return VectorSurface(
+            path=str(surface.path),
+            points=[(float(y), float(x), float(z)) for (y, x, z) in surface.points],
+            line_strings=[[(float(y), float(x), float(z)) for (y, x, z) in line] for line in getattr(surface, "line_strings", [])],
+            triangles=[tuple(int(i) for i in tri) for tri in getattr(surface, "triangles", getattr(surface, "faces", []))],
+            layer_name=getattr(surface, "layer_name", None),
+            source_kind=str(getattr(surface, "source_kind", "vector")),
+            point_labels=[str(v) for v in getattr(surface, "point_labels", [])],
+            point_codes=[str(v) for v in getattr(surface, "point_codes", [])],
+        )
+    raise TypeError(f"Unsupported surface type: {type(surface).__name__}")
 
 
 def _draw_3d_volume_bars(viewer: Any) -> None:
