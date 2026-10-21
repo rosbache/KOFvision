@@ -1,6 +1,6 @@
 # KOFvision
 
-KOFvision is a standalone Python viewer for KOF survey files with:
+KOFvision is a standalone Python viewer for KOF/SOSI/LandXML survey surfaces with:
 
 - 2D and 3D visualization
 - KOF polyline parsing (`09 91` ... `09 99` / `09 96`)
@@ -12,7 +12,7 @@ The main app is implemented in `kof_viewer.py`.
 
 ## Features
 
-- Open one or more `.kof` files
+- Open one or more `.kof`, `.sos`/`.sosi`, or `.xml` (LandXML) files
 - Plot points/polylines in 2D plan view
 - Plot points/polylines in 3D with optional triangulated surface
 - Toggle labels, markers, lines, triangulation, and equal aspect mode
@@ -27,12 +27,12 @@ The main app is implemented in `kof_viewer.py`.
 	- volume source modes:
 		- `Selected surfaces` (default): independently choose KOF, LandXML, or elevation raster for Top and Bottom
 		- legacy active-raster modes remain available:
-		- `KOF - KOF`
-		- `Top KOF - Raster`
-		- `Raster - Bottom KOF`
-		- `Raster - Top KOF`
+		- `Top surface - Bottom surface`
+		- `Top surface - Raster`
+		- `Raster - Bottom surface`
+		- `Raster - Top surface`
 - Optional intermediate layer for split-volume calculation:
-	- KOF or LandXML layer
+	- KOF, SOSI, or LandXML layer
 	- raster elevation layer
 	- virtual constant Z plane
 	- split output:
@@ -59,7 +59,9 @@ The main app is implemented in `kof_viewer.py`.
 	- profile images at fixed spacing along a baseline (for example every 1 m)
 	- plan-view image with baseline and profile numbers
 	- HTML report and JSON manifest
-- Export loaded KOF source data to GeoPackage (points + original polylines)
+- Export loaded vector surfaces to GeoPackage:
+	- KOF/SOSI source points + original polylines
+	- LandXML source points + TIN triangles
 
 ## Requirements
 
@@ -212,12 +214,14 @@ The ditch workflow lets you define centerline-driven profile modifications befor
 
 ### Layer Mapping (Stop Rules)
 
-In Ditch setup, assign surface names to material slots:
+In Volume setup, assign surface names to material slots (project-level mapping):
 
 - `rock[0..9]`
 - `moist[0..9]`
 - `constructiontc[0..9]`
 
+These mappings are shared across ditch rules and pit stop-layer settings.
+You can map both vector surfaces (KOF/LandXML) and loaded elevation rasters (`Raster: ...` entries).
 If a rule has a stop material/slot and mapped surface, extension is clipped at that stop surface.
 
 ### Chained Surfaces
@@ -329,6 +333,8 @@ DEM conversion details and limitations:
 - DEM triangles are piecewise planar. They can differ from bilinear raster interpolation on non-planar quads, so the two methods need not produce identical cut/fill results.
 - Orthophotos/RGB rasters are display-only and are not elevation inputs.
 - Theoretical pit surfaces still require the raster method.
+- For sloped pits, the 2D plan map draws a dedicated pit slope-end line (daylight line) for each visible pit.
+  If the side slope is very shallow, KOFvision automatically expands the search area so the outer daylight line is still found and shown.
 - Large-raster loading, clipping, and mesh scalability are unchanged.
 
 ### Intermediate Split-Volume
