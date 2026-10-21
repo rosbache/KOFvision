@@ -64,9 +64,9 @@ from matplotlib.figure import Figure
 from matplotlib.path import Path as MplPath
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
 
-from kofvision import compute_volume, compute_volume_with_intermediate, parse_kof, parse_landxml, parse_sosi_as_kof
+from kofvision import compute_volume, compute_volume_with_intermediate, parse_kof, parse_landxml, parse_sosi_surface
 from kofvision.export import export_surfaces_to_gpkg
-from kofvision.models import KOFFile, LandXMLFile, LandXMLStation, LandXMLSurface
+from kofvision.models import LandXMLFile, LandXMLStation, VectorSurface
 from kofvision.mask_io import (
     MaskDataError,
     MaskDefinition,
@@ -272,7 +272,7 @@ class KOFViewer(tk.Tk):
             ctk.set_appearance_mode("Dark" if self.theme_mode.get() == "dark" else "Light")
             ctk.set_default_color_theme("blue")
 
-        self.files: list[KOFFile | LandXMLSurface] = []
+        self.files: list[VectorSurface] = []
         self.landxml_files: list[LandXMLFile] = []
         self.layer_vars: list[tk.BooleanVar] = []
         self._surface_owner_paths: list[Optional[str]] = []
@@ -2587,21 +2587,13 @@ class KOFViewer(tk.Tk):
                 rxmin, rxmax, rymin, rymax = layer.extent
                 include(rxmin, rxmax, rymin, rymax)
 
-        for idx, kof in enumerate(self.files):
+        for idx, surface in enumerate(self.files):
             if not self._is_layer_visible(idx):
                 continue
-            if isinstance(kof, KOFFile):
-                points = kof.all_points
-                if not points:
-                    continue
-                xs = [p.y for p in points]
-                ys = [p.x for p in points]
-                include(min(xs), max(xs), min(ys), max(ys))
-            else:
-                b = kof.xy_bounds()
-                if b is None:
-                    continue
-                include(b[0], b[2], b[1], b[3])
+            b = surface.xy_bounds()
+            if b is None:
+                continue
+            include(b[0], b[2], b[1], b[3])
 
         for lx in self.landxml_files:
             for alignment in lx.alignments:
@@ -2709,14 +2701,14 @@ class KOFViewer(tk.Tk):
                             f"Strict XSD validation {verdict}\nFile: {landxml.name}\nSchema: {source}\n\n{details}",
                         )
             elif ext in {".sos", ".sosi"}:
-                surface = parse_sosi_as_kof(path)
+                surface = parse_sosi_surface(path)
                 self.files.append(surface)
                 self.layer_vars.append(tk.BooleanVar(value=True))
                 self._surface_owner_paths.append(None)
                 self._surface_source_paths.append(path)
             else:
-                kof = parse_kof(path)
-                self.files.append(kof)
+                surface = parse_kof(path)
+                self.files.append(surface)
                 self.layer_vars.append(tk.BooleanVar(value=True))
                 self._surface_owner_paths.append(None)
                 self._surface_source_paths.append(path)
@@ -2892,14 +2884,11 @@ class KOFViewer(tk.Tk):
             if owner_path is not None:
                 continue
 
-            if isinstance(surface, KOFFile):
-                n_pts = sum(len(b.points) for b in surface.blocks)
-                n_pl = sum(1 for b in surface.blocks if b.is_polyline and b.points)
-                label = f"{surface.name} ({n_pts} pts, {n_pl} pl)"
-            else:
-                n_pts = len(surface.all_points)
-                n_pl = len(surface.faces)
-                label = f"{surface.name} ({n_pts} pts, {n_pl} tri)"
+            n_pts = len(surface.all_points)
+            n_pl = len(getattr(surface, "line_strings", []))
+            n_tri = len(getattr(surface, "triangles", []))
+            primitive_label = f"{n_pl} pl" if n_pl > 0 and n_tri == 0 else f"{n_tri} tri"
+            label = f"{surface.name} ({n_pts} pts, {primitive_label})"
             if _matches(label):
                 ttk.Checkbutton(
                     self.layers_inner,
@@ -2928,11 +2917,12 @@ class KOFViewer(tk.Tk):
 
                 for idx in child_indices:
                     surface = self.files[idx]
-                    if not isinstance(surface, LandXMLSurface):
+                    if getattr(surface, "source_kind", "") != "landxml":
                         continue
                     n_pts = len(surface.all_points)
-                    n_tri = len(surface.faces)
-                    label = f"    - {surface.layer_name} ({n_pts} pts, {n_tri} tri)"
+                    n_tri = len(getattr(surface, "triangles", []))
+                    layer_name = str(getattr(surface, "layer_name", surface.name))
+                    label = f"    - {layer_name} ({n_pts} pts, {n_tri} tri)"
                     if _matches(label):
                         ttk.Checkbutton(
                             self.layers_inner,
@@ -5589,17 +5579,11 @@ class KOFViewer(tk.Tk):
         all_x: list[float] = []
         all_y: list[float] = []
         all_z: list[float] = []
-        for kof in self.files:
-            if isinstance(kof, KOFFile):
-                for p in kof.all_points:
-                    all_x.append(p.y)
-                    all_y.append(p.x)
-                    all_z.append(p.h)
-            else:
-                if kof.ensure_triangulation() and kof._xy is not None and kof._z is not None:
-                    all_x.extend(kof._xy[:, 0].tolist())
-                    all_y.extend(kof._xy[:, 1].tolist())
-                    all_z.extend(kof._z.tolist())
+        for surface in self.files:
+            if surface.ensure_triangulation() and surface._xy is not None and surface._z is not None:
+                all_x.extend(surface._xy[:, 0].tolist())
+                all_y.extend(surface._xy[:, 1].tolist())
+                all_z.extend(surface._z.tolist())
         if not all_x:
             return
         rx = max(all_x) - min(all_x)
@@ -5659,19 +5643,16 @@ class KOFViewer(tk.Tk):
         parts = []
         total_points = 0
         total_blocks = 0
-        for kof in self.files:
-            if isinstance(kof, KOFFile):
-                n_pts = sum(len(b.points) for b in kof.blocks)
-                n_pl = sum(1 for b in kof.blocks if b.is_polyline and b.points)
-                total_points += n_pts
-                total_blocks += n_pl
-                parts.append(f"{kof.name}: {n_pts} pts / {n_pl} polylines")
+        for surface in self.files:
+            n_pts = len(surface.all_points)
+            n_pl = len(getattr(surface, "line_strings", []))
+            n_tri = len(getattr(surface, "triangles", []))
+            total_points += n_pts
+            total_blocks += max(n_pl, n_tri)
+            if n_tri > 0 and n_pl == 0:
+                parts.append(f"{surface.name}: {n_pts} pts / {n_tri} triangles")
             else:
-                n_pts = len(kof.all_points)
-                n_tri = len(kof.faces)
-                total_points += n_pts
-                total_blocks += n_tri
-                parts.append(f"{kof.name}: {n_pts} pts / {n_tri} triangles")
+                parts.append(f"{surface.name}: {n_pts} pts / {n_pl} polylines")
         for lx in self.landxml_files:
             n_align = len(lx.alignments)
             n_sta = sum(len(a.stations) for a in lx.alignments)
