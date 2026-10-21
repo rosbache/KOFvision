@@ -34,6 +34,7 @@ class _Viewer:
     _find_volume_surface = KOFViewer._find_volume_surface
     _find_file = KOFViewer._find_file
     _refresh_file_selectors = KOFViewer._refresh_file_selectors
+    _refresh_volume_stop_mapping_controls = lambda self: None  # noqa: E731
     _current_volume_mode_key = KOFViewer._current_volume_mode_key
     _current_intermediate_type_key = KOFViewer._current_intermediate_type_key
     _resolve_intermediate_surface = KOFViewer._resolve_intermediate_surface
