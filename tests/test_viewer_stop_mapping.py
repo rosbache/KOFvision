@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from kof_viewer import KOFViewer
 from kofvision.ditch import DitchLayerCatalog
-from kofvision.pit import PitSettings
+from kofvision.pit import PitPolygon, PitSettings
 
 
 class _Var:
@@ -88,6 +88,24 @@ class _DummyViewer:
         self.redraw_calls += 1
 
 
+class _DummyPitSelectionViewer:
+    _resolve_active_pit_index = KOFViewer._resolve_active_pit_index
+    _active_pit = KOFViewer._active_pit
+    _pit_indices_for_compute = KOFViewer._pit_indices_for_compute
+
+    def __init__(self) -> None:
+        self._pit_polygons = [
+            PitPolygon(name="Pit A", vertices=[(0.0, 0.0), (0.0, 1.0), (1.0, 1.0)], target_z=10.0, visible=True),
+            PitPolygon(name="Pit B", vertices=[(2.0, 2.0), (2.0, 3.0), (3.0, 3.0)], target_z=11.0, visible=True),
+        ]
+        self._active_pit_index = None
+        self.active_pit_var = _Var("Pit B")
+        self._pit_visibility_vars = [_Var(True), _Var(True)]
+
+    def _pit_is_visible(self, index: int) -> bool:
+        return bool(self._pit_visibility_vars[index].get())
+
+
 def test_refresh_volume_stop_mapping_controls_populates_choices_and_rows() -> None:
     viewer = _DummyViewer()
     viewer._refresh_volume_stop_mapping_controls()
@@ -120,3 +138,11 @@ def test_pit_settings_change_marks_volume_stale_and_redraws() -> None:
     assert viewer.volume_text.get() == "Volume: (stale – recompute)"
     assert viewer.refresh_calls == 1
     assert viewer.redraw_calls == 1
+
+
+def test_selected_pit_name_recovers_active_pit_index() -> None:
+    viewer = _DummyPitSelectionViewer()
+    assert viewer._active_pit() is not None
+    assert viewer._active_pit().name == "Pit B"
+    assert viewer._active_pit_index == 1
+    assert viewer._pit_indices_for_compute("selected") == [1]

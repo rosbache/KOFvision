@@ -32,7 +32,7 @@ Usage
 
 from __future__ import annotations
 
-__version__ = "0.2026.10.20"
+__version__ = "0.2026.10.21"
 
 import argparse
 import copy
@@ -973,12 +973,14 @@ class KOFViewer(tk.Tk):
         ttk.Label(top_row, text="Top:").pack(side=tk.LEFT)
         self.top_combo = ttk.Combobox(top_row, textvariable=self.top_var, width=28, state="readonly")
         self.top_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+        self.top_combo.bind("<<ComboboxSelected>>", self._on_volume_surface_selection_change)
 
         bottom_row = ttk.Frame(volume_panel)
         bottom_row.pack(fill=tk.X, pady=(0, 2))
         ttk.Label(bottom_row, text="Bottom:").pack(side=tk.LEFT)
         self.bottom_combo = ttk.Combobox(bottom_row, textvariable=self.bottom_var, width=28, state="readonly")
         self.bottom_combo.pack(side=tk.LEFT, padx=(6, 0), fill=tk.X, expand=True)
+        self.bottom_combo.bind("<<ComboboxSelected>>", self._on_volume_surface_selection_change)
 
         source_row = ttk.Frame(volume_panel)
         source_row.pack(fill=tk.X, pady=(0, 2))
@@ -1856,9 +1858,22 @@ class KOFViewer(tk.Tk):
         self._active_pit_index = index
         self.active_pit_var.set(self._pit_polygons[index].name)
 
-    def _active_pit(self) -> Optional[PitPolygon]:
+    def _resolve_active_pit_index(self) -> Optional[int]:
         idx = self._active_pit_index
-        if idx is None or idx < 0 or idx >= len(self._pit_polygons):
+        if idx is not None and 0 <= idx < len(self._pit_polygons):
+            return idx
+        selected = self.active_pit_var.get().strip()
+        if not selected:
+            return None
+        for pit_idx, pit in enumerate(self._pit_polygons):
+            if pit.name == selected:
+                self._active_pit_index = pit_idx
+                return pit_idx
+        return None
+
+    def _active_pit(self) -> Optional[PitPolygon]:
+        idx = self._resolve_active_pit_index()
+        if idx is None:
             return None
         return self._pit_polygons[idx]
 
@@ -3308,8 +3323,8 @@ class KOFViewer(tk.Tk):
         if not self._pit_polygons:
             return []
         if scope == "selected":
-            idx = self._active_pit_index
-            if idx is None or idx < 0 or idx >= len(self._pit_polygons):
+            idx = self._resolve_active_pit_index()
+            if idx is None:
                 return []
             return [idx]
         if scope == "visible":
@@ -4633,6 +4648,12 @@ class KOFViewer(tk.Tk):
                 self._refresh_pit_controls()
                 self._redraw_2d()
                 return
+
+    def _on_volume_surface_selection_change(self, _event=None) -> None:  # noqa: ANN001
+        if self.last_volume is not None:
+            self.volume_text.set("Volume: (stale – recompute)")
+        self._redraw_2d()
+        self._update_status()
 
     def _on_toggle_pit(self) -> None:
         PitTool.toggle(self)
