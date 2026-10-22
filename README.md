@@ -17,6 +17,7 @@ The main app is implemented in `kof_viewer.py`.
 - Plot points/polylines in 3D with optional triangulated surface
 - Toggle labels, markers, lines, triangulation, and equal aspect mode
 - Load a georeferenced orthophoto/raster background in the 2D tab
+- Configure an optional WMS background for the 2D tab
 - Toggle file layers and raster layer from the Layers panel
 - Zoom 2D view to selected (visible) layers
 - Select top and bottom surfaces and compute:
@@ -40,6 +41,7 @@ The main app is implemented in `kof_viewer.py`.
 		- Intermediate - Bottom
 		- Total (sum of both legs)
 - Load multiple raster layers, reorder them (up/down), toggle visibility, and set per-layer alpha
+- Refresh WMS maps asynchronously while panning or zooming the 2D view
 - Use any loaded single-band elevation raster as Top, Bottom, or Intermediate with either volume method
 - Set an active elevation raster for legacy raster source modes and the section reference profile
 - Optionally clip raster loading to current KOF bounds with user-defined buffer
@@ -137,6 +139,10 @@ KOFvision now uses a hybrid layout aimed at faster access to common actions and 
 	- LandXML schema
 
 The right panel supports collapse/expand per section and vertical scrolling for smaller screens.
+
+### WMS background
+
+In the Raster panel, choose **Configure WMS background...** and enter the WMS GetMap service URL, layer name, and CRS used by the loaded map coordinates (for example, `EPSG:25832`). KOFvision requests a transparent PNG map image for the current 2D extent and updates it when the view is panned or zoomed. WMS configuration is session-only and is not saved in project files.
 
 ## Keyboard Shortcuts
 

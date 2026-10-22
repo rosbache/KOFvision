@@ -47,6 +47,15 @@ def initialize_3d_axes(viewer: Any) -> None:
 
 
 def _draw_rasters(viewer: Any) -> None:
+    wms_map = getattr(viewer, "_wms_map", None)
+    wms_visible = getattr(viewer, "wms_visible", None)
+    if wms_map is not None and wms_visible is not None and wms_visible.get():
+        viewer.ax2d.imshow(
+            wms_map.image,
+            extent=wms_map.extent,
+            origin="upper",
+            zorder=0,
+        )
     if not (viewer.show_raster.get() and viewer._raster_layers):
         return
     for layer in viewer._raster_layers:

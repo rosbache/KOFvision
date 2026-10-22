@@ -123,6 +123,7 @@ from kofvision.validation import safe_float
 from kofvision.volume_controller import combine_volume_results, compute_volume_for_mask
 from kofvision.viewer_runtime_state import ViewerRuntimeState
 from kofvision.viewer_undo import EditSnapshot, UndoRedoManager
+from kofvision.wms import WMSConfig, WMSMap, fetch_wms_map, validate_wms_config
 from kofvision.ditch import (
     DitchLayerCatalog,
     DitchRule,
@@ -295,6 +296,7 @@ class KOFViewer(tk.Tk):
         self.equal_aspect = tk.BooleanVar(value=True)
         self.show_raster = tk.BooleanVar(value=False)
         self.raster_alpha = tk.DoubleVar(value=0.7)
+        self.wms_visible = tk.BooleanVar(value=False)
 
         self.top_var = tk.StringVar()
         self.bottom_var = tk.StringVar()
@@ -337,6 +339,14 @@ class KOFViewer(tk.Tk):
         self._elevation_raster_index: Optional[int] = None
         self._intermediate_raster_index_map: dict[str, int] = {}
         self._view_extent_2d: Optional[tuple[float, float, float, float]] = None
+        self._wms_config: Optional[WMSConfig] = None
+        self._wms_map: Optional[WMSMap] = None
+        self._wms_request_id = 0
+        self._wms_pending_request: Optional[tuple[Any, ...]] = None
+        self._wms_loaded_request: Optional[tuple[Any, ...]] = None
+        self._wms_after_id: Optional[str] = None
+        self._wms_axes_callback_ids: list[int] = []
+        self._rendering_2d = False
 
         # Section-drawing state
         self._section_mode = False
@@ -920,6 +930,15 @@ class KOFViewer(tk.Tk):
         ttk.Button(raster_btns, text="Remove", command=self._on_clear_raster).pack(side=tk.LEFT, padx=4)
         ttk.Button(raster_btns, text="Up", command=self._on_move_raster_up).pack(side=tk.LEFT, padx=4)
         ttk.Button(raster_btns, text="Down", command=self._on_move_raster_down).pack(side=tk.LEFT, padx=4)
+        ttk.Button(raster_panel, text="Configure WMS background...", command=self._on_configure_wms).pack(
+            fill=tk.X, pady=(4, 0)
+        )
+        ttk.Checkbutton(
+            raster_panel,
+            text="Show WMS background",
+            variable=self.wms_visible,
+            command=self._on_wms_visibility_change,
+        ).pack(anchor="w")
 
         ttk.Button(raster_panel, text="Set elevation raster", command=self._on_set_elevation_raster).pack(anchor="w", pady=(4, 0))
         ttk.Checkbutton(raster_panel, text="Show raster", variable=self.show_raster, command=self._redraw).pack(anchor="w", pady=(4, 0))
@@ -2450,6 +2469,129 @@ class KOFViewer(tk.Tk):
 
     def _on_open_raster(self) -> None:
         self._raster_manager.on_open_raster()
+
+    def _on_configure_wms(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("Configure WMS background")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        config = self._wms_config
+        url_var = tk.StringVar(value=config.url if config else "")
+        layer_var = tk.StringVar(value=config.layer if config else "")
+        crs_var = tk.StringVar(value=config.crs if config else "")
+
+        fields = (
+            ("WMS service URL:", url_var),
+            ("Layer name:", layer_var),
+            ("Map CRS (e.g. EPSG:25832):", crs_var),
+        )
+        for row, (label, variable) in enumerate(fields):
+            ttk.Label(dialog, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=5)
+            ttk.Entry(dialog, textvariable=variable, width=58).grid(
+                row=row, column=1, sticky="ew", padx=8, pady=5
+            )
+
+        def _save() -> None:
+            try:
+                self._wms_config = validate_wms_config(
+                    url_var.get(),
+                    layer_var.get(),
+                    crs_var.get(),
+                )
+            except ValueError as exc:
+                messagebox.showerror("KOF Viewer", str(exc), parent=dialog)
+                return
+            self._wms_map = None
+            self._wms_loaded_request = None
+            self._wms_request_id += 1
+            self.wms_visible.set(True)
+            self.runtime_state.last_render_2d_signature = None
+            dialog.destroy()
+            self._redraw_2d()
+
+        button_row = ttk.Frame(dialog)
+        button_row.grid(row=len(fields), column=0, columnspan=2, sticky="e", padx=8, pady=8)
+        ttk.Button(button_row, text="Cancel", command=dialog.destroy).pack(side=tk.RIGHT, padx=(4, 0))
+        ttk.Button(button_row, text="Apply", command=_save).pack(side=tk.RIGHT)
+        dialog.columnconfigure(1, weight=1)
+
+        def _on_dialog_key(event: tk.Event) -> None:
+            if event.keysym == "Return":
+                _save()
+            elif event.keysym == "Escape":
+                dialog.destroy()
+
+        dialog.bind("<Return>", _on_dialog_key)
+        dialog.bind("<Escape>", _on_dialog_key)
+        dialog.wait_window()
+
+    def _on_wms_visibility_change(self) -> None:
+        self.runtime_state.last_render_2d_signature = None
+        if not self.wms_visible.get():
+            self._wms_request_id += 1
+            self._wms_pending_request = None
+        self._redraw_2d()
+
+    def _on_wms_limits_changed(self, axes: Any) -> None:
+        if axes is not self.ax2d:
+            return
+        if self._rendering_2d or self._wms_config is None or not self.wms_visible.get():
+            return
+        xlim = self.ax2d.get_xlim()
+        ylim = self.ax2d.get_ylim()
+        self._view_extent_2d = (float(xlim[0]), float(xlim[1]), float(ylim[0]), float(ylim[1]))
+        self.runtime_state.last_render_2d_signature = None
+        if self._wms_after_id is not None:
+            self.after_cancel(self._wms_after_id)
+        self._wms_after_id = self.after(350, self._request_wms_for_view)
+
+    def _connect_wms_view_callbacks(self) -> None:
+        for callback_id in self._wms_axes_callback_ids:
+            self.ax2d.callbacks.disconnect(callback_id)
+        self._wms_axes_callback_ids = [
+            self.ax2d.callbacks.connect("xlim_changed", self._on_wms_limits_changed),
+            self.ax2d.callbacks.connect("ylim_changed", self._on_wms_limits_changed),
+        ]
+
+    def _request_wms_for_view(self) -> None:
+        self._wms_after_id = None
+        config = self._wms_config
+        if config is None or not self.wms_visible.get() or not hasattr(self, "ax2d"):
+            return
+        xlim = self.ax2d.get_xlim()
+        ylim = self.ax2d.get_ylim()
+        extent = (float(xlim[0]), float(xlim[1]), float(ylim[0]), float(ylim[1]))
+        bounds = self.ax2d.get_window_extent()
+        width = min(2048, max(256, int(bounds.width)))
+        height = min(2048, max(256, int(bounds.height)))
+        request_key = (config, extent, width, height)
+        if request_key == self._wms_loaded_request or request_key == self._wms_pending_request:
+            return
+
+        self._wms_request_id += 1
+        request_id = self._wms_request_id
+        self._wms_pending_request = request_key
+
+        def _task() -> WMSMap:
+            return fetch_wms_map(config, extent, width, height)
+
+        def _on_success(wms_map: WMSMap) -> None:
+            if request_id != self._wms_request_id or config != self._wms_config or not self.wms_visible.get():
+                return
+            self._wms_pending_request = None
+            self._wms_map = wms_map
+            self._wms_loaded_request = request_key
+            self.runtime_state.last_render_2d_signature = None
+            self._redraw_2d()
+
+        def _on_error(exc: Exception) -> None:
+            if request_id != self._wms_request_id:
+                return
+            self._wms_pending_request = None
+            self.status.set(f"WMS background failed: {exc}")
+
+        self._task_executor.submit(task=_task, on_success=_on_success, on_error=_on_error)
 
     def _raster_display_name(self, idx: int) -> str:
         return self._raster_manager.raster_display_name(idx)
@@ -5537,6 +5679,9 @@ class KOFViewer(tk.Tk):
             bool(self.show_triangulation.get()),
             bool(self.show_tin_fill.get()),
             bool(self.show_raster.get()),
+            bool(self.wms_visible.get()),
+            self._wms_config,
+            self._wms_map.extent if self._wms_map is not None else None,
             int(self.max_labels.get()) if hasattr(self, "max_labels") else 0,
             self._section_mode,
             self._mask_mode,
@@ -5566,9 +5711,16 @@ class KOFViewer(tk.Tk):
             note_checksum,
         )
         if signature == self.runtime_state.last_render_2d_signature:
+            self._request_wms_for_view()
             return
         self.runtime_state.last_render_2d_signature = signature
-        render_2d(self, FILE_COLORS)
+        self._rendering_2d = True
+        try:
+            render_2d(self, FILE_COLORS)
+        finally:
+            self._rendering_2d = False
+        self._connect_wms_view_callbacks()
+        self._request_wms_for_view()
         if hasattr(self, "pit_daylight_text"):
             pit_dbg = str(getattr(self, "_pit_daylight_debug", "")).strip()
             self.pit_daylight_text.set(
