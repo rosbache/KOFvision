@@ -2,6 +2,11 @@
 
 This folder documents the modularized viewer architecture introduced to split the original monolithic `kof_viewer.py` into maintainable pieces.
 
+## Quick links
+
+- [Architecture diagram](architecture-diagram.md)
+- [Internal geometry structure and format mapping](../geometry-internal-format.md)
+
 ## Goals
 
 - Keep runtime behavior unchanged while reducing file complexity.
@@ -14,6 +19,10 @@ This folder documents the modularized viewer architecture introduced to split th
 2. UI callbacks are bound in the coordinator.
 3. Callback methods delegate work to focused modules.
 4. Modules call back into the coordinator only where cross-cutting context is required.
+
+## High-level diagram
+
+For the current architecture graph, see [architecture-diagram.md](architecture-diagram.md).
 
 ## Modules
 
