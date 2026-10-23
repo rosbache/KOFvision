@@ -566,3 +566,14 @@ It writes PNG files to `docs/images/`.
 	- `triangles`: direct polygon-overlap integration on vector TINs and/or triangulated elevation rasters.
 	- split-volume with KOF, LandXML, raster, or constant-Z intermediate layers is available with either method.
 - Interpolation outside the filtered triangulation boundary is ignored.
+
+## Application Languages
+
+The application stores interface text in JSON catalogs:
+
+- `kofvision/locales/en.json` is the English base catalog.
+- `kofvision/locales/nb.json` contains Norwegian Bokmål translations.
+
+Choose a language from the toolbar. The selection is saved in the user preferences and takes effect the next time KOFvision starts. If a translation is not yet present in the selected catalog, the English value is used; if it is also missing from English, the key itself is shown.
+
+Add new interface text to the English catalog first, then add the translated value to each available language catalog.

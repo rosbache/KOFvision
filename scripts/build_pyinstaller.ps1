@@ -45,6 +45,7 @@ $PyInstallerArgs = @(
     "--windowed",
     "--name", $AppName,
     "--collect-data", "matplotlib",
+    "--collect-data", "kofvision",
     "--collect-submodules", "matplotlib.backends",
     "--hidden-import", "PIL._tkinter_finder",
     $EntryScript

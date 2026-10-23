@@ -4,6 +4,7 @@ import json
 import os
 from dataclasses import dataclass, asdict
 
+from kofvision.localization import normalize_language
 from kofvision.validation import safe_float
 
 PREFERENCES_DIR = os.path.join(os.path.expanduser("~"), ".kofvision")
@@ -12,6 +13,7 @@ PREFERENCES_PATH = os.path.join(PREFERENCES_DIR, "preferences.json")
 
 @dataclass
 class ViewerPreferences:
+    language: str = "en"
     theme: str = "dark"
     volume_method: str = "raster"
     station_interval_m: float = 10.0
@@ -33,6 +35,8 @@ def load_preferences(path: str = PREFERENCES_PATH) -> ViewerPreferences:
         return ViewerPreferences()
 
     prefs = ViewerPreferences()
+    prefs.language = normalize_language(str(payload.get("language", prefs.language)))
+
     theme = str(payload.get("theme", prefs.theme)).strip().lower()
     prefs.theme = theme if theme in {"dark", "light"} else prefs.theme
 

@@ -113,6 +113,7 @@ from kofvision.viewer_tools import (
 from kofvision.viewer_rendering import render_2d, render_3d
 from kofvision.raster_management import RasterLayerManager
 from kofvision.preferences import ViewerPreferences, load_preferences, save_preferences
+from kofvision.localization import Translator
 from kofvision.report_service import (
     apply_cumulative_profile_volumes,
     cumulative_profile_volumes,
@@ -263,7 +264,12 @@ class _HoverTooltip:
 class KOFViewer(tk.Tk):
     def __init__(self, initial_files: Optional[list[str]] = None) -> None:
         super().__init__()
-        self.title("KOF Viewer – 2D / 3D / Volume / Section")
+        preferences = load_preferences()
+        self.language = tk.StringVar(value=preferences.language)
+        self._translator = Translator(self.language.get())
+        self._ = self._translator.gettext
+        self._active_language = self._translator.language
+        self.title(self._("app.title"))
         self.geometry("1300x860")
         env_theme = os.environ.get("KOFVISION_THEME", "dark")
         self.theme_mode = tk.StringVar(value=normalize_theme_name(env_theme))
@@ -435,7 +441,7 @@ class KOFViewer(tk.Tk):
         self._volume_task_running = False
         self._report_task_running = False
 
-        self._apply_preferences(load_preferences())
+        self._apply_preferences(preferences)
 
         self._configure_styles()
 
@@ -453,6 +459,7 @@ class KOFViewer(tk.Tk):
         self._redraw()
 
     def _apply_preferences(self, prefs: ViewerPreferences) -> None:
+        self.language.set(prefs.language)
         self.theme_mode.set(prefs.theme)
         self.volume_method.set(prefs.volume_method)
         self.station_interval_m.set(safe_float(prefs.station_interval_m, default=10.0, min_value=1.0))
@@ -464,6 +471,7 @@ class KOFViewer(tk.Tk):
 
     def _capture_preferences(self) -> ViewerPreferences:
         return ViewerPreferences(
+            language=self.language.get(),
             theme=self.theme_mode.get(),
             volume_method=self.volume_method.get(),
             station_interval_m=safe_float(self.station_interval_m.get(), default=10.0, min_value=1.0),
@@ -588,7 +596,14 @@ class KOFViewer(tk.Tk):
                 activeforeground="#ffffff",
             )
         if hasattr(self, "theme_btn"):
-            self.theme_btn.configure(text=f"Theme: {mode.title()}")
+            self.theme_btn.configure(text=f'{self._("toolbar.theme")}: {self._("theme." + mode)}')
+        if hasattr(self, "language_menu"):
+            self.language_menu.configure(
+                background=self._theme["bg_surface"],
+                foreground=self._theme["fg_primary"],
+                activebackground=self._theme["accent"],
+                activeforeground="#ffffff",
+            )
 
         if hasattr(self, "controls_canvas"):
             self.controls_canvas.configure(background=self._theme["bg_surface"])
@@ -617,6 +632,11 @@ class KOFViewer(tk.Tk):
 
     def _on_theme_changed(self) -> None:
         self._apply_theme(self.theme_mode.get(), redraw=True)
+
+    def _on_language_changed(self) -> None:
+        if self.language.get() == self._active_language:
+            return
+        messagebox.showinfo(self._("app.title"), self._("language.restart_notice"))
 
     def _bind_shortcuts(self) -> None:
         self.bind_all("<Control-o>", lambda _e: self._invoke_shortcut(self._on_open))
@@ -688,70 +708,70 @@ class KOFViewer(tk.Tk):
         top = ttk.Frame(self, style="TopBar.TFrame", padding=(8, 6, 8, 2))
         top.pack(side=tk.TOP, fill=tk.X)
 
-        open_btn = self._make_toolbar_button(top, text="Open", command=self._on_open)
+        open_btn = self._make_toolbar_button(top, text=self._("toolbar.open"), command=self._on_open)
         open_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(open_btn, "Shortcut: Ctrl+O")
 
-        export_btn = self._make_toolbar_button(top, text="Export GPKG", command=self._on_export_gpkg)
+        export_btn = self._make_toolbar_button(top, text=self._("toolbar.export_gpkg"), command=self._on_export_gpkg)
         export_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(export_btn, "Shortcut: Ctrl+E")
 
-        clear_btn = self._make_toolbar_button(top, text="Clear", command=self._on_clear)
+        clear_btn = self._make_toolbar_button(top, text=self._("toolbar.clear"), command=self._on_clear)
         clear_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(clear_btn, "Shortcut: Ctrl+Shift+K")
 
-        self.undo_btn = self._make_toolbar_button(top, text="Undo", command=self._on_undo)
+        self.undo_btn = self._make_toolbar_button(top, text=self._("toolbar.undo"), command=self._on_undo)
         self.undo_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.undo_btn, "Shortcut: Ctrl+Z")
 
-        self.redo_btn = self._make_toolbar_button(top, text="Redo", command=self._on_redo)
+        self.redo_btn = self._make_toolbar_button(top, text=self._("toolbar.redo"), command=self._on_redo)
         self.redo_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.redo_btn, "Shortcut: Ctrl+Y")
         self._refresh_undo_redo_controls()
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
-        zoom_btn = self._make_toolbar_button(top, text="Zoom to selected", command=self._on_zoom_selected_layers)
+        zoom_btn = self._make_toolbar_button(top, text=self._("toolbar.zoom_selected"), command=self._on_zoom_selected_layers)
         zoom_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(zoom_btn, "Shortcut: Ctrl+Shift+Z")
 
-        reset_btn = self._make_toolbar_button(top, text="Reset view", command=self._on_reset_view)
+        reset_btn = self._make_toolbar_button(top, text=self._("toolbar.reset_view"), command=self._on_reset_view)
         reset_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(reset_btn, "Shortcut: Ctrl+Shift+R")
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
-        compute_btn = self._make_toolbar_button(top, text="Compute volume", command=self._on_compute_volume, primary=True)
+        compute_btn = self._make_toolbar_button(top, text=self._("toolbar.compute_volume"), command=self._on_compute_volume, primary=True)
         compute_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(compute_btn, "Shortcut: Ctrl+Shift+V")
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
-        self.section_btn = self._make_toolbar_button(top, text="Draw section", command=self._on_toggle_section)
+        self.section_btn = self._make_toolbar_button(top, text=self._("toolbar.draw_section"), command=self._on_toggle_section)
         self.section_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.section_btn, "Shortcut: Ctrl+Shift+S")
 
-        self.ditch_btn = self._make_toolbar_button(top, text="Draw ditch", command=self._on_toggle_ditch_centerline)
+        self.ditch_btn = self._make_toolbar_button(top, text=self._("toolbar.draw_ditch"), command=self._on_toggle_ditch_centerline)
         self.ditch_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.ditch_btn, "Shortcut: Ctrl+Shift+L")
 
-        self.mask_btn = self._make_toolbar_button(top, text="Draw mask", command=self._on_toggle_mask)
+        self.mask_btn = self._make_toolbar_button(top, text=self._("toolbar.draw_mask"), command=self._on_toggle_mask)
         self.mask_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.mask_btn, "Shortcut: Ctrl+Shift+M")
 
-        self.pit_btn = self._make_toolbar_button(top, text="Draw pit", command=self._on_toggle_pit)
+        self.pit_btn = self._make_toolbar_button(top, text=self._("toolbar.draw_pit"), command=self._on_toggle_pit)
         self.pit_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.pit_btn, "Shortcut: Ctrl+Shift+P")
 
-        self.measure_btn = self._make_toolbar_button(top, text="Measure", command=self._on_toggle_measure)
+        self.measure_btn = self._make_toolbar_button(top, text=self._("toolbar.measure"), command=self._on_toggle_measure)
         self.measure_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.measure_btn, "Shortcut: Ctrl+Shift+D")
 
-        self.note_btn = self._make_toolbar_button(top, text="Add note", command=self._on_toggle_note_mode)
+        self.note_btn = self._make_toolbar_button(top, text=self._("toolbar.add_note"), command=self._on_toggle_note_mode)
         self.note_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.note_btn, "Shortcut: Ctrl+Shift+N")
 
-        self.measure_mode_btn = ttk.Menubutton(top, text="Measure mode")
+        self.measure_mode_btn = ttk.Menubutton(top, text=self._("toolbar.measure_mode"))
         self.measure_mode_menu = tk.Menu(self.measure_mode_btn, tearoff=False)
         for _mode_key, mode_label in MEASURE_MODE_LABELS.items():
             self.measure_mode_menu.add_radiobutton(
@@ -764,10 +784,20 @@ class KOFViewer(tk.Tk):
         self.measure_mode_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.measure_mode_btn, "Choose how Measure behaves (line distance or polygon area).")
 
-        self.theme_btn = ttk.Menubutton(top, text="Theme")
+        self.theme_btn = ttk.Menubutton(top, text=self._("toolbar.theme"))
         self.theme_menu = tk.Menu(self.theme_btn, tearoff=False)
-        self.theme_menu.add_radiobutton(label="Dark", value="dark", variable=self.theme_mode, command=self._on_theme_changed)
-        self.theme_menu.add_radiobutton(label="Light", value="light", variable=self.theme_mode, command=self._on_theme_changed)
+        self.theme_menu.add_radiobutton(
+            label=self._("theme.dark"),
+            value="dark",
+            variable=self.theme_mode,
+            command=self._on_theme_changed,
+        )
+        self.theme_menu.add_radiobutton(
+            label=self._("theme.light"),
+            value="light",
+            variable=self.theme_mode,
+            command=self._on_theme_changed,
+        )
         self.theme_btn.configure(menu=self.theme_menu)
         self.theme_btn.pack(side=tk.LEFT, padx=3)
         _HoverTooltip(self.theme_btn, "Switch between dark and light application themes.")
@@ -777,18 +807,36 @@ class KOFViewer(tk.Tk):
         top_secondary = ttk.Frame(self, style="TopBar.TFrame", padding=(8, 0, 8, 6))
         top_secondary.pack(side=tk.TOP, fill=tk.X)
 
-        save_project_btn = self._make_toolbar_button(top_secondary, text="Save project", command=self._on_save_project)
+        save_project_btn = self._make_toolbar_button(top_secondary, text=self._("toolbar.save_project"), command=self._on_save_project)
         save_project_btn.pack(side=tk.LEFT, padx=3)
 
-        load_project_btn = self._make_toolbar_button(top_secondary, text="Load project", command=self._on_load_project)
+        load_project_btn = self._make_toolbar_button(top_secondary, text=self._("toolbar.load_project"), command=self._on_load_project)
         load_project_btn.pack(side=tk.LEFT, padx=3)
 
-        self.mode_badge = ttk.Label(top_secondary, text="Mode: idle", style="Muted.TLabel")
+        self.language_btn = ttk.Menubutton(top_secondary, text=self._("toolbar.language"))
+        self.language_menu = tk.Menu(self.language_btn, tearoff=False)
+        self.language_menu.add_radiobutton(
+            label=self._("language.english"),
+            value="en",
+            variable=self.language,
+            command=self._on_language_changed,
+        )
+        self.language_menu.add_radiobutton(
+            label=self._("language.norwegian_bokmal"),
+            value="nb",
+            variable=self.language,
+            command=self._on_language_changed,
+        )
+        self.language_btn.configure(menu=self.language_menu)
+        self.language_btn.pack(side=tk.LEFT, padx=3)
+        _HoverTooltip(self.language_btn, self._("language.restart_tooltip"))
+
+        self.mode_badge = ttk.Label(top_secondary, text=self._("toolbar.mode_idle"), style="Muted.TLabel")
         self.mode_badge.pack(side=tk.LEFT, padx=(8, 0))
 
         ttk.Label(
             top_secondary,
-            text="Shortcuts: Ctrl+O open, Ctrl+E export, Ctrl+Shift+V compute, Ctrl+Shift+L ditch, Ctrl+Shift+P pit, Ctrl+Shift+N note",
+            text=self._("shortcuts.summary"),
             style="Muted.TLabel",
         ).pack(side=tk.RIGHT, padx=(8, 0))
 
