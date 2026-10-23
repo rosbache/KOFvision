@@ -10,6 +10,13 @@ KOFvision is a standalone Python viewer for KOF/SOSI/LandXML survey surfaces wit
 
 The main app is implemented in `kof_viewer.py`.
 
+## Documentation
+
+- [Architecture docs index](docs/viewer-architecture/README.md)
+- [Application architecture diagram](docs/viewer-architecture/architecture-diagram.md)
+- [Internal geometry structure (KOF/SOSI/LandXML)](docs/geometry-internal-format.md)
+- [Windows packaging (PyInstaller)](docs/pyinstaller-windows.md)
+
 ## Features
 
 - Open one or more `.kof`, `.sos`/`.sosi`, or `.xml` (LandXML) files
@@ -54,6 +61,9 @@ The main app is implemented in `kof_viewer.py`.
 	- net/cut/fill cross-section area
 - Draw one or more ditch centerlines in 2D and use them as section-report baselines
 - Configure ditch rules with side, distance, slope, profile range, and optional stop-layer constraints
+- Draw one or more pit polygons in 2D and use them as pit construction surfaces
+- Configure pit target Z, side slope or vertical walls, and optional stop-layer clipping
+- Apply pit surfaces directly in volume calculations (`Top surface - Pit`) or as Intermediate layer (`Pit surface`)
 - Save and load polygon masks as JSON
 - Save and load section lines as JSON
 - Save and load ditch centerlines/rules in project files
@@ -127,6 +137,7 @@ KOFvision now uses a hybrid layout aimed at faster access to common actions and 
 	- Draw section
 	- Draw ditch
 	- Draw mask
+	- Draw pit
 - Left panel:
 	- Layer visibility (KOF, LandXML, and raster layers)
 - Center:
@@ -155,6 +166,7 @@ In the Raster panel, choose **Configure WMS background...** and enter the WMS Ge
 - Ctrl+Shift+S: Toggle Draw section mode
 - Ctrl+Shift+L: Toggle Draw ditch mode
 - Ctrl+Shift+M: Toggle Draw mask mode
+- Ctrl+Shift+P: Toggle Draw pit mode
 
 ## Tests
 
@@ -192,6 +204,48 @@ For full packaging and distribution details, see `docs/pyinstaller-windows.md`.
 9. Read net/cut/fill (or split results) in the Volume setup panel summary.
 10. Click Draw section and pick two points in 2D to open a section profile window.
 
+## Pit Tool
+
+The pit workflow lets you create one or more theoretical excavation polygons that can be used in volume calculations and in split-volume chains.
+
+### Quick Start
+
+1. Click Draw pit in the top bar (or press Ctrl+Shift+P).
+2. Left-click in 2D to add pit polygon vertices.
+3. Right-click (or double-click) to close and save the pit polygon.
+4. Open the Pit panel and select the active pit polygon.
+5. Set Target Z (pit base elevation) for the selected pit.
+6. Configure edge behavior:
+	- Use Vertical walls for vertical pit sides, or
+	- Disable vertical walls and set Pit edge slope (m/m) for daylighting sides.
+7. (Optional) Set Stop layer (`rock` or `moist` + slot `0..9`) to clip pit depth against mapped stop surfaces.
+8. Choose how pits are used in computation:
+	- Volume from = Top surface - Pit, or
+	- Intermediate = Pit surface.
+9. Set Pit compute scope in the Pit panel (`Selected pit`, `Visible pits`, or `All pits`) and click Compute volume.
+
+### How pit geometry is evaluated
+
+- Inside each pit polygon, the pit surface is fixed at the polygon Target Z.
+- Outside the polygon:
+	- Vertical walls = enabled -> pit is undefined outside (volume stays within pit footprint).
+	- Vertical walls = disabled -> elevation increases away from pit edges using `edge_slope` (m/m).
+- With multiple pits, the combined pit surface keeps the lowest resulting Z at each sample location.
+- If a stop layer is configured and mapped in Volume setup, the pit surface is clamped so it does not go below the stop surface.
+
+### Editing and management
+
+- Use Edit selected pit to drag vertices in the 2D view.
+- Use Show all / Hide all and per-pit checkboxes to control visibility.
+- Use Delete selected pit or Clear all pits for cleanup.
+- You can convert a closed mask to a pit from the Mask panel (`Convert selected mask -> pit`) and then adjust Target Z.
+
+### Pit integration with volumes and sections
+
+- Pits can act as a full volume operand (Top - Pit) or as a split intermediate layer.
+- Pit changes mark existing volume results as stale; recompute after edits.
+- For sloped pits, KOFvision draws a pit slope-end (daylight) line in 2D for visible pits.
+
 ## Ditch Tool
 
 The ditch workflow lets you define centerline-driven profile modifications before report volume integration.
@@ -203,6 +257,22 @@ The ditch workflow lets you define centerline-driven profile modifications befor
 3. Open the Sections and mask panel and click Ditch setup....
 4. Add one or more ditch rules and save.
 5. Export section report. The selected ditch centerline is used as baseline.
+
+### Detailed usage flow
+
+1. Draw and select the ditch centerline you want to use for reporting.
+2. Open Ditch setup and define one or more rules per side (`+1` right, `-1` left).
+3. Start with nearest branch rules (closest to centerline), then add outer chained rules on the same side when needed.
+4. Limit rule applicability by profile range when ditch geometry should vary along chainage.
+5. (Optional) Add stop material + stop slot to prevent extension beyond mapped stop surfaces.
+6. Export section report to generate repeated profile plots and plan annotation from the chosen baseline.
+
+### What the user should verify
+
+- Layer mapping in Volume setup is complete for all materials/slots used by ditch or pit stop rules.
+- Rule order is intentional when multiple rules share the same side (they are chained in listed order).
+- Profile start/end ranges align with the intended report profiles.
+- The selected ditch centerline is the one intended for baseline export.
 
 ### Rule Fields
 
