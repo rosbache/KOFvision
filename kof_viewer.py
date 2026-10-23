@@ -32,7 +32,7 @@ Usage
 
 from __future__ import annotations
 
-__version__ = "0.2026.10.21"
+__version__ = "0.2026.10.22"
 
 import argparse
 import copy
